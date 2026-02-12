@@ -10,7 +10,6 @@ struct InspectorView: View {
     @State private var showingSavePromptAlert = false
     @State private var newPromptName = ""
     
-    let aspectRatios = ["1:1", "16:9", "9:16", "4:3", "3:4"]
     let sizes = ["1K", "2K", "4K"]
     
     var body: some View {
@@ -101,17 +100,12 @@ struct InspectorView: View {
                             .frame(height: 1)
                             .padding(.vertical, 4)
                         
-                        // Ratio Row
-                        HStack {
-                            Text("Ratio")
+                        // Ratio Selector
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Aspect Ratio")
                                 .foregroundStyle(.secondary)
-                            Spacer()
-                            Picker("", selection: $stagingManager.aspectRatio) {
-                                ForEach(aspectRatios, id: \.self) { Text($0) }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.menu)
-                            .frame(width: 85)
+                            
+                            AspectRatioSelector(selectedRatio: $stagingManager.aspectRatio)
                         }
                         
                         // Size Row

@@ -142,7 +142,7 @@ actor NanoBananaService {
             "generationConfig": [
                 "responseModalities": ["TEXT", "IMAGE"],
                 "imageConfig": [
-                    "aspectRatio": request.aspectRatio,
+                    "aspectRatio": AspectRatio.from(string: request.aspectRatio).apiValue, // Send "auto" or specific ratio
                     "imageSize": request.imageSize
                 ]
             ]

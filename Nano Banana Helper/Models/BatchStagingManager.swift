@@ -8,7 +8,7 @@ class BatchStagingManager {
     
     // Batch Configuration (Synced with Inspector)
     var prompt: String = ""
-    var aspectRatio: String = "16:9"
+    var aspectRatio: String = "Auto" // Changed to Auto
     var imageSize: String = "4K"
     var isBatchTier: Bool = false
     var isMultiInput: Bool = false

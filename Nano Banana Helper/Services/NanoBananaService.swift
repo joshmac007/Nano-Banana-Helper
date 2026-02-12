@@ -4,6 +4,7 @@ import Foundation
 struct ImageEditRequest: Sendable {
     let inputImageURLs: [URL] // Changed to array
     let prompt: String
+    let systemInstruction: String?
     let aspectRatio: String
     let imageSize: String
     let useBatchTier: Bool
@@ -137,16 +138,27 @@ actor NanoBananaService {
             throw NanoBananaError.batchError(message: "Total image data (\(totalDataSize / 1024 / 1024)MB) exceeds 20MB limit for batch inline requests. Use smaller images or fewer images per batch.")
         }
         
-        return [
+        var payload: [String: Any] = [
             "contents": [["parts": parts]],
             "generationConfig": [
                 "responseModalities": ["TEXT", "IMAGE"],
                 "imageConfig": [
-                    "aspectRatio": request.aspectRatio,
+                    "aspectRatio": AspectRatio.from(string: request.aspectRatio).apiValue, // Send "auto" or specific ratio
                     "imageSize": request.imageSize
                 ]
             ]
         ]
+        
+        // Add system instruction if present
+        if let systemInstruction = request.systemInstruction, !systemInstruction.isEmpty {
+            payload["system_instruction"] = [
+                "parts": [
+                    ["text": systemInstruction]
+                ]
+            ]
+        }
+        
+        return payload
     }
     
     // MARK: - Standard API

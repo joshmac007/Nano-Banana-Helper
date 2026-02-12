@@ -1,17 +1,41 @@
 import Foundation
 
+enum PromptType: String, Codable, CaseIterable, Identifiable {
+    case user = "User"
+    case system = "System"
+    
+    var id: String { rawValue }
+}
+
 /// A saved prompt template
 struct SavedPrompt: Codable, Identifiable, Hashable {
     let id: UUID
     var name: String
     var prompt: String
+    var type: PromptType
     var createdAt: Date
     
-    init(name: String, prompt: String) {
+    init(name: String, prompt: String, type: PromptType = .user) {
         self.id = UUID()
         self.name = name
         self.prompt = prompt
+        self.type = type
         self.createdAt = Date()
+    }
+    
+    // Custom decoding to handle migration from old format missing 'type'
+    enum CodingKeys: String, CodingKey {
+        case id, name, prompt, type, createdAt
+    }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        prompt = try container.decode(String.self, forKey: .prompt)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        // Default to .user if type is missing
+        type = try container.decodeIfPresent(PromptType.self, forKey: .type) ?? .user
     }
 }
 
@@ -33,8 +57,17 @@ class PromptLibrary {
         load()
     }
     
-    func save(name: String, prompt: String) {
-        let savedPrompt = SavedPrompt(name: name, prompt: prompt)
+    // Filtered accessors
+    var userPrompts: [SavedPrompt] {
+        prompts.filter { $0.type == .user }
+    }
+    
+    var systemPrompts: [SavedPrompt] {
+        prompts.filter { $0.type == .system }
+    }
+    
+    func save(name: String, prompt: String, type: PromptType) {
+        let savedPrompt = SavedPrompt(name: name, prompt: prompt, type: type)
         prompts.insert(savedPrompt, at: 0)
         persist()
     }
@@ -57,6 +90,11 @@ class PromptLibrary {
         do {
             let data = try Data(contentsOf: storageURL)
             prompts = try decoder.decode([SavedPrompt].self, from: data)
+            
+            // If any prompts didn't have a type (older saved format), 
+            // the custom init(from:) has defaulted them to .user already.
+            // We can re-persist to ensure the file on disk is updated.
+            persist() 
         } catch {
             print("Failed to load prompts: \(error)")
         }

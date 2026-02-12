@@ -316,6 +316,7 @@ class BatchJob: Identifiable, Codable {
     let createdAt: Date
     var projectId: UUID?
     var prompt: String
+    var systemPrompt: String? // Added
     var aspectRatio: String
     var imageSize: String
     var outputDirectory: String
@@ -324,7 +325,7 @@ class BatchJob: Identifiable, Codable {
     var tasks: [ImageTask]
 
     enum CodingKeys: String, CodingKey {
-        case id, createdAt, projectId, prompt, aspectRatio, imageSize, outputDirectory, useBatchTier, status, tasks
+        case id, createdAt, projectId, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, useBatchTier, status, tasks
     }
 
     required init(from decoder: Decoder) throws {
@@ -333,6 +334,7 @@ class BatchJob: Identifiable, Codable {
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         projectId = try container.decodeIfPresent(UUID.self, forKey: .projectId)
         prompt = try container.decode(String.self, forKey: .prompt)
+        systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt) // Decode if present
         aspectRatio = try container.decode(String.self, forKey: .aspectRatio)
         imageSize = try container.decode(String.self, forKey: .imageSize)
         outputDirectory = try container.decode(String.self, forKey: .outputDirectory)
@@ -347,6 +349,7 @@ class BatchJob: Identifiable, Codable {
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(projectId, forKey: .projectId)
         try container.encode(prompt, forKey: .prompt)
+        try container.encode(systemPrompt, forKey: .systemPrompt)
         try container.encode(aspectRatio, forKey: .aspectRatio)
         try container.encode(imageSize, forKey: .imageSize)
         try container.encode(outputDirectory, forKey: .outputDirectory)
@@ -357,6 +360,7 @@ class BatchJob: Identifiable, Codable {
     
     init(
         prompt: String,
+        systemPrompt: String? = nil,
         aspectRatio: String = "16:9",
         imageSize: String = "4K",
         outputDirectory: String,
@@ -367,6 +371,7 @@ class BatchJob: Identifiable, Codable {
         self.createdAt = Date()
         self.projectId = projectId
         self.prompt = prompt
+        self.systemPrompt = systemPrompt
         self.aspectRatio = aspectRatio
         self.imageSize = imageSize
         self.outputDirectory = outputDirectory

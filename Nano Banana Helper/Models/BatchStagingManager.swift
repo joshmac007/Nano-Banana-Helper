@@ -8,7 +8,8 @@ class BatchStagingManager {
     
     // Batch Configuration (Synced with Inspector)
     var prompt: String = ""
-    var aspectRatio: String = "16:9"
+    var systemPrompt: String = "" // New System Prompt
+    var aspectRatio: String = "Auto" // Changed to Auto
     var imageSize: String = "4K"
     var isBatchTier: Bool = false
     var isMultiInput: Bool = false
@@ -32,10 +33,12 @@ class BatchStagingManager {
     
     func clearAll() {
         stagedFiles.removeAll()
+        // Do NOT clear system prompt on batch clear, it's persistent configuration
     }
     
-    func updateSettings(prompt: String? = nil, ratio: String? = nil, size: String? = nil, batch: Bool? = nil, multiInput: Bool? = nil) {
+    func updateSettings(prompt: String? = nil, systemPrompt: String? = nil, ratio: String? = nil, size: String? = nil, batch: Bool? = nil, multiInput: Bool? = nil) {
         if let p = prompt { self.prompt = p }
+        if let sp = systemPrompt { self.systemPrompt = sp }
         if let r = ratio { self.aspectRatio = r }
         if let s = size { self.imageSize = s }
         if let b = batch { self.isBatchTier = b }

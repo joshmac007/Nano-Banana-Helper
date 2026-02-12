@@ -11,6 +11,7 @@ struct JobSubmissionData: Sendable {
 
 struct BatchSettings: Sendable {
     let prompt: String
+    let systemPrompt: String?
     let aspectRatio: String
     let imageSize: String
     let outputDirectory: String
@@ -266,6 +267,7 @@ final class BatchOrchestrator {
         
         let batchSettings = BatchSettings(
             prompt: batch.prompt,
+            systemPrompt: batch.systemPrompt,
             aspectRatio: batch.aspectRatio,
             imageSize: batch.imageSize,
             outputDirectory: batch.outputDirectory,
@@ -335,6 +337,7 @@ final class BatchOrchestrator {
         let request = ImageEditRequest(
             inputImageURLs: data.inputURLs,
             prompt: settings.prompt,
+            systemInstruction: settings.systemPrompt,
             aspectRatio: settings.aspectRatio,
             imageSize: settings.imageSize,
             useBatchTier: settings.useBatchTier

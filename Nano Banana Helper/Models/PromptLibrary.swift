@@ -91,10 +91,12 @@ class PromptLibrary {
             let data = try Data(contentsOf: storageURL)
             prompts = try decoder.decode([SavedPrompt].self, from: data)
             
-            // If any prompts didn't have a type (older saved format), 
-            // the custom init(from:) has defaulted them to .user already.
-            // We can re-persist to ensure the file on disk is updated.
-            persist() 
+            // Only re-persist if the decoded data differs from what's on disk.
+            // This handles migration (e.g., older entries missing the 'type' field)
+            // without writing on every launch when nothing has changed.
+            if let reEncoded = try? encoder.encode(prompts), reEncoded != data {
+                persist()
+            }
         } catch {
             print("Failed to load prompts: \(error)")
         }

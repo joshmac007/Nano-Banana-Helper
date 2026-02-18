@@ -69,8 +69,7 @@ final class BatchOrchestrator {
     
     private var activeBatches: [BatchJob] = []
     private let service = NanoBananaService()
-    private let concurrencyLimit = 1 
-    private let timeoutSeconds: TimeInterval = 300
+    private let concurrencyLimit = 5 // Paid tier: safe default for concurrent submissions
 
     // Callbacks for history/cost tracking
     var onImageCompleted: ((HistoryEntry) -> Void)?
@@ -175,12 +174,11 @@ final class BatchOrchestrator {
             }
         }
         
-        // Cancel API jobs in background
+        // Cancel API jobs in background — capture names (strings) not ImageTask references
+        let namesToCancel = jobsToCancel.compactMap { $0.externalJobName }
         Task {
-            for job in jobsToCancel {
-                if let jobName = job.externalJobName {
-                    try? await service.cancelBatchJob(jobName: jobName)
-                }
+            for jobName in namesToCancel {
+                try? await service.cancelBatchJob(jobName: jobName)
             }
         }
         
@@ -285,12 +283,19 @@ final class BatchOrchestrator {
             projectId: batch.projectId
         )
         
-        // 2. Submit all jobs to get IDs
+        // 2. Submit all jobs to get IDs — throttled to concurrencyLimit concurrent submissions
         await withTaskGroup(of: Void.self) { group in
+            var inFlight = 0
             for data in submissionDataList {
+                // If at capacity, wait for one slot to free before adding another
+                if inFlight >= concurrencyLimit {
+                    await group.next()
+                    inFlight -= 1
+                }
                 group.addTask {
                     await self.performSubmission(data: data, settings: batchSettings)
                 }
+                inFlight += 1
             }
         }
         
@@ -466,7 +471,10 @@ final class BatchOrchestrator {
             
             let cost = settings.cost(inputCount: job.inputPaths.count)
             if let projectId = settings.projectId {
-                let sourceBookmarks = job.inputURLs.compactMap { AppPaths.bookmark(for: $0) }
+                // Use bookmarks already captured before security scope was stopped.
+                // Do NOT use job.inputURLs here — that computed property calls
+                // startAccessingSecurityScopedResource() on an already-stopped resource.
+                let sourceBookmarks = job.inputBookmarks ?? []
                 let outputBookmark = AppPaths.bookmark(for: outputURL)
                 
                 let historyEntry = HistoryEntry(
@@ -536,7 +544,8 @@ final class BatchOrchestrator {
         let directoryURL = URL(fileURLWithPath: directory)
         try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         
-        let inputName = task.inputURL.deletingPathExtension().lastPathComponent
+        let inputName = URL(fileURLWithPath: task.inputPaths.first ?? "image")
+            .deletingPathExtension().lastPathComponent
         let ext = mimeType == "image/png" ? "png" : "jpg"
         let baseName = "\(inputName)_edited"
         

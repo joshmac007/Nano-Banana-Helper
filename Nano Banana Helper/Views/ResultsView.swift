@@ -72,13 +72,13 @@ struct ResultCard: View {
                    let nsImage = NSImage(contentsOfFile: path) {
                     Image(nsImage: nsImage)
                         .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: size, height: size * 9/16) // Default aspect ratio hint
-                        .clipped()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: size, height: size * 3/4)
+                        .background(Color.black.opacity(0.04))
                 } else {
                     Rectangle()
                         .fill(Color.secondary.opacity(0.1))
-                        .frame(width: size, height: size * 9/16)
+                        .frame(width: size, height: size * 3/4)
                         .overlay {
                             Image(systemName: "photo")
                                 .foregroundStyle(.secondary)

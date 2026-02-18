@@ -26,8 +26,11 @@ class Project: Codable, Identifiable, Hashable {
     var projectNotes: String?
     
     var outputURL: URL {
-        if let bookmark = outputDirectoryBookmark, let url = AppPaths.resolveBookmark(bookmark) {
-            return url
+        // Resolve the bookmark briefly to capture the path, then stop access immediately.
+        // Display-only: we only need the path string for labels and FileManager checks.
+        if let bookmark = outputDirectoryBookmark,
+           let path = AppPaths.resolveBookmarkToPath(bookmark) {
+            return URL(fileURLWithPath: path)
         }
         return URL(fileURLWithPath: outputDirectory)
     }
@@ -145,20 +148,16 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     var outputImageBookmark: Data?
     
     var sourceURLs: [URL] {
-        // Try to use bookmarks first
-        if let bookmarks = sourceImageBookmarks, bookmarks.count == sourceImagePaths.count {
-            return bookmarks.compactMap { AppPaths.resolveBookmark($0) }
-        }
-        // Fallback to paths (legacy)
+        // Display-only: use plain path-based URLs. Security scope is not needed
+        // for NSImage thumbnail loading or Finder reveals.
         return sourceImagePaths.map { URL(fileURLWithPath: $0) }
     }
     
     var sourceURL: URL { sourceURLs.first ?? URL(fileURLWithPath: "") }
     
     var outputURL: URL {
-        if let bookmark = outputImageBookmark, let url = AppPaths.resolveBookmark(bookmark) {
-            return url
-        }
+        // Display-only: use plain path-based URL. Security scope is not needed
+        // for NSImage thumbnail loading or Finder reveals.
         return URL(fileURLWithPath: outputImagePath)
     }
     
@@ -531,14 +530,11 @@ class ImageTask: Identifiable, Codable {
     // Backward compatibility for single input path
     var inputPath: String { inputPaths.first ?? "" }
     
-    /// Resolves input URLs, using security-scoped bookmarks when available
-    var inputURLs: [URL] {
-        if let bookmarks = inputBookmarks, bookmarks.count == inputPaths.count {
-            return bookmarks.compactMap { AppPaths.resolveBookmark($0) }
-        }
-        return inputPaths.map { URL(fileURLWithPath: $0) }
-    }
-    var inputURL: URL { inputURLs.first ?? URL(fileURLWithPath: inputPath) }
+    /// Returns plain path-based URLs for display purposes.
+    /// For security-scoped access during batch processing, use `inputBookmarks` via
+    /// `AppPaths.withResolvedBookmark` or `AppPaths.resolveBookmark` (with paired stop call).
+    var inputURLs: [URL] { inputPaths.map { URL(fileURLWithPath: $0) } }
+    var inputURL: URL { URL(fileURLWithPath: inputPath) }
     var outputURL: URL? { outputPath.map { URL(fileURLWithPath: $0) } }
     var filename: String { 
         if inputPaths.count > 1 {
@@ -546,7 +542,8 @@ class ImageTask: Identifiable, Codable {
             let count = status == "completed" ? "1" : "\(inputPaths.count)"
             return "Multimodal (\(count) \(label))"
         }
-        return inputURL.lastPathComponent 
+        // Use the path string directly — no bookmark resolution needed for a display name.
+        return URL(fileURLWithPath: inputPath).lastPathComponent
     }
     var errorMessage: String? { error }
     var duration: TimeInterval? {

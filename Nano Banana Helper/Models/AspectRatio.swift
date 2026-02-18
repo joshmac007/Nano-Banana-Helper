@@ -44,6 +44,8 @@ struct AspectRatio: Identifiable, Hashable, Sendable {
     ]
     
     nonisolated static var `default`: AspectRatio {
+        // Default to 16:9 for unrecognized strings — Auto is a valid user choice
+        // but should never be a silent fallback (it omits aspectRatio from the API payload).
         all.first(where: { $0.id == "16:9" }) ?? all[0]
     }
     

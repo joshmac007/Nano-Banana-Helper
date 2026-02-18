@@ -24,12 +24,6 @@ struct BottomDockView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 
-                // Progress Bar (Always Visible, but inactive state if 0)
-                ProgressView(value: orchestrator.isRunning ? orchestrator.currentProgress : 0)
-                    .progressViewStyle(.linear)
-                    .frame(maxWidth: 200)
-                    .opacity(orchestrator.isRunning || orchestrator.currentProgress > 0 ? 1.0 : 0.3)
-                
                 Spacer()
                 
                 // Toggle Drawer Button (Explicit button, but entire bar is also tappable)

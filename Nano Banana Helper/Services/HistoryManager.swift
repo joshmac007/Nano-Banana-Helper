@@ -94,12 +94,37 @@ class HistoryManager {
     
     /// Updates an existing entry by matching externalJobName, or adds as new entry if not found
     func updateEntry(byExternalJobName jobName: String, with newEntry: HistoryEntry) {
+        // Search current project's entries first (fast path)
         if let index = entries.firstIndex(where: { $0.externalJobName == jobName }) {
             entries[index] = newEntry
+            // Also update allGlobalEntries
+            if let globalIndex = allGlobalEntries.firstIndex(where: { $0.externalJobName == jobName }) {
+                allGlobalEntries[globalIndex] = newEntry
+            }
             saveHistory(for: newEntry.projectId)
-        } else {
-            addEntry(newEntry)
+            return
         }
+
+        // The user may have switched projects while this job was polling.
+        // Load the correct project's history file directly and update it there.
+        let url = historyURL(for: newEntry.projectId)
+        if fileManager.fileExists(atPath: url.path),
+           let data = try? Data(contentsOf: url),
+           var projectEntries = try? decoder.decode([HistoryEntry].self, from: data),
+           let index = projectEntries.firstIndex(where: { $0.externalJobName == jobName }) {
+            projectEntries[index] = newEntry
+            if let encoded = try? encoder.encode(projectEntries) {
+                try? encoded.write(to: url)
+            }
+            // Keep allGlobalEntries in sync
+            if let globalIndex = allGlobalEntries.firstIndex(where: { $0.externalJobName == jobName }) {
+                allGlobalEntries[globalIndex] = newEntry
+            }
+            return
+        }
+
+        // Not found anywhere — add as a new entry
+        addEntry(newEntry)
     }
     
     func clearHistory(for projectId: UUID) {

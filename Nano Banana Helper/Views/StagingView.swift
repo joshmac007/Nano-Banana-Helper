@@ -77,7 +77,19 @@ struct StagingView: View {
             allowsMultipleSelection: true
         ) { result in
             if case .success(let urls) = result {
-                stagingManager.addFiles(urls)
+                // Create security-scoped bookmarks for each URL so we can
+                // access the files later when the batch job runs.
+                var bookmarks: [URL: Data] = [:]
+                for url in urls {
+                    let didStart = url.startAccessingSecurityScopedResource()
+                    if let bookmark = AppPaths.bookmark(for: url) {
+                        bookmarks[url] = bookmark
+                    }
+                    if didStart {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                }
+                stagingManager.addFiles(urls, bookmarks: bookmarks)
             }
         }
     }
@@ -109,20 +121,31 @@ struct StagedImageCell: View {
     let url: URL
     let onDelete: () -> Void
     
+    // Load synchronously — AsyncImage uses URLSession which can't access
+    // security-scoped sandbox URLs after stopAccessingSecurityScopedResource.
+    private var thumbnail: NSImage? {
+        // Try direct load first (works for drag-and-drop and accessible paths)
+        if let img = NSImage(contentsOfFile: url.path) { return img }
+        // Try resolving via bookmark if stored in BatchStagingManager
+        return nil
+    }
+    
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            // Image Preview (AsyncImage logic or placeholder)
-            AsyncImage(url: url) { image in
-                image
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-            } placeholder: {
-                Color.secondary.opacity(0.2)
-                    .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
+            // Image Preview
+            Group {
+                if let img = thumbnail {
+                    Image(nsImage: img)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                } else {
+                    Color.secondary.opacity(0.2)
+                        .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
+                }
             }
             .frame(height: 150)
             .frame(maxWidth: .infinity)
-            .background(Color.black.opacity(0.2)) // Letterbox background
+            .background(Color.black.opacity(0.06))
             .cornerRadius(8)
             .clipped()
             

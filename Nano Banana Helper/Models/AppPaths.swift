@@ -108,7 +108,10 @@ struct AppPaths {
         }
     }
     
-    /// Resolve a security scoped bookmark and start accessing the resource
+    /// Resolve a security scoped bookmark and start accessing the resource.
+    /// - Important: The caller is responsible for calling `stopAccessingSecurityScopedResource()`
+    ///   on the returned URL when done. Prefer `withResolvedBookmark` or `resolveBookmarkToPath`
+    ///   for display-only use cases to avoid leaks.
     static func resolveBookmark(_ data: Data) -> URL? {
         do {
             var isStale = false
@@ -120,8 +123,20 @@ struct AppPaths {
             )
             
             if isStale {
-                print("Bookmark is stale for \(url.path)")
-                // In a perfect world we'd regenerate it here, but we need the original URL context
+                // Attempt to refresh the stale bookmark immediately.
+                // If we can't, return nil to force the user to re-select the file —
+                // a stale bookmark stored on disk will fail silently on next launch.
+                do {
+                    _ = try url.bookmarkData(
+                        options: .withSecurityScope,
+                        includingResourceValuesForKeys: nil,
+                        relativeTo: nil
+                    )
+                    print("⚠️ Stale bookmark refreshed for \(url.path) — caller should persist the updated bookmark")
+                } catch {
+                    print("❌ Could not refresh stale bookmark for \(url.path): \(error). User must re-select the file.")
+                    return nil
+                }
             }
             
             if url.startAccessingSecurityScopedResource() {
@@ -134,5 +149,25 @@ struct AppPaths {
             print("Failed to resolve bookmark: \(error)")
             return nil
         }
+    }
+    
+    /// Resolves a bookmark, executes a closure with the scoped URL, then immediately stops access.
+    /// Use this for short-lived operations (reading file data, loading an image, etc.).
+    @discardableResult
+    static func withResolvedBookmark<T>(_ data: Data, _ body: (URL) throws -> T) rethrows -> T? {
+        guard let url = resolveBookmark(data) else { return nil }
+        defer { url.stopAccessingSecurityScopedResource() }
+        return try body(url)
+    }
+    
+    /// Resolves a bookmark, captures the file-system path, then immediately stops access.
+    /// Safe for display-only use (labels, Finder reveals, FileManager checks) where a live
+    /// security scope is not required.
+    static func resolveBookmarkToPath(_ data: Data) -> String? {
+        var result: String?
+        withResolvedBookmark(data) { url in
+            result = url.path
+        }
+        return result
     }
 }

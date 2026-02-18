@@ -5,8 +5,9 @@ import UserNotifications
 // MARK: - Sendable Helpers
 struct JobSubmissionData: Sendable {
     let id: UUID
-    let inputURLs: [URL]
+    let inputURLs: [URL]       // Security-scoped URLs (already started access)
     let inputPaths: [String]
+    let hasSecurityScope: Bool // Whether we need to stop access after use
 }
 
 struct BatchSettings: Sendable {
@@ -68,8 +69,7 @@ final class BatchOrchestrator {
     
     private var activeBatches: [BatchJob] = []
     private let service = NanoBananaService()
-    private let concurrencyLimit = 1 
-    private let timeoutSeconds: TimeInterval = 300
+    private let concurrencyLimit = 5 // Paid tier: safe default for concurrent submissions
 
     // Callbacks for history/cost tracking
     var onImageCompleted: ((HistoryEntry) -> Void)?
@@ -174,12 +174,11 @@ final class BatchOrchestrator {
             }
         }
         
-        // Cancel API jobs in background
+        // Cancel API jobs in background — capture names (strings) not ImageTask references
+        let namesToCancel = jobsToCancel.compactMap { $0.externalJobName }
         Task {
-            for job in jobsToCancel {
-                if let jobName = job.externalJobName {
-                    try? await service.cancelBatchJob(jobName: jobName)
-                }
+            for jobName in namesToCancel {
+                try? await service.cancelBatchJob(jobName: jobName)
             }
         }
         
@@ -261,8 +260,17 @@ final class BatchOrchestrator {
         
         statusMessage = "Submitting \(jobsToSubmit.count) jobs..."
         
-        let submissionDataList = jobsToSubmit.map { job in
-            JobSubmissionData(id: job.id, inputURLs: job.inputURLs, inputPaths: job.inputPaths)
+        let submissionDataList: [JobSubmissionData] = jobsToSubmit.map { job in
+            // Resolve security-scoped URLs from bookmarks if available.
+            // resolveBookmark calls startAccessingSecurityScopedResource internally.
+            if let bookmarks = job.inputBookmarks, !bookmarks.isEmpty {
+                let resolvedURLs = bookmarks.compactMap { AppPaths.resolveBookmark($0) }
+                if !resolvedURLs.isEmpty {
+                    return JobSubmissionData(id: job.id, inputURLs: resolvedURLs, inputPaths: job.inputPaths, hasSecurityScope: true)
+                }
+            }
+            // Fallback to plain path-based URLs (drag-and-drop, or already-accessible files)
+            return JobSubmissionData(id: job.id, inputURLs: job.inputPaths.map { URL(fileURLWithPath: $0) }, inputPaths: job.inputPaths, hasSecurityScope: false)
         }
         
         let batchSettings = BatchSettings(
@@ -275,12 +283,19 @@ final class BatchOrchestrator {
             projectId: batch.projectId
         )
         
-        // 2. Submit all jobs to get IDs
+        // 2. Submit all jobs to get IDs — throttled to concurrencyLimit concurrent submissions
         await withTaskGroup(of: Void.self) { group in
+            var inFlight = 0
             for data in submissionDataList {
+                // If at capacity, wait for one slot to free before adding another
+                if inFlight >= concurrencyLimit {
+                    await group.next()
+                    inFlight -= 1
+                }
                 group.addTask {
                     await self.performSubmission(data: data, settings: batchSettings)
                 }
+                inFlight += 1
             }
         }
         
@@ -346,6 +361,10 @@ final class BatchOrchestrator {
         do {
             if settings.useBatchTier {
                 let jobInfo = try await service.startBatchJob(request: request)
+                // Stop security-scoped access now that the service has read the file data
+                if data.hasSecurityScope {
+                    data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+                }
                 await MainActor.run {
                      if let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == data.id }) {
                         job.externalJobName = jobInfo.jobName
@@ -371,6 +390,10 @@ final class BatchOrchestrator {
                 }
             } else {
                 let response = try await service.editImage(request)
+                // Stop security-scoped access now that the service has read the file data
+                if data.hasSecurityScope {
+                    data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+                }
                 await handleSuccess(
                     jobId: data.id,
                     data: data,
@@ -380,6 +403,10 @@ final class BatchOrchestrator {
                 )
             }
         } catch {
+            // Always stop security-scoped access on error too
+            if data.hasSecurityScope {
+                data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+            }
             await handleError(jobId: data.id, data: data, settings: settings, error: error)
         }
     }
@@ -403,7 +430,7 @@ final class BatchOrchestrator {
             
             await handleSuccess(
                 jobId: jobId,
-                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: []),
+                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false),
                 settings: settings,
                 response: response,
                 jobName: jobName
@@ -411,7 +438,7 @@ final class BatchOrchestrator {
         } catch {
             await handleError(
                 jobId: jobId,
-                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: []),
+                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false),
                 settings: settings,
                 error: error
             )
@@ -444,7 +471,10 @@ final class BatchOrchestrator {
             
             let cost = settings.cost(inputCount: job.inputPaths.count)
             if let projectId = settings.projectId {
-                let sourceBookmarks = job.inputURLs.compactMap { AppPaths.bookmark(for: $0) }
+                // Use bookmarks already captured before security scope was stopped.
+                // Do NOT use job.inputURLs here — that computed property calls
+                // startAccessingSecurityScopedResource() on an already-stopped resource.
+                let sourceBookmarks = job.inputBookmarks ?? []
                 let outputBookmark = AppPaths.bookmark(for: outputURL)
                 
                 let historyEntry = HistoryEntry(
@@ -514,11 +544,19 @@ final class BatchOrchestrator {
         let directoryURL = URL(fileURLWithPath: directory)
         try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         
-        let inputName = task.inputURL.deletingPathExtension().lastPathComponent
+        let inputName = URL(fileURLWithPath: task.inputPaths.first ?? "image")
+            .deletingPathExtension().lastPathComponent
         let ext = mimeType == "image/png" ? "png" : "jpg"
-        let outputName = "\(inputName)_edited.\(ext)"
+        let baseName = "\(inputName)_edited"
         
-        return directoryURL.appendingPathComponent(outputName)
+        // Find a unique filename to avoid silently overwriting existing outputs
+        var candidate = directoryURL.appendingPathComponent("\(baseName).\(ext)")
+        var counter = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = directoryURL.appendingPathComponent("\(baseName)_\(counter).\(ext)")
+            counter += 1
+        }
+        return candidate
     }
     
     private func updateProgress() {

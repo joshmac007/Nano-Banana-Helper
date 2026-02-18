@@ -91,6 +91,12 @@ struct MainLayoutView: View {
                  projectManager.costSummary.record(cost: cost, resolution: resolution, projectId: projectId)
              }
         }
+        .onDisappear {
+            // Clear callbacks to prevent stale closures from firing if the view is re-created
+            orchestrator.onImageCompleted = nil
+            orchestrator.onHistoryEntryUpdated = nil
+            orchestrator.onCostIncurred = nil
+        }
         .sheet(isPresented: $showingSettings) {
             SettingsView()
                 .environment(projectManager)

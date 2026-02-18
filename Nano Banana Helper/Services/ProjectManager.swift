@@ -195,20 +195,33 @@ class ProjectManager {
     
     // MARK: - Export
     
-    func exportCostReportCSV() -> URL? {
-        var csv = "Date,Project,Resolution,Cost\n"
+    func exportCostReportCSV(entries: [HistoryEntry] = []) -> URL? {
+        var csv = "Date,Project,Prompt,Resolution,Tier,Cost,Status\n"
         
-        // We'd need history entries for full detail
-        // For now, export summary
-        csv += "Summary,All Projects,All Resolutions,\(costSummary.totalSpent)\n"
-        
-        for (resolution, cost) in costSummary.byResolution.sorted(by: { $0.key < $1.key }) {
-            csv += "Summary,All Projects,\(resolution),\(cost)\n"
-        }
-        
-        for (projectId, cost) in costSummary.byProject {
-            let projectName = projects.first { $0.id.uuidString == projectId }?.name ?? "Unknown"
-            csv += "Summary,\(projectName),All Resolutions,\(cost)\n"
+        if entries.isEmpty {
+            // Fallback: summary rows only (no history entries provided)
+            csv += "Summary,All Projects,All Resolutions,All Tiers,\(costSummary.totalSpent),\n"
+            for (resolution, cost) in costSummary.byResolution.sorted(by: { $0.key < $1.key }) {
+                csv += "Summary,All Projects,All Resolutions,\(resolution),,\(cost),\n"
+            }
+            for (projectId, cost) in costSummary.byProject {
+                let projectName = projects.first { $0.id.uuidString == projectId }?.name ?? "Unknown"
+                csv += "Summary,\(projectName),All Resolutions,All Tiers,,\(cost),\n"
+            }
+        } else {
+            // Per-image detail rows
+            let sorted = entries.sorted(by: { $0.timestamp < $1.timestamp })
+            for entry in sorted {
+                let project = projects.first { $0.id == entry.projectId }?.name ?? "Unknown"
+                // Sanitize prompt: truncate, remove commas and newlines
+                let prompt = entry.prompt
+                    .prefix(60)
+                    .replacingOccurrences(of: ",", with: ";")
+                    .replacingOccurrences(of: "\n", with: " ")
+                let tier = entry.usedBatchTier ? "Batch" : "Standard"
+                let date = entry.timestamp.ISO8601Format()
+                csv += "\(date),\(project),\(prompt),\(entry.imageSize),\(tier),\(entry.cost),\(entry.status)\n"
+            }
         }
         
         let exportURL = appSupportURL.appendingPathComponent("cost_report_\(Date().ISO8601Format()).csv")

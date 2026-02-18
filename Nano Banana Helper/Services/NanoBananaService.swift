@@ -22,7 +22,8 @@ struct BatchJobInfo: Sendable {
     let requestKey: String
 }
 
-/// Simple config storage
+/// Simple config storage — @MainActor ensures all reads/writes are serialized
+@MainActor
 struct AppConfig: Codable {
     var apiKey: String?
     var modelName: String?
@@ -49,7 +50,7 @@ actor NanoBananaService {
     
     private var modelName: String {
         get async {
-            await AppConfig.load().modelName ?? "gemini-3-pro-image-preview"
+            await MainActor.run { AppConfig.load().modelName } ?? "gemini-3-pro-image-preview"
         }
     }
     
@@ -69,13 +70,15 @@ actor NanoBananaService {
     // MARK: - API Key Management
     
     func getAPIKey() async -> String? {
-        await AppConfig.load().apiKey
+        await MainActor.run { AppConfig.load().apiKey }
     }
     
     func setAPIKey(_ key: String) async {
-        var config = await AppConfig.load()
-        config.apiKey = key.isEmpty ? nil : key
-        await config.save()
+        await MainActor.run {
+            var config = AppConfig.load()
+            config.apiKey = key.isEmpty ? nil : key
+            config.save()
+        }
     }
     
     func hasAPIKey() async -> Bool {
@@ -138,14 +141,20 @@ actor NanoBananaService {
             throw NanoBananaError.batchError(message: "Total image data (\(totalDataSize / 1024 / 1024)MB) exceeds 20MB limit for batch inline requests. Use smaller images or fewer images per batch.")
         }
         
+        // Build imageConfig — omit aspectRatio entirely when Auto is selected,
+        // because the Gemini API only accepts explicit ratio strings (1:1, 16:9, etc.)
+        // and will return HTTP 400 for any other value.
+        let aspectRatioEntry = AspectRatio.from(string: request.aspectRatio)
+        var imageConfig: [String: Any] = ["imageSize": request.imageSize]
+        if aspectRatioEntry.id != "Auto" {
+            imageConfig["aspectRatio"] = aspectRatioEntry.id
+        }
+        
         var payload: [String: Any] = [
             "contents": [["parts": parts]],
             "generationConfig": [
                 "responseModalities": ["TEXT", "IMAGE"],
-                "imageConfig": [
-                    "aspectRatio": AspectRatio.from(string: request.aspectRatio).apiValue, // Send "auto" or specific ratio
-                    "imageSize": request.imageSize
-                ]
+                "imageConfig": imageConfig
             ]
         ]
         
@@ -268,11 +277,12 @@ actor NanoBananaService {
     private func pollBatchJob(jobName: String, requestKey: String, apiKey: String, onPollUpdate: (@Sendable (Int) -> Void)?) async throws -> ImageEditResponse {
         let pollInterval: UInt64 = 10 * 1_000_000_000 // 10 seconds (docs show this interval)
         let completedStates = Set(["JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"])
+        let maxPollCount = 360 // 360 × 10s = 1 hour max; prevents infinite loop on stuck API state
         var pollCount = 0
         let jobName = jobName.trimmingCharacters(in: .whitespacesAndNewlines)
         var consecutiveErrors = 0
         
-        while true {
+        while pollCount <= maxPollCount {
             pollCount += 1
             onPollUpdate?(pollCount)
             // Poll using the operation name
@@ -362,6 +372,10 @@ actor NanoBananaService {
                 throw error
             }
         }
+
+        // Exceeded maximum poll attempts — the API job is stuck in a non-terminal state
+        await LogManager.shared.log(.error, payload: "Poll timeout after \(maxPollCount) attempts for job: \(jobName)")
+        throw NanoBananaError.timeout
     }
     
     private func extractResultFromResponse(_ response: [String: Any], requestKey: String, apiKey: String) throws -> ImageEditResponse {

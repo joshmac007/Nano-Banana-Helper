@@ -26,8 +26,11 @@ class Project: Codable, Identifiable, Hashable {
     var projectNotes: String?
     
     var outputURL: URL {
-        if let bookmark = outputDirectoryBookmark, let url = AppPaths.resolveBookmark(bookmark) {
-            return url
+        // Resolve the bookmark briefly to capture the path, then stop access immediately.
+        // Display-only: we only need the path string for labels and FileManager checks.
+        if let bookmark = outputDirectoryBookmark,
+           let path = AppPaths.resolveBookmarkToPath(bookmark) {
+            return URL(fileURLWithPath: path)
         }
         return URL(fileURLWithPath: outputDirectory)
     }
@@ -145,20 +148,16 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     var outputImageBookmark: Data?
     
     var sourceURLs: [URL] {
-        // Try to use bookmarks first
-        if let bookmarks = sourceImageBookmarks, bookmarks.count == sourceImagePaths.count {
-            return bookmarks.compactMap { AppPaths.resolveBookmark($0) }
-        }
-        // Fallback to paths (legacy)
+        // Display-only: use plain path-based URLs. Security scope is not needed
+        // for NSImage thumbnail loading or Finder reveals.
         return sourceImagePaths.map { URL(fileURLWithPath: $0) }
     }
     
     var sourceURL: URL { sourceURLs.first ?? URL(fileURLWithPath: "") }
     
     var outputURL: URL {
-        if let bookmark = outputImageBookmark, let url = AppPaths.resolveBookmark(bookmark) {
-            return url
-        }
+        // Display-only: use plain path-based URL. Security scope is not needed
+        // for NSImage thumbnail loading or Finder reveals.
         return URL(fileURLWithPath: outputImagePath)
     }
     
@@ -458,6 +457,7 @@ enum JobPhase: String, Codable {
 class ImageTask: Identifiable, Codable {
     let id: UUID
     let inputPaths: [String] // Changed to array for multimodal support
+    var inputBookmarks: [Data]? // Security-scoped bookmarks for file picker selections
     var outputPath: String?
     var status: String
     var phase: JobPhase
@@ -470,13 +470,14 @@ class ImageTask: Identifiable, Codable {
     var projectId: UUID? // Added for filtering results by project
 
     enum CodingKeys: String, CodingKey {
-        case id, inputPaths, outputPath, status, phase, pollCount, error, startedAt, submittedAt, completedAt, externalJobName, projectId
+        case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount, error, startedAt, submittedAt, completedAt, externalJobName, projectId
     }
 
     required init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
         inputPaths = try container.decode([String].self, forKey: .inputPaths)
+        inputBookmarks = try container.decodeIfPresent([Data].self, forKey: .inputBookmarks)
         outputPath = try container.decodeIfPresent(String.self, forKey: .outputPath)
         status = try container.decode(String.self, forKey: .status)
         phase = try container.decodeIfPresent(JobPhase.self, forKey: .phase) ?? .pending
@@ -493,6 +494,7 @@ class ImageTask: Identifiable, Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
         try container.encode(inputPaths, forKey: .inputPaths)
+        try container.encodeIfPresent(inputBookmarks, forKey: .inputBookmarks)
         try container.encode(outputPath, forKey: .outputPath)
         try container.encode(status, forKey: .status)
         try container.encode(phase, forKey: .phase)
@@ -505,18 +507,20 @@ class ImageTask: Identifiable, Codable {
         try container.encode(projectId, forKey: .projectId)
     }
     
-    init(inputPaths: [String], projectId: UUID? = nil) {
+    init(inputPaths: [String], projectId: UUID? = nil, inputBookmarks: [Data]? = nil) {
         self.id = UUID()
         self.inputPaths = inputPaths
+        self.inputBookmarks = inputBookmarks
         self.status = "pending"
         self.phase = .pending
         self.pollCount = 0
         self.projectId = projectId
     }
     
-    init(inputPath: String, projectId: UUID? = nil) {
+    init(inputPath: String, projectId: UUID? = nil, inputBookmark: Data? = nil) {
         self.id = UUID()
         self.inputPaths = [inputPath]
+        self.inputBookmarks = inputBookmark.map { [$0] }
         self.status = "pending"
         self.phase = .pending
         self.pollCount = 0
@@ -526,8 +530,11 @@ class ImageTask: Identifiable, Codable {
     // Backward compatibility for single input path
     var inputPath: String { inputPaths.first ?? "" }
     
+    /// Returns plain path-based URLs for display purposes.
+    /// For security-scoped access during batch processing, use `inputBookmarks` via
+    /// `AppPaths.withResolvedBookmark` or `AppPaths.resolveBookmark` (with paired stop call).
     var inputURLs: [URL] { inputPaths.map { URL(fileURLWithPath: $0) } }
-    var inputURL: URL { inputURLs.first ?? URL(fileURLWithPath: "") }
+    var inputURL: URL { URL(fileURLWithPath: inputPath) }
     var outputURL: URL? { outputPath.map { URL(fileURLWithPath: $0) } }
     var filename: String { 
         if inputPaths.count > 1 {
@@ -535,7 +542,8 @@ class ImageTask: Identifiable, Codable {
             let count = status == "completed" ? "1" : "\(inputPaths.count)"
             return "Multimodal (\(count) \(label))"
         }
-        return inputURL.lastPathComponent 
+        // Use the path string directly — no bookmark resolution needed for a display name.
+        return URL(fileURLWithPath: inputPath).lastPathComponent
     }
     var errorMessage: String? { error }
     var duration: TimeInterval? {

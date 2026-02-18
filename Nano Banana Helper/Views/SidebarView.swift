@@ -10,6 +10,10 @@ struct SidebarView: View {
     @State private var newProjectName = ""
     @State private var newProjectDirectory = ""
     
+    // MARK: - Rename State
+    @State private var projectToRename: Project?
+    @State private var renameText = ""
+    
     var body: some View {
         VStack(spacing: 0) {
             // Header
@@ -43,6 +47,20 @@ struct SidebarView: View {
                                 Text(project.name)
                             }
                         }
+                        .contextMenu {
+                            Button("Rename...") {
+                                renameText = project.name
+                                projectToRename = project
+                            }
+                            Button("Open Output Folder") {
+                                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: project.outputDirectory)
+                            }
+                            Divider()
+                            Button("Delete Project", role: .destructive) {
+                                projectManager.deleteProject(project)
+                            }
+                            .disabled(projectManager.projects.count <= 1)
+                        }
                     }
                 }
                 
@@ -56,6 +74,20 @@ struct SidebarView: View {
                                     Text(project.name)
                                         .foregroundStyle(.secondary)
                                 }
+                            }
+                            .contextMenu {
+                                Button("Rename...") {
+                                    renameText = project.name
+                                    projectToRename = project
+                                }
+                                Button("Unarchive") {
+                                    projectManager.unarchiveProject(project)
+                                }
+                                Divider()
+                                Button("Delete Project", role: .destructive) {
+                                    projectManager.deleteProject(project)
+                                }
+                                .disabled(projectManager.projects.count <= 1)
                             }
                         }
                     }
@@ -108,6 +140,26 @@ struct SidebarView: View {
         }
         .sheet(isPresented: $showingCostReport) {
             CostReportView(costSummary: projectManager.costSummary, projects: projectManager.projects)
+        }
+        .alert("Rename Project", isPresented: Binding(
+            get: { projectToRename != nil },
+            set: { if !$0 { projectToRename = nil } }
+        )) {
+            TextField("Project name", text: $renameText)
+            Button("Cancel", role: .cancel) {
+                projectToRename = nil
+                renameText = ""
+            }
+            Button("Rename") {
+                if let project = projectToRename {
+                    projectManager.renameProject(project, to: renameText)
+                }
+                projectToRename = nil
+                renameText = ""
+            }
+            .disabled(renameText.isEmpty)
+        } message: {
+            Text("Enter a new name for this project.")
         }
     }
     

@@ -271,18 +271,23 @@ struct InspectorView: View {
         if stagingManager.isMultiInput {
             // All staged files become ONE task with multiple inputs
             let inputPaths = stagingManager.stagedFiles.map { $0.path }
-            tasks = [ImageTask(inputPaths: inputPaths)]
+            let inputBookmarks = stagingManager.stagedFiles.compactMap { stagingManager.bookmark(for: $0) }
+            tasks = [ImageTask(
+                inputPaths: inputPaths,
+                inputBookmarks: inputBookmarks.isEmpty ? nil : inputBookmarks
+            )]
         } else {
             // Standard: One task per file
             tasks = stagingManager.stagedFiles.map { url in
-                ImageTask(inputPath: url.path)
+                ImageTask(
+                    inputPath: url.path,
+                    inputBookmark: stagingManager.bookmark(for: url)
+                )
             }
         }
         batch.tasks = tasks
         
         orchestrator.enqueue(batch)
-        
-
         
         // Clear staging
         withAnimation {

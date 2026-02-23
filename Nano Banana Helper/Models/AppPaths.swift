@@ -2,6 +2,11 @@ import Foundation
 
 /// Centralized management of application storage paths and data migration
 struct AppPaths {
+    struct ResolvedSecurityScopedBookmark {
+        let url: URL
+        let refreshedBookmarkData: Data?
+    }
+
     /// The primary application support directory for the current app version
     static let appSupportURL: URL = {
         let fileManager = FileManager.default
@@ -113,6 +118,12 @@ struct AppPaths {
     ///   on the returned URL when done. Prefer `withResolvedBookmark` or `resolveBookmarkToPath`
     ///   for display-only use cases to avoid leaks.
     static func resolveBookmark(_ data: Data) -> URL? {
+        resolveBookmarkAccess(data)?.url
+    }
+
+    /// Resolve a bookmark, start accessing it, and return any refreshed bookmark data when stale.
+    /// - Important: Caller must stop accessing `url` when done.
+    static func resolveBookmarkAccess(_ data: Data) -> ResolvedSecurityScopedBookmark? {
         do {
             var isStale = false
             let url = try URL(
@@ -122,12 +133,13 @@ struct AppPaths {
                 bookmarkDataIsStale: &isStale
             )
             
+            var refreshedBookmarkData: Data?
             if isStale {
                 // Attempt to refresh the stale bookmark immediately.
                 // If we can't, return nil to force the user to re-select the file —
                 // a stale bookmark stored on disk will fail silently on next launch.
                 do {
-                    _ = try url.bookmarkData(
+                    refreshedBookmarkData = try url.bookmarkData(
                         options: .withSecurityScope,
                         includingResourceValuesForKeys: nil,
                         relativeTo: nil
@@ -140,7 +152,10 @@ struct AppPaths {
             }
             
             if url.startAccessingSecurityScopedResource() {
-                return url
+                return ResolvedSecurityScopedBookmark(
+                    url: url,
+                    refreshedBookmarkData: refreshedBookmarkData
+                )
             } else {
                 print("Failed to access security scoped resource: \(url.path)")
                 return nil

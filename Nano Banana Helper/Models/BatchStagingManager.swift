@@ -9,6 +9,22 @@ class BatchStagingManager {
     // Security-scoped bookmarks keyed by URL, for files selected via file picker
     var stagedBookmarks: [URL: Data] = [:]
     
+    struct DrawingPath: Identifiable, Sendable {
+        let id = UUID()
+        var points: [CGPoint]
+        var size: CGFloat
+        var isEraser: Bool = false
+    }
+    
+    struct StagedMaskEdit: Sendable {
+        let maskData: Data
+        let prompt: String
+        let paths: [DrawingPath]
+    }
+    
+    // Saved mask edits keyed by URL
+    var stagedMaskEdits: [URL: StagedMaskEdit] = [:]
+    
     // Batch Configuration (Synced with Inspector)
     var prompt: String = ""
     var systemPrompt: String = "" // New System Prompt
@@ -16,10 +32,34 @@ class BatchStagingManager {
     var imageSize: String = "4K"
     var isBatchTier: Bool = false
     var isMultiInput: Bool = false
+    var textToImageCount: Int = 1 // Support for generating without input images
     
     // Derived Properties
     var isEmpty: Bool { stagedFiles.isEmpty }
-    var count: Int { stagedFiles.count }
+    var count: Int { stagedFiles.isEmpty ? textToImageCount : stagedFiles.count }
+    
+    var hasSufficientPrompts: Bool {
+        if !prompt.isEmpty { return true }
+        if stagedFiles.isEmpty { return false } // Text-to-image requires a prompt
+        
+        if isMultiInput {
+            // In multi-input, we just need at least one mask edit with a prompt
+            return stagedFiles.contains { url in
+                stagedMaskEdits[url]?.prompt.isEmpty == false
+            }
+        } else {
+            // In standard mode, EVERY image without its own mask prompt needs the global prompt
+            // Thus if global prompt is empty, EVERY file must have a mask prompt
+            return stagedFiles.allSatisfy { url in
+                stagedMaskEdits[url]?.prompt.isEmpty == false
+            }
+        }
+    }
+    
+    var canStartBatch: Bool {
+        let hasValidInput = !stagedFiles.isEmpty || (textToImageCount > 0 && aspectRatio != "Auto")
+        return hasValidInput && hasSufficientPrompts
+    }
     
     // Actions
     func addFiles(_ urls: [URL], bookmarks: [URL: Data] = [:]) {
@@ -38,11 +78,14 @@ class BatchStagingManager {
     func removeFile(_ url: URL) {
         stagedFiles.removeAll { $0 == url }
         stagedBookmarks.removeValue(forKey: url)
+        stagedMaskEdits.removeValue(forKey: url)
     }
     
     func clearAll() {
         stagedFiles.removeAll()
         stagedBookmarks.removeAll()
+        stagedMaskEdits.removeAll()
+        // Do NOT clear system prompt on batch clear, it's persistent configuration
     }
     
     func bookmark(for url: URL) -> Data? {
@@ -56,5 +99,13 @@ class BatchStagingManager {
         if let s = size { self.imageSize = s }
         if let b = batch { self.isBatchTier = b }
         if let m = multiInput { self.isMultiInput = m }
+    }
+    
+    func saveMaskEdit(for url: URL, maskData: Data, prompt: String, paths: [DrawingPath]) {
+        stagedMaskEdits[url] = StagedMaskEdit(maskData: maskData, prompt: prompt, paths: paths)
+    }
+    
+    func hasMaskEdit(for url: URL) -> Bool {
+        return stagedMaskEdits[url] != nil
     }
 }

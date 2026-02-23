@@ -6,6 +6,13 @@ struct StagingView: View {
     @State private var isTargeted = false
     @State private var showingFilePicker = false
     
+    struct EditableImage: Identifiable {
+        let url: URL
+        let bookmark: Data?
+        var id: URL { url }
+    }
+    @State private var selectedImageForEditing: EditableImage?
+    
     var body: some View {
         ZStack {
             // Empty State / Drop Zone
@@ -16,9 +23,15 @@ struct StagingView: View {
                 ScrollView {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 200), spacing: 16)], spacing: 16) {
                         ForEach(stagingManager.stagedFiles, id: \.self) { url in
-                            StagedImageCell(url: url) {
-                                stagingManager.removeFile(url)
-                            }
+                            StagedImageCell(
+                                url: url,
+                                bookmark: stagingManager.bookmark(for: url),
+                                hasMaskEdit: stagingManager.hasMaskEdit(for: url),
+                                onDelete: { stagingManager.removeFile(url) },
+                                onEdit: { 
+                                    selectedImageForEditing = EditableImage(url: url, bookmark: stagingManager.bookmark(for: url))
+                                }
+                            )
                         }
                         
                         // Add More Button
@@ -55,6 +68,19 @@ struct StagingView: View {
                             .padding(20)
                     )
             }
+        }
+        .sheet(item: $selectedImageForEditing) { editable in
+            let existingEdit = stagingManager.stagedMaskEdits[editable.url]
+            ImageMaskEditorView(
+                inputImageURL: editable.url,
+                inputBookmark: editable.bookmark,
+                initialPaths: existingEdit?.paths,
+                initialPrompt: existingEdit?.prompt,
+                initialMaskData: existingEdit?.maskData,
+                onSaveMask: { maskData, prompt, paths in
+                    stagingManager.saveMaskEdit(for: editable.url, maskData: maskData, prompt: prompt, paths: paths)
+                }
+            )
         }
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
             // Handle Drop
@@ -119,14 +145,24 @@ struct StagingView: View {
 
 struct StagedImageCell: View {
     let url: URL
+    let bookmark: Data?
+    let hasMaskEdit: Bool
     let onDelete: () -> Void
+    let onEdit: () -> Void
     
     // Load synchronously — AsyncImage uses URLSession which can't access
     // security-scoped sandbox URLs after stopAccessingSecurityScopedResource.
     private var thumbnail: NSImage? {
         // Try direct load first (works for drag-and-drop and accessible paths)
         if let img = NSImage(contentsOfFile: url.path) { return img }
+        
         // Try resolving via bookmark if stored in BatchStagingManager
+        if let data = bookmark {
+            return AppPaths.withResolvedBookmark(data) { resolvedURL in
+                return NSImage(contentsOfFile: resolvedURL.path)
+            }?.flatMap { $0 }
+        }
+        
         return nil
     }
     
@@ -149,14 +185,41 @@ struct StagedImageCell: View {
             .cornerRadius(8)
             .clipped()
             
-            // Delete Button
-            Button(action: onDelete) {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.white, .black.opacity(0.5))
-                    .font(.title3)
+            // Actions (Delete & Edit)
+            HStack(spacing: 4) {
+                Button(action: onEdit) {
+                    Image(systemName: "pencil.circle.fill")
+                        .foregroundStyle(.white, .black.opacity(0.5))
+                        .font(.title3)
+                }
+                .buttonStyle(.plain)
+                
+                Button(action: onDelete) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.white, .black.opacity(0.5))
+                        .font(.title3)
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
             .padding(6)
+            
+            // Mask Indicator Badge
+            if hasMaskEdit {
+                VStack {
+                    HStack {
+                        Image(systemName: "paintbrush.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.white)
+                            .padding(4)
+                            .background(Color.blue)
+                            .clipShape(Circle())
+                            .shadow(radius: 1)
+                        Spacer()
+                    }
+                    Spacer()
+                }
+                .padding(6)
+            }
         }
         .overlay(
             VStack {

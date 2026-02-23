@@ -38,7 +38,7 @@ struct InspectorView: View {
                     .controlSize(.large)
                     .padding(.horizontal)
                     .padding(.top)
-                    .disabled(stagingManager.isEmpty || stagingManager.prompt.isEmpty)
+                    .disabled(!stagingManager.canStartBatch)
                     
                     if let project = projectManager.currentProject {
                         OutputLocationView(project: project) { newURL, newBookmark in
@@ -169,6 +169,16 @@ struct InspectorView: View {
                                 .textCase(.uppercase)
                             
                             AspectRatioSelector(selectedRatio: $stagingManager.aspectRatio)
+                            
+                            if stagingManager.isEmpty && stagingManager.aspectRatio == "Auto" && !stagingManager.prompt.isEmpty {
+                                Label("Aspect ratio required for Text-to-Image", systemImage: "info.circle.fill")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 4)
+                                    .background(Color.orange.opacity(0.15))
+                                    .foregroundStyle(.orange)
+                                    .cornerRadius(4)
+                            }
                         }
                         
                         // Size Row
@@ -206,21 +216,38 @@ struct InspectorView: View {
                                 .labelsHidden()
                         }
                         
-                        // Multi-Input Toggle
-                        HStack(alignment: .top) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Multi-Input Mode")
-                                    .font(.system(size: 11, weight: .bold)) // Standardized header
-                                    .foregroundStyle(.primary)
-                                    .textCase(.uppercase)
-                                Text("Merge all to 1 output.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                        if stagingManager.isEmpty {
+                            // Text-To-Image stepper
+                            HStack(alignment: .top) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Generated Images")
+                                        .font(.system(size: 11, weight: .bold)) // Standardized header
+                                        .foregroundStyle(.primary)
+                                        .textCase(.uppercase)
+                                    Text("Number of images to generate.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Stepper("\(stagingManager.textToImageCount)", value: $stagingManager.textToImageCount, in: 1...100)
                             }
-                            Spacer()
-                            Toggle("", isOn: $stagingManager.isMultiInput)
-                                .toggleStyle(.switch)
-                                .labelsHidden()
+                        } else {
+                            // Multi-Input Toggle
+                            HStack(alignment: .top) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Multi-Input Mode")
+                                        .font(.system(size: 11, weight: .bold)) // Standardized header
+                                        .foregroundStyle(.primary)
+                                        .textCase(.uppercase)
+                                    Text("Merge all to 1 output.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Toggle("", isOn: $stagingManager.isMultiInput)
+                                    .toggleStyle(.switch)
+                                    .labelsHidden()
+                            }
                         }
                     }
                     .padding(.horizontal)
@@ -262,26 +289,40 @@ struct InspectorView: View {
             aspectRatio: stagingManager.aspectRatio,
             imageSize: stagingManager.imageSize,
             outputDirectory: project.outputDirectory,
+            outputDirectoryBookmark: project.outputDirectoryBookmark,
             useBatchTier: stagingManager.isBatchTier,
             projectId: project.id
         )
         
         // Handle Multi-Input vs Standard Batch
         let tasks: [ImageTask]
-        if stagingManager.isMultiInput {
+        if stagingManager.isEmpty {
+            tasks = (0..<stagingManager.textToImageCount).map { _ in
+                ImageTask(inputPaths: [])
+            }
+        } else if stagingManager.isMultiInput {
             // All staged files become ONE task with multiple inputs
             let inputPaths = stagingManager.stagedFiles.map { $0.path }
             let inputBookmarks = stagingManager.stagedFiles.compactMap { stagingManager.bookmark(for: $0) }
+            // For multi-input, if a mask was provided, we'll arbitrarily use the first one available
+            let firstMaskURL = stagingManager.stagedFiles.first { stagingManager.hasMaskEdit(for: $0) }
+            let stagedEdit = firstMaskURL.flatMap { stagingManager.stagedMaskEdits[$0] }
+            
             tasks = [ImageTask(
                 inputPaths: inputPaths,
-                inputBookmarks: inputBookmarks.isEmpty ? nil : inputBookmarks
+                inputBookmarks: inputBookmarks.isEmpty ? nil : inputBookmarks,
+                maskImageData: stagedEdit?.maskData,
+                customPrompt: stagedEdit?.prompt
             )]
         } else {
             // Standard: One task per file
             tasks = stagingManager.stagedFiles.map { url in
-                ImageTask(
+                let stagedEdit = stagingManager.stagedMaskEdits[url]
+                return ImageTask(
                     inputPath: url.path,
-                    inputBookmark: stagingManager.bookmark(for: url)
+                    inputBookmark: stagingManager.bookmark(for: url),
+                    maskImageData: stagedEdit?.maskData,
+                    customPrompt: stagedEdit?.prompt
                 )
             }
         }

@@ -93,7 +93,6 @@ struct SettingsView: View {
                                     .textFieldStyle(.plain)
                                     .opacity(showKey ? 1 : 0)
                                     .disabled(!showKey)
-                                    .offset(y: -1.0) // Correct macOS baseline shift
                             }
                             .font(.system(.body, design: .monospaced))
                             .padding(.horizontal, 8)

@@ -111,6 +111,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     let status: String // "completed", "cancelled", "failed"
     let error: String?
     let externalJobName: String?
+    let maskImageData: Data?
     
     init(
         projectId: UUID,
@@ -138,6 +139,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.status = status
         self.error = error
         self.externalJobName = externalJobName
+        self.maskImageData = nil
     }
     
     // Backward compatibility for single source path
@@ -166,6 +168,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         case prompt, aspectRatio, imageSize, usedBatchTier, cost
         case status, error, externalJobName
         case sourceImageBookmarks, outputImageBookmark
+        case maskImageData
     }
     
     init(
@@ -181,7 +184,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         error: String? = nil,
         externalJobName: String? = nil,
         sourceImageBookmarks: [Data]? = nil,
-        outputImageBookmark: Data? = nil
+        outputImageBookmark: Data? = nil,
+        maskImageData: Data? = nil
     ) {
         self.id = UUID()
         self.projectId = projectId
@@ -198,6 +202,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.externalJobName = externalJobName
         self.sourceImageBookmarks = sourceImageBookmarks
         self.outputImageBookmark = outputImageBookmark
+        self.maskImageData = maskImageData
     }
     
     init(from decoder: Decoder) throws {
@@ -217,6 +222,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
         sourceImageBookmarks = try container.decodeIfPresent([Data].self, forKey: .sourceImageBookmarks)
         outputImageBookmark = try container.decodeIfPresent(Data.self, forKey: .outputImageBookmark)
+        maskImageData = try container.decodeIfPresent(Data.self, forKey: .maskImageData)
     }
     
     func encode(to encoder: Encoder) throws {
@@ -236,6 +242,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         try container.encodeIfPresent(externalJobName, forKey: .externalJobName)
         try container.encodeIfPresent(sourceImageBookmarks, forKey: .sourceImageBookmarks)
         try container.encodeIfPresent(outputImageBookmark, forKey: .outputImageBookmark)
+        try container.encodeIfPresent(maskImageData, forKey: .maskImageData)
     }
 }
 
@@ -319,12 +326,14 @@ class BatchJob: Identifiable, Codable {
     var aspectRatio: String
     var imageSize: String
     var outputDirectory: String
+    var outputDirectoryBookmark: Data?
     var useBatchTier: Bool
     var status: String
     var tasks: [ImageTask]
+    var maskImageData: Data?
 
     enum CodingKeys: String, CodingKey {
-        case id, createdAt, projectId, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, useBatchTier, status, tasks
+        case id, createdAt, projectId, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, outputDirectoryBookmark, useBatchTier, status, tasks, maskImageData
     }
 
     required init(from decoder: Decoder) throws {
@@ -337,9 +346,11 @@ class BatchJob: Identifiable, Codable {
         aspectRatio = try container.decode(String.self, forKey: .aspectRatio)
         imageSize = try container.decode(String.self, forKey: .imageSize)
         outputDirectory = try container.decode(String.self, forKey: .outputDirectory)
+        outputDirectoryBookmark = try container.decodeIfPresent(Data.self, forKey: .outputDirectoryBookmark)
         useBatchTier = try container.decode(Bool.self, forKey: .useBatchTier)
         status = try container.decode(String.self, forKey: .status)
         tasks = try container.decode([ImageTask].self, forKey: .tasks)
+        maskImageData = try container.decodeIfPresent(Data.self, forKey: .maskImageData)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -352,9 +363,11 @@ class BatchJob: Identifiable, Codable {
         try container.encode(aspectRatio, forKey: .aspectRatio)
         try container.encode(imageSize, forKey: .imageSize)
         try container.encode(outputDirectory, forKey: .outputDirectory)
+        try container.encodeIfPresent(outputDirectoryBookmark, forKey: .outputDirectoryBookmark)
         try container.encode(useBatchTier, forKey: .useBatchTier)
         try container.encode(status, forKey: .status)
         try container.encode(tasks, forKey: .tasks)
+        try container.encodeIfPresent(maskImageData, forKey: .maskImageData)
     }
     
     init(
@@ -363,8 +376,10 @@ class BatchJob: Identifiable, Codable {
         aspectRatio: String = "16:9",
         imageSize: String = "4K",
         outputDirectory: String,
+        outputDirectoryBookmark: Data? = nil,
         useBatchTier: Bool = false,
-        projectId: UUID? = nil
+        projectId: UUID? = nil,
+        maskImageData: Data? = nil
     ) {
         self.id = UUID()
         self.createdAt = Date()
@@ -374,9 +389,11 @@ class BatchJob: Identifiable, Codable {
         self.aspectRatio = aspectRatio
         self.imageSize = imageSize
         self.outputDirectory = outputDirectory
+        self.outputDirectoryBookmark = outputDirectoryBookmark
         self.useBatchTier = useBatchTier
         self.status = "pending"
         self.tasks = []
+        self.maskImageData = maskImageData
     }
     
     var pendingCount: Int { tasks.filter { $0.status == "pending" }.count }
@@ -468,9 +485,11 @@ class ImageTask: Identifiable, Codable {
     var completedAt: Date?
     var externalJobName: String? // Store Gemini API job ID
     var projectId: UUID? // Added for filtering results by project
+    var maskImageData: Data? // Added for inpainting
+    var customPrompt: String? // Added for overriding
 
     enum CodingKeys: String, CodingKey {
-        case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount, error, startedAt, submittedAt, completedAt, externalJobName, projectId
+        case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount, error, startedAt, submittedAt, completedAt, externalJobName, projectId, maskImageData, customPrompt
     }
 
     required init(from decoder: Decoder) throws {
@@ -488,6 +507,8 @@ class ImageTask: Identifiable, Codable {
         completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
         projectId = try container.decodeIfPresent(UUID.self, forKey: .projectId)
+        maskImageData = try container.decodeIfPresent(Data.self, forKey: .maskImageData)
+        customPrompt = try container.decodeIfPresent(String.self, forKey: .customPrompt)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -505,9 +526,11 @@ class ImageTask: Identifiable, Codable {
         try container.encode(completedAt, forKey: .completedAt)
         try container.encode(externalJobName, forKey: .externalJobName)
         try container.encode(projectId, forKey: .projectId)
+        try container.encodeIfPresent(maskImageData, forKey: .maskImageData)
+        try container.encodeIfPresent(customPrompt, forKey: .customPrompt)
     }
     
-    init(inputPaths: [String], projectId: UUID? = nil, inputBookmarks: [Data]? = nil) {
+    init(inputPaths: [String], projectId: UUID? = nil, inputBookmarks: [Data]? = nil, maskImageData: Data? = nil, customPrompt: String? = nil) {
         self.id = UUID()
         self.inputPaths = inputPaths
         self.inputBookmarks = inputBookmarks
@@ -515,9 +538,11 @@ class ImageTask: Identifiable, Codable {
         self.phase = .pending
         self.pollCount = 0
         self.projectId = projectId
+        self.maskImageData = maskImageData
+        self.customPrompt = customPrompt
     }
     
-    init(inputPath: String, projectId: UUID? = nil, inputBookmark: Data? = nil) {
+    init(inputPath: String, projectId: UUID? = nil, inputBookmark: Data? = nil, maskImageData: Data? = nil, customPrompt: String? = nil) {
         self.id = UUID()
         self.inputPaths = [inputPath]
         self.inputBookmarks = inputBookmark.map { [$0] }
@@ -525,6 +550,8 @@ class ImageTask: Identifiable, Codable {
         self.phase = .pending
         self.pollCount = 0
         self.projectId = projectId
+        self.maskImageData = maskImageData
+        self.customPrompt = customPrompt
     }
     
     // Backward compatibility for single input path
@@ -537,6 +564,9 @@ class ImageTask: Identifiable, Codable {
     var inputURL: URL { URL(fileURLWithPath: inputPath) }
     var outputURL: URL? { outputPath.map { URL(fileURLWithPath: $0) } }
     var filename: String { 
+        if inputPaths.isEmpty {
+            return "Text to Image"
+        }
         if inputPaths.count > 1 {
             let label = status == "completed" ? "output" : "inputs"
             let count = status == "completed" ? "1" : "\(inputPaths.count)"

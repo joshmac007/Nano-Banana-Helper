@@ -298,7 +298,7 @@ struct TaskRowView: View {
                     Text(error)
                         .font(.caption)
                         .foregroundStyle(.red)
-                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 } else if let duration = task.duration {
                     Text(String(format: "%.1fs", duration))
                         .font(.caption)

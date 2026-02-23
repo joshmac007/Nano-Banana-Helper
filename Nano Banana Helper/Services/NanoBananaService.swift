@@ -3,6 +3,7 @@ import Foundation
 /// Request structure for image editing
 struct ImageEditRequest: Sendable {
     let inputImageURLs: [URL] // Changed to array
+    let maskImageData: Data? // Added for inpainting
     let prompt: String
     let systemInstruction: String?
     let aspectRatio: String
@@ -148,6 +149,17 @@ actor NanoBananaService {
         var imageConfig: [String: Any] = ["imageSize": request.imageSize]
         if aspectRatioEntry.id != "Auto" {
             imageConfig["aspectRatio"] = aspectRatioEntry.id
+        }
+        
+        // Add mask image if we have one
+        if let maskImageData = request.maskImageData {
+            // Append mask image to parts (as the first or second image depending on order API expects; usually second after base)
+            parts.append([
+                "inlineData": [
+                    "mimeType": "image/png",
+                    "data": maskImageData.base64EncodedString()
+                ]
+            ])
         }
         
         var payload: [String: Any] = [
@@ -369,6 +381,7 @@ actor NanoBananaService {
                 }
                 
                 // Rethrow other errors
+                await LogManager.shared.log(.error, payload: "Poll failed with error: \(error.localizedDescription)")
                 throw error
             }
         }
@@ -458,6 +471,9 @@ actor NanoBananaService {
             }
         }
         
+        Task { @MainActor in
+            LogManager.shared.log(.error, payload: "No valid image found in batch dest JSONL results")
+        }
         throw NanoBananaError.noImageInResponse
     }
     
@@ -585,6 +601,9 @@ actor NanoBananaService {
             }
         }
         
+        Task { @MainActor in
+            LogManager.shared.log(.error, payload: "No valid image found in candidates or parts")
+        }
         throw NanoBananaError.noImageInResponse
     }
     

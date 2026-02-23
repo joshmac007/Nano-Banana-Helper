@@ -76,6 +76,9 @@ struct WorkbenchView: View {
                                 let url = URL(fileURLWithPath: path)
                                 if FileManager.default.fileExists(atPath: path) {
                                     stagingManager.addFiles([url])
+                                    if let maskData = entry.maskImageData {
+                                        stagingManager.saveMaskEdit(for: url, maskData: maskData, prompt: entry.prompt, paths: [])
+                                    }
                                 }
                             }
                         },

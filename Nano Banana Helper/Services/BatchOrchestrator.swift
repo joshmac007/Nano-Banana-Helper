@@ -8,6 +8,8 @@ struct JobSubmissionData: Sendable {
     let inputURLs: [URL]       // Security-scoped URLs (already started access)
     let inputPaths: [String]
     let hasSecurityScope: Bool // Whether we need to stop access after use
+    let maskImageData: Data?   // Added for inpainting
+    let customPrompt: String?  // Added for individual custom prompts
 }
 
 struct BatchSettings: Sendable {
@@ -16,13 +18,14 @@ struct BatchSettings: Sendable {
     let aspectRatio: String
     let imageSize: String
     let outputDirectory: String
+    let outputDirectoryBookmark: Data?
     let useBatchTier: Bool
     let projectId: UUID?
     
     // Helper for cost calculation
     func cost(inputCount: Int) -> Double {
         let inputRate = useBatchTier ? 0.0006 : 0.0011
-        let inputCost = inputRate * Double(max(1, inputCount))
+        let inputCost = inputRate * Double(inputCount)
         
         let outputCost: Double
         if useBatchTier {
@@ -266,11 +269,11 @@ final class BatchOrchestrator {
             if let bookmarks = job.inputBookmarks, !bookmarks.isEmpty {
                 let resolvedURLs = bookmarks.compactMap { AppPaths.resolveBookmark($0) }
                 if !resolvedURLs.isEmpty {
-                    return JobSubmissionData(id: job.id, inputURLs: resolvedURLs, inputPaths: job.inputPaths, hasSecurityScope: true)
+                    return JobSubmissionData(id: job.id, inputURLs: resolvedURLs, inputPaths: job.inputPaths, hasSecurityScope: true, maskImageData: job.maskImageData ?? batch.maskImageData, customPrompt: job.customPrompt)
                 }
             }
             // Fallback to plain path-based URLs (drag-and-drop, or already-accessible files)
-            return JobSubmissionData(id: job.id, inputURLs: job.inputPaths.map { URL(fileURLWithPath: $0) }, inputPaths: job.inputPaths, hasSecurityScope: false)
+            return JobSubmissionData(id: job.id, inputURLs: job.inputPaths.map { URL(fileURLWithPath: $0) }, inputPaths: job.inputPaths, hasSecurityScope: false, maskImageData: job.maskImageData ?? batch.maskImageData, customPrompt: job.customPrompt)
         }
         
         let batchSettings = BatchSettings(
@@ -279,6 +282,7 @@ final class BatchOrchestrator {
             aspectRatio: batch.aspectRatio,
             imageSize: batch.imageSize,
             outputDirectory: batch.outputDirectory,
+            outputDirectoryBookmark: batch.outputDirectoryBookmark,
             useBatchTier: batch.useBatchTier,
             projectId: batch.projectId
         )
@@ -351,7 +355,8 @@ final class BatchOrchestrator {
         
         let request = ImageEditRequest(
             inputImageURLs: data.inputURLs,
-            prompt: settings.prompt,
+            maskImageData: data.maskImageData,
+            prompt: data.customPrompt ?? settings.prompt,
             systemInstruction: settings.systemPrompt,
             aspectRatio: settings.aspectRatio,
             imageSize: settings.imageSize,
@@ -376,7 +381,7 @@ final class BatchOrchestrator {
                                 projectId: projectId,
                                 sourceImagePaths: job.inputPaths,
                                 outputImagePath: "",
-                                prompt: settings.prompt,
+                                prompt: data.customPrompt ?? settings.prompt,
                                 aspectRatio: settings.aspectRatio,
                                 imageSize: settings.imageSize,
                                 usedBatchTier: settings.useBatchTier,
@@ -430,7 +435,7 @@ final class BatchOrchestrator {
             
             await handleSuccess(
                 jobId: jobId,
-                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false),
+                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false, maskImageData: nil, customPrompt: nil),
                 settings: settings,
                 response: response,
                 jobName: jobName
@@ -438,7 +443,7 @@ final class BatchOrchestrator {
         } catch {
             await handleError(
                 jobId: jobId,
-                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false),
+                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false, maskImageData: nil, customPrompt: nil),
                 settings: settings,
                 error: error
             )
@@ -455,9 +460,25 @@ final class BatchOrchestrator {
     private func handleSuccess(jobId: UUID, data: JobSubmissionData, settings: BatchSettings, response: ImageEditResponse, jobName: String?) async {
         guard let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == jobId }) else { return }
         
+        var requiresStopAccess = false
+        var directoryURL: URL!
+        if let bookmark = settings.outputDirectoryBookmark,
+           let resolved = AppPaths.resolveBookmark(bookmark) {
+            directoryURL = resolved
+            requiresStopAccess = true
+        } else {
+            directoryURL = URL(fileURLWithPath: settings.outputDirectory)
+        }
+        
+        defer {
+            if requiresStopAccess {
+                directoryURL.stopAccessingSecurityScopedResource()
+            }
+        }
+        
         let outputURL = generateOutputURL(
             for: job,
-            in: settings.outputDirectory,
+            inDirectory: directoryURL,
             mimeType: response.mimeType
         )
         
@@ -481,7 +502,7 @@ final class BatchOrchestrator {
                     projectId: projectId,
                     sourceImagePaths: job.inputPaths,
                     outputImagePath: outputURL.path,
-                    prompt: settings.prompt,
+                    prompt: job.customPrompt ?? settings.prompt,
                     aspectRatio: settings.aspectRatio,
                     imageSize: settings.imageSize,
                     usedBatchTier: settings.useBatchTier,
@@ -519,7 +540,7 @@ final class BatchOrchestrator {
                 projectId: projectId,
                 sourceImagePaths: job.inputPaths,
                 outputImagePath: "",
-                prompt: settings.prompt,
+                prompt: job.customPrompt ?? settings.prompt,
                 aspectRatio: settings.aspectRatio,
                 imageSize: settings.imageSize,
                 usedBatchTier: settings.useBatchTier,
@@ -540,14 +561,12 @@ final class BatchOrchestrator {
         updateProgress()
     }
 
-    private func generateOutputURL(for task: ImageTask, in directory: String, mimeType: String) -> URL {
-        let directoryURL = URL(fileURLWithPath: directory)
+    private func generateOutputURL(for task: ImageTask, inDirectory directoryURL: URL, mimeType: String) -> URL {
         try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         
-        let inputName = URL(fileURLWithPath: task.inputPaths.first ?? "image")
-            .deletingPathExtension().lastPathComponent
+        let inputName = task.inputPaths.first.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? "generation"
         let ext = mimeType == "image/png" ? "png" : "jpg"
-        let baseName = "\(inputName)_edited"
+        let baseName = task.inputPaths.isEmpty ? inputName : "\(inputName)_edited"
         
         // Find a unique filename to avoid silently overwriting existing outputs
         var candidate = directoryURL.appendingPathComponent("\(baseName).\(ext)")
@@ -655,6 +674,7 @@ final class BatchOrchestrator {
             aspectRatio: entry.aspectRatio,
             imageSize: entry.imageSize,
             outputDirectory: outputDir,
+            outputDirectoryBookmark: entry.outputImageBookmark,
             useBatchTier: entry.usedBatchTier,
             projectId: entry.projectId
         )

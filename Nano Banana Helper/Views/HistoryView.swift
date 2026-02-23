@@ -384,7 +384,7 @@ struct HistoryRowView: View {
                             Text(error)
                                 .font(.system(size: 9))
                                 .foregroundStyle(.secondary)
-                                .lineLimit(1)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                     .padding(.horizontal, 6)

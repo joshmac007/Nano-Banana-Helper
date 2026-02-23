@@ -69,7 +69,7 @@ struct MainLayoutView: View {
         .navigationTitle(projectManager.currentProject?.name ?? "Nano Banana Pro")
         .frame(minWidth: 1000, minHeight: 600)
         .environment(projectManager)
-        .onAppear {
+         .onAppear {
              // Load saved prompts if needed
              promptLibrary.load()
              // Load global history

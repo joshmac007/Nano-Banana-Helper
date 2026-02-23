@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct SettingsView: View {
     @State private var apiKey: String = ""
@@ -8,6 +9,8 @@ struct SettingsView: View {
     @State private var hasExistingKey: Bool = false
     @State private var isLoaded: Bool = false
     @State private var selectedTab: SettingsTab = .api
+    @State private var debugLoggingEnabled: Bool = true
+    @State private var debugStatusMessage: String = ""
     
     @Environment(ProjectManager.self) private var projectManager
     @Environment(PromptLibrary.self) private var promptLibrary
@@ -63,6 +66,7 @@ struct SettingsView: View {
         .onAppear {
             if !isLoaded {
                 checkExistingKey()
+                loadDiagnosticsSettings()
                 isLoaded = true
             }
         }
@@ -267,6 +271,66 @@ struct SettingsView: View {
                      destination: URL(string: "https://ai.google.dev/gemini-api/docs")!)
                     .font(.caption)
             }
+
+            Section("Diagnostics") {
+                Toggle("Enable debug file logging", isOn: Binding(
+                    get: { debugLoggingEnabled },
+                    set: { setDebugLogging($0) }
+                ))
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Log File")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(DebugLog.fileURL.path)
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
+                
+                HStack {
+                    Button("Reveal Log") {
+                        ensureLogFileExistsForUI()
+                        NSWorkspace.shared.activateFileViewerSelecting([DebugLog.fileURL])
+                        DebugLog.info("settings.debug", "Revealed debug log in Finder")
+                    }
+                    .buttonStyle(.bordered)
+                    
+                    Button("Open Log") {
+                        ensureLogFileExistsForUI()
+                        NSWorkspace.shared.open(DebugLog.fileURL)
+                        DebugLog.info("settings.debug", "Opened debug log file")
+                    }
+                    .buttonStyle(.bordered)
+                    
+                    Button("Clear Log", role: .destructive) {
+                        Task {
+                            await DebugLogger.shared.clearLog()
+                            await DebugLogger.shared.log(
+                                level: .info,
+                                category: "settings.debug",
+                                message: "Debug log cleared by user",
+                                force: true
+                            )
+                            await MainActor.run {
+                                debugStatusMessage = "Debug log cleared"
+                            }
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                }
+                
+                if !debugStatusMessage.isEmpty {
+                    Text(debugStatusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                
+                Text("Writes detailed permission, bookmark, and save diagnostics to a local file for troubleshooting.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
     }
@@ -281,6 +345,41 @@ struct SettingsView: View {
             }
         }
     }
+
+    private func loadDiagnosticsSettings() {
+        let config = AppConfig.load()
+        debugLoggingEnabled = config.debugLoggingEnabled
+        if debugLoggingEnabled {
+            ensureLogFileExistsForUI()
+            DebugLog.info("settings.debug", "Diagnostics settings loaded", metadata: [
+                "enabled": String(debugLoggingEnabled)
+            ])
+        }
+    }
+
+    private func setDebugLogging(_ enabled: Bool) {
+        if enabled == debugLoggingEnabled { return }
+        
+        if !enabled {
+            DebugLog.forceInfo("settings.debug", "Debug logging disabled by user")
+        }
+        
+        debugLoggingEnabled = enabled
+        var config = AppConfig.load()
+        config.debugLoggingEnabled = enabled
+        config.save()
+        
+        if enabled {
+            ensureLogFileExistsForUI()
+            DebugLog.info("settings.debug", "Debug logging enabled by user")
+        }
+        
+        debugStatusMessage = enabled ? "Debug logging enabled" : "Debug logging disabled"
+    }
+
+    private func ensureLogFileExistsForUI() {
+        DebugLog.ensureLogFileExists()
+    }
     
     private func saveSettings() {
         guard !apiKey.isEmpty && apiKey != "••••••••••••••••" else { return }
@@ -291,6 +390,7 @@ struct SettingsView: View {
         let service = NanoBananaService()
         Task {
             await service.setAPIKey(apiKey)
+            DebugLog.info("settings.api", "API key saved")
             statusMessage = "API key saved successfully!"
             hasExistingKey = true
             apiKey = "••••••••••••••••"
@@ -303,6 +403,7 @@ struct SettingsView: View {
         let service = NanoBananaService()
         Task {
             await service.setAPIKey("")
+            DebugLog.info("settings.api", "API key cleared")
             statusMessage = "API key cleared"
             hasExistingKey = false
             isSaving = false

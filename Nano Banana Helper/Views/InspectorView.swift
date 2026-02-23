@@ -426,11 +426,19 @@ struct OutputLocationView: View {
         // Prefer validating the persisted bookmark when present. A plain path check can
         // appear reachable even when sandbox access has expired.
         if let bookmark = project.outputDirectoryBookmark {
-            guard let scopedURL = AppPaths.resolveBookmark(bookmark) else {
+            guard let resolved = AppPaths.resolveBookmarkAccess(bookmark) else {
                 isAccessible = false
+                DebugLog.warning("ui.output_location", "Output bookmark no longer resolves", metadata: [
+                    "project_id": project.id.uuidString,
+                    "path": project.outputDirectory
+                ])
                 return
             }
+            let scopedURL = resolved.url
             defer { scopedURL.stopAccessingSecurityScopedResource() }
+            if let refreshedBookmark = resolved.refreshedBookmarkData {
+                onUpdate(scopedURL, refreshedBookmark)
+            }
             isAccessible = FileManager.default.isWritableFile(atPath: scopedURL.path) ||
                 ((try? scopedURL.checkResourceIsReachable()) ?? false)
             return
@@ -455,8 +463,17 @@ struct OutputLocationView: View {
         
         if panel.runModal() == .OK, let url = panel.url {
             if let bookmark = AppPaths.bookmark(for: url) {
+                DebugLog.info("ui.output_location", "User selected new output folder", metadata: [
+                    "project_id": project.id.uuidString,
+                    "path": url.path
+                ])
                 onUpdate(url, bookmark)
                 checkStatus()
+            } else {
+                DebugLog.error("ui.output_location", "Failed to create bookmark for selected output folder", metadata: [
+                    "project_id": project.id.uuidString,
+                    "path": url.path
+                ])
             }
         }
     }
@@ -465,8 +482,17 @@ struct OutputLocationView: View {
         let url = project.outputURL
         do {
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            DebugLog.info("ui.output_location", "Recreated output folder", metadata: [
+                "project_id": project.id.uuidString,
+                "path": url.path
+            ])
             checkStatus()
         } catch {
+            DebugLog.error("ui.output_location", "Failed to recreate output folder", metadata: [
+                "project_id": project.id.uuidString,
+                "path": url.path,
+                "error": String(describing: error)
+            ])
             print("Failed to recreate folder: \(error)")
         }
     }

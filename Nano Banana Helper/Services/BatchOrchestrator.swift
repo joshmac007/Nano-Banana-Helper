@@ -89,17 +89,27 @@ final class BatchOrchestrator {
     var onImageCompleted: ((HistoryEntry) -> Void)?
     var onCostIncurred: ((Double, String, UUID) -> Void)?
     var onHistoryEntryUpdated: ((String, HistoryEntry) -> Void)?
+    var onOutputDirectoryBookmarkRefreshed: ((UUID, Data) -> Void)?
     var onRestoreSettings: ((HistoryEntry) -> Void)?
     
     private let activeBatchURL = AppPaths.activeBatchURL
 
     init() {
         loadActiveBatches()
+        DebugLog.info("batch", "BatchOrchestrator initialized", metadata: [
+            "restored_batches": String(activeBatches.count)
+        ])
     }
     
     /// Enqueue a new batch job for processing
     func enqueue(_ batch: BatchJob) {
         activeBatches.append(batch)
+        DebugLog.info("batch.enqueue", "Enqueued batch", metadata: [
+            "batch_id": batch.id.uuidString,
+            "task_count": String(batch.tasks.count),
+            "project_id": batch.projectId?.uuidString ?? "nil",
+            "has_output_bookmark": String(batch.outputDirectoryBookmark != nil)
+        ])
         
         // Ensure all tasks have the project ID
         for task in batch.tasks {
@@ -118,6 +128,11 @@ final class BatchOrchestrator {
     /// Start or resume batch processing
     func start(batch: BatchJob) async {
         guard batch.status != "processing" && batch.status != "completed" else { return }
+        DebugLog.info("batch.start", "Starting batch", metadata: [
+            "batch_id": batch.id.uuidString,
+            "status": batch.status,
+            "tasks": String(batch.tasks.count)
+        ])
         
         // Request notification permission - Skip in tests
         if !isTesting && Bundle.main.bundleIdentifier != nil {
@@ -276,9 +291,39 @@ final class BatchOrchestrator {
         
         let submissionDataList: [JobSubmissionData] = jobsToSubmit.map { job in
             // Resolve security-scoped URLs from bookmarks if available.
-            // resolveBookmark calls startAccessingSecurityScopedResource internally.
+            // resolveBookmarkAccess calls startAccessingSecurityScopedResource internally.
             if let bookmarks = job.inputBookmarks, !bookmarks.isEmpty {
-                let resolvedURLs = bookmarks.compactMap { AppPaths.resolveBookmark($0) }
+                var resolvedURLs: [URL] = []
+                var refreshedBookmarks = bookmarks
+                var didRefreshBookmarks = false
+                
+                for (index, bookmark) in bookmarks.enumerated() {
+                    guard let resolved = AppPaths.resolveBookmarkAccess(bookmark) else {
+                        DebugLog.error("batch.input", "Input bookmark resolution failed; falling back to path URLs", metadata: [
+                            "job_id": job.id.uuidString,
+                            "bookmark_index": String(index),
+                            "input_count": String(bookmarks.count)
+                        ])
+                        // Avoid partially submitting multi-input jobs when only some bookmarks resolve.
+                        resolvedURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+                        resolvedURLs = []
+                        break
+                    }
+                    resolvedURLs.append(resolved.url)
+                    if let refreshed = resolved.refreshedBookmarkData {
+                        refreshedBookmarks[index] = refreshed
+                        didRefreshBookmarks = true
+                    }
+                }
+                
+                if didRefreshBookmarks {
+                    job.inputBookmarks = refreshedBookmarks
+                    DebugLog.info("batch.input", "Refreshed one or more input bookmarks", metadata: [
+                        "job_id": job.id.uuidString,
+                        "input_count": String(bookmarks.count)
+                    ])
+                }
+                
                 if !resolvedURLs.isEmpty {
                     return JobSubmissionData(id: job.id, inputURLs: resolvedURLs, inputPaths: job.inputPaths, hasSecurityScope: true, maskImageData: job.maskImageData ?? batch.maskImageData, customPrompt: job.customPrompt)
                 }
@@ -377,6 +422,10 @@ final class BatchOrchestrator {
         do {
             if settings.useBatchTier {
                 let jobInfo = try await service.startBatchJob(request: request)
+                DebugLog.info("batch.submit", "Batch-tier job submitted", metadata: [
+                    "job_id": data.id.uuidString,
+                    "remote_job": jobInfo.jobName
+                ])
                 // Stop security-scoped access now that the service has read the file data
                 if data.hasSecurityScope {
                     data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
@@ -406,6 +455,11 @@ final class BatchOrchestrator {
                 }
             } else {
                 let response = try await service.editImage(request)
+                DebugLog.info("batch.submit", "Standard job completed inline", metadata: [
+                    "job_id": data.id.uuidString,
+                    "bytes": String(response.imageData.count),
+                    "mime_type": response.mimeType
+                ])
                 // Stop security-scoped access now that the service has read the file data
                 if data.hasSecurityScope {
                     data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
@@ -419,6 +473,10 @@ final class BatchOrchestrator {
                 )
             }
         } catch {
+            DebugLog.error("batch.submit", "Submission failed", metadata: [
+                "job_id": data.id.uuidString,
+                "error": String(describing: error)
+            ])
             // Always stop security-scoped access on error too
             if data.hasSecurityScope {
                 data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
@@ -474,7 +532,7 @@ final class BatchOrchestrator {
         var requiresStopAccess = false
         var directoryURL: URL!
         if let bookmark = settings.outputDirectoryBookmark {
-            guard let resolved = AppPaths.resolveBookmark(bookmark) else {
+            guard let resolved = AppPaths.resolveBookmarkAccess(bookmark) else {
                 await handleError(
                     jobId: jobId,
                     data: data,
@@ -483,8 +541,20 @@ final class BatchOrchestrator {
                 )
                 return
             }
-            directoryURL = resolved
+            directoryURL = resolved.url
             requiresStopAccess = true
+            
+            if let refreshedBookmark = resolved.refreshedBookmarkData,
+               let batch = activeBatches.first(where: { $0.tasks.contains(where: { $0.id == jobId }) }) {
+                batch.outputDirectoryBookmark = refreshedBookmark
+                DebugLog.info("batch.output", "Refreshed output directory bookmark", metadata: [
+                    "job_id": jobId.uuidString,
+                    "batch_id": batch.id.uuidString
+                ])
+                if let projectId = settings.projectId {
+                    onOutputDirectoryBookmarkRefreshed?(projectId, refreshedBookmark)
+                }
+            }
         } else {
             directoryURL = URL(fileURLWithPath: settings.outputDirectory)
         }
@@ -502,7 +572,17 @@ final class BatchOrchestrator {
         )
         
         do {
+            DebugLog.debug("batch.output", "Writing output image", metadata: [
+                "job_id": jobId.uuidString,
+                "path": outputURL.path,
+                "bytes": String(response.imageData.count),
+                "mime_type": response.mimeType
+            ])
             try response.imageData.write(to: outputURL)
+            DebugLog.info("batch.output", "Output image write succeeded", metadata: [
+                "job_id": jobId.uuidString,
+                "path": outputURL.path
+            ])
             
             job.status = "completed"
             job.phase = .completed
@@ -543,6 +623,11 @@ final class BatchOrchestrator {
             saveActiveBatches()
             updateProgress()
         } catch {
+            DebugLog.error("batch.output", "Output image write failed", metadata: [
+                "job_id": jobId.uuidString,
+                "path": outputURL.path,
+                "error": String(describing: error)
+            ])
             await handleError(jobId: jobId, data: data, settings: settings, error: error)
         }
     }
@@ -553,6 +638,11 @@ final class BatchOrchestrator {
         job.status = "failed"
         job.phase = .failed
         job.error = error.localizedDescription
+        DebugLog.error("batch.error", "Job marked failed", metadata: [
+            "job_id": jobId.uuidString,
+            "project_id": settings.projectId?.uuidString ?? "nil",
+            "error": error.localizedDescription
+        ])
         
         if let projectId = settings.projectId {
             let historyEntry = HistoryEntry(
@@ -632,12 +722,20 @@ final class BatchOrchestrator {
     private func saveActiveBatches() {
         if activeBatches.isEmpty {
              try? FileManager.default.removeItem(at: activeBatchURL)
+             DebugLog.debug("batch.persistence", "Cleared active batch persistence file")
              return
         }
         do {
             let data = try JSONEncoder().encode(activeBatches)
             try data.write(to: activeBatchURL)
+            DebugLog.debug("batch.persistence", "Saved active batches", metadata: [
+                "count": String(activeBatches.count),
+                "bytes": String(data.count)
+            ])
         } catch {
+            DebugLog.error("batch.persistence", "Failed to save active batches", metadata: [
+                "error": String(describing: error)
+            ])
             print("Failed to save active batches: \(error)")
         }
     }
@@ -659,7 +757,13 @@ final class BatchOrchestrator {
                 statusMessage = "Resumed sessions"
             }
             updateProgress()
+            DebugLog.info("batch.persistence", "Loaded active batches", metadata: [
+                "count": String(activeBatches.count)
+            ])
         } catch {
+            DebugLog.error("batch.persistence", "Failed to load active batches", metadata: [
+                "error": String(describing: error)
+            ])
             print("Failed to load active batches: \(error)")
         }
     }

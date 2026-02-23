@@ -58,6 +58,12 @@ class ProjectManager {
             outputDirectory: outputDirectory,
             outputDirectoryBookmark: outputDirectoryBookmark
         )
+        DebugLog.info("project", "Creating project", metadata: [
+            "project_id": project.id.uuidString,
+            "name": name,
+            "output_directory": outputDirectory,
+            "has_output_bookmark": String(outputDirectoryBookmark != nil)
+        ])
         projects.append(project)
         
         // Create project directory
@@ -119,6 +125,18 @@ class ProjectManager {
         saveProjectMetadata(project)
     }
 
+    func refreshOutputDirectoryBookmark(projectId: UUID, bookmark: Data) {
+        guard let project = projects.first(where: { $0.id == projectId }) else { return }
+        guard project.outputDirectoryBookmark != bookmark else { return }
+        project.outputDirectoryBookmark = bookmark
+        DebugLog.info("project", "Persisted refreshed output bookmark", metadata: [
+            "project_id": projectId.uuidString,
+            "output_directory": project.outputDirectory
+        ])
+        saveProjects()
+        saveProjectMetadata(project)
+    }
+
     
     // MARK: - Persistence
     
@@ -137,7 +155,14 @@ class ProjectManager {
         do {
             let data = try encoder.encode(projects)
             try data.write(to: projectsListURL)
+            DebugLog.debug("project.persistence", "Saved projects list", metadata: [
+                "count": String(projects.count),
+                "bytes": String(data.count)
+            ])
         } catch {
+            DebugLog.error("project.persistence", "Failed to save projects list", metadata: [
+                "error": String(describing: error)
+            ])
             print("Failed to save projects: \(error)")
         }
     }

@@ -28,6 +28,13 @@ struct BatchJobInfo: Sendable {
 struct AppConfig: Codable {
     var apiKey: String?
     var modelName: String?
+    var debugLoggingEnabled: Bool = true
+
+    enum CodingKeys: String, CodingKey {
+        case apiKey
+        case modelName
+        case debugLoggingEnabled
+    }
     
     static let fileURL: URL = AppPaths.configURL
     
@@ -41,6 +48,19 @@ struct AppConfig: Codable {
     
     func save() {
         try? JSONEncoder().encode(self).write(to: Self.fileURL)
+    }
+    
+    init(apiKey: String? = nil, modelName: String? = nil, debugLoggingEnabled: Bool = true) {
+        self.apiKey = apiKey
+        self.modelName = modelName
+        self.debugLoggingEnabled = debugLoggingEnabled
+    }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        apiKey = try container.decodeIfPresent(String.self, forKey: .apiKey)
+        modelName = try container.decodeIfPresent(String.self, forKey: .modelName)
+        debugLoggingEnabled = try container.decodeIfPresent(Bool.self, forKey: .debugLoggingEnabled) ?? true
     }
 }
 

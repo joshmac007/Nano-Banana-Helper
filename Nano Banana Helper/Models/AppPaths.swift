@@ -46,6 +46,23 @@ struct AppPaths {
     static var activeBatchURL: URL {
         appSupportURL.appendingPathComponent("active_batch.json")
     }
+
+    /// Directory for local debug logs
+    static var debugLogsDirectoryURL: URL {
+        let url = appSupportURL.appendingPathComponent("logs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    /// Primary debug log file used for local troubleshooting
+    static var debugLogURL: URL {
+        debugLogsDirectoryURL.appendingPathComponent("debug.log")
+    }
+
+    /// Rotated debug log file (previous)
+    static var debugLogArchiveURL: URL {
+        debugLogsDirectoryURL.appendingPathComponent("debug.previous.log")
+    }
     
     /// Subdirectory for individual project data
     static var projectsDirectoryURL: URL {
@@ -106,8 +123,15 @@ struct AppPaths {
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )
+            DebugLog.debug("security.bookmark", "Created security-scoped bookmark", metadata: [
+                "path": url.path
+            ])
             return data
         } catch {
+            DebugLog.error("security.bookmark", "Failed to create bookmark", metadata: [
+                "path": url.path,
+                "error": String(describing: error)
+            ])
             print("Failed to create bookmark for \(url.path): \(error)")
             return nil
         }
@@ -135,6 +159,9 @@ struct AppPaths {
             
             var refreshedBookmarkData: Data?
             if isStale {
+                DebugLog.info("security.bookmark", "Bookmark is stale; attempting refresh", metadata: [
+                    "path": url.path
+                ])
                 // Attempt to refresh the stale bookmark immediately.
                 // If we can't, return nil to force the user to re-select the file —
                 // a stale bookmark stored on disk will fail silently on next launch.
@@ -144,8 +171,15 @@ struct AppPaths {
                         includingResourceValuesForKeys: nil,
                         relativeTo: nil
                     )
+                    DebugLog.info("security.bookmark", "Stale bookmark refreshed", metadata: [
+                        "path": url.path
+                    ])
                     print("⚠️ Stale bookmark refreshed for \(url.path) — caller should persist the updated bookmark")
                 } catch {
+                    DebugLog.error("security.bookmark", "Could not refresh stale bookmark", metadata: [
+                        "path": url.path,
+                        "error": String(describing: error)
+                    ])
                     print("❌ Could not refresh stale bookmark for \(url.path): \(error). User must re-select the file.")
                     return nil
                 }
@@ -157,10 +191,16 @@ struct AppPaths {
                     refreshedBookmarkData: refreshedBookmarkData
                 )
             } else {
+                DebugLog.error("security.bookmark", "startAccessingSecurityScopedResource failed", metadata: [
+                    "path": url.path
+                ])
                 print("Failed to access security scoped resource: \(url.path)")
                 return nil
             }
         } catch {
+            DebugLog.error("security.bookmark", "Failed to resolve bookmark", metadata: [
+                "error": String(describing: error)
+            ])
             print("Failed to resolve bookmark: \(error)")
             return nil
         }
@@ -184,5 +224,163 @@ struct AppPaths {
             result = url.path
         }
         return result
+    }
+}
+
+enum DebugLogLevel: String {
+    case debug = "DEBUG"
+    case info = "INFO"
+    case warning = "WARN"
+    case error = "ERROR"
+}
+
+actor DebugLogger {
+    static let shared = DebugLogger()
+    
+    private let fileManager = FileManager.default
+    private let maxFileBytes = 2_000_000
+    private let formatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    
+    func log(
+        level: DebugLogLevel,
+        category: String,
+        message: String,
+        metadata: [String: String] = [:],
+        force: Bool = false
+    ) async {
+        let enabled = force || await MainActor.run { AppConfig.load().debugLoggingEnabled }
+        guard enabled else { return }
+        
+        ensureLogFileExists()
+        rotateIfNeeded()
+        
+        var line = "\(formatter.string(from: Date())) [\(level.rawValue)] [\(category)] \(message)"
+        if !metadata.isEmpty {
+            let metaString = metadata
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key)=\(Self.sanitize($0.value))" }
+                .joined(separator: " ")
+            line += " | \(metaString)"
+        }
+        line += "\n"
+        append(line)
+    }
+    
+    func clearLog() async {
+        ensureLogFileExists()
+        try? Data().write(to: AppPaths.debugLogURL)
+        if fileManager.fileExists(atPath: AppPaths.debugLogArchiveURL.path) {
+            try? fileManager.removeItem(at: AppPaths.debugLogArchiveURL)
+        }
+    }
+    
+    func logFileURL() -> URL {
+        AppPaths.debugLogURL
+    }
+    
+    private func ensureLogFileExists() {
+        let dir = AppPaths.debugLogsDirectoryURL
+        if !fileManager.fileExists(atPath: dir.path) {
+            try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        if !fileManager.fileExists(atPath: AppPaths.debugLogURL.path) {
+            _ = fileManager.createFile(atPath: AppPaths.debugLogURL.path, contents: nil)
+        }
+    }
+    
+    private func rotateIfNeeded() {
+        guard
+            let attrs = try? fileManager.attributesOfItem(atPath: AppPaths.debugLogURL.path),
+            let size = attrs[.size] as? NSNumber,
+            size.intValue >= maxFileBytes
+        else {
+            return
+        }
+        
+        if fileManager.fileExists(atPath: AppPaths.debugLogArchiveURL.path) {
+            try? fileManager.removeItem(at: AppPaths.debugLogArchiveURL)
+        }
+        try? fileManager.moveItem(at: AppPaths.debugLogURL, to: AppPaths.debugLogArchiveURL)
+        _ = fileManager.createFile(atPath: AppPaths.debugLogURL.path, contents: nil)
+    }
+    
+    private func append(_ line: String) {
+        guard let data = line.data(using: .utf8) else { return }
+        ensureLogFileExists()
+        
+        do {
+            let handle = try FileHandle(forWritingTo: AppPaths.debugLogURL)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } catch {
+            // Avoid recursive logging failures; console only.
+            print("Debug logger write failed: \(error)")
+        }
+    }
+    
+    private static func sanitize(_ value: String) -> String {
+        value.replacingOccurrences(of: "\n", with: "\\n")
+    }
+}
+
+enum DebugLog {
+    static var fileURL: URL { AppPaths.debugLogURL }
+    static var archiveURL: URL { AppPaths.debugLogArchiveURL }
+    
+    static func debug(_ category: String, _ message: String, metadata: [String: String] = [:]) {
+        write(.debug, category, message, metadata: metadata)
+    }
+    
+    static func info(_ category: String, _ message: String, metadata: [String: String] = [:]) {
+        write(.info, category, message, metadata: metadata)
+    }
+    
+    static func warning(_ category: String, _ message: String, metadata: [String: String] = [:]) {
+        write(.warning, category, message, metadata: metadata)
+    }
+    
+    static func error(_ category: String, _ message: String, metadata: [String: String] = [:]) {
+        write(.error, category, message, metadata: metadata)
+    }
+    
+    static func forceInfo(_ category: String, _ message: String, metadata: [String: String] = [:]) {
+        write(.info, category, message, metadata: metadata, force: true)
+    }
+    
+    static func ensureLogFileExists() {
+        let dir = AppPaths.debugLogsDirectoryURL
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        if !FileManager.default.fileExists(atPath: AppPaths.debugLogURL.path) {
+            _ = FileManager.default.createFile(atPath: AppPaths.debugLogURL.path, contents: nil)
+        }
+    }
+    
+    static func clear() {
+        Task { await DebugLogger.shared.clearLog() }
+    }
+    
+    private static func write(
+        _ level: DebugLogLevel,
+        _ category: String,
+        _ message: String,
+        metadata: [String: String] = [:],
+        force: Bool = false
+    ) {
+        Task {
+            await DebugLogger.shared.log(
+                level: level,
+                category: category,
+                message: message,
+                metadata: metadata,
+                force: force
+            )
+        }
     }
 }

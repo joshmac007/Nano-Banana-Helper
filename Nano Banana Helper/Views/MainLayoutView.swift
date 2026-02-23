@@ -90,12 +90,17 @@ struct MainLayoutView: View {
              orchestrator.onCostIncurred = { cost, resolution, projectId in
                  projectManager.costSummary.record(cost: cost, resolution: resolution, projectId: projectId)
              }
+
+             orchestrator.onOutputDirectoryBookmarkRefreshed = { projectId, bookmark in
+                 projectManager.refreshOutputDirectoryBookmark(projectId: projectId, bookmark: bookmark)
+             }
         }
         .onDisappear {
             // Clear callbacks to prevent stale closures from firing if the view is re-created
             orchestrator.onImageCompleted = nil
             orchestrator.onHistoryEntryUpdated = nil
             orchestrator.onCostIncurred = nil
+            orchestrator.onOutputDirectoryBookmarkRefreshed = nil
         }
         .sheet(isPresented: $showingSettings) {
             SettingsView()

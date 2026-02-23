@@ -45,6 +45,17 @@ struct BatchSettings: Sendable {
     }
 }
 
+private enum OutputDirectoryAccessError: LocalizedError {
+    case bookmarkAccessFailed(path: String)
+    
+    var errorDescription: String? {
+        switch self {
+        case .bookmarkAccessFailed(let path):
+            return "Cannot access the output folder anymore. Re-select Output Location and retry. (\(path))"
+        }
+    }
+}
+
 /// Orchestrates batch processing of image editing tasks
 @Observable
 @MainActor
@@ -462,8 +473,16 @@ final class BatchOrchestrator {
         
         var requiresStopAccess = false
         var directoryURL: URL!
-        if let bookmark = settings.outputDirectoryBookmark,
-           let resolved = AppPaths.resolveBookmark(bookmark) {
+        if let bookmark = settings.outputDirectoryBookmark {
+            guard let resolved = AppPaths.resolveBookmark(bookmark) else {
+                await handleError(
+                    jobId: jobId,
+                    data: data,
+                    settings: settings,
+                    error: OutputDirectoryAccessError.bookmarkAccessFailed(path: settings.outputDirectory)
+                )
+                return
+            }
             directoryURL = resolved
             requiresStopAccess = true
         } else {

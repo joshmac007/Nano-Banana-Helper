@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 struct NewProjectSheet: View {
     @Binding var projectName: String
     @Binding var projectDirectory: String
+    @Binding var projectDirectoryBookmark: Data?
     var onCreate: () -> Void
     var onCancel: () -> Void
     
@@ -46,6 +47,7 @@ struct NewProjectSheet: View {
         ) { result in
             if case .success(let urls) = result, let url = urls.first {
                 projectDirectory = url.path
+                projectDirectoryBookmark = AppPaths.bookmark(for: url)
             }
         }
     }

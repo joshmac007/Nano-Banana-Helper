@@ -9,6 +9,7 @@ struct SidebarView: View {
     @State private var showingCostReport = false
     @State private var newProjectName = ""
     @State private var newProjectDirectory = ""
+    @State private var newProjectDirectoryBookmark: Data?
     
     // MARK: - Rename State
     @State private var projectToRename: Project?
@@ -134,6 +135,7 @@ struct SidebarView: View {
             NewProjectSheet(
                 projectName: $newProjectName,
                 projectDirectory: $newProjectDirectory,
+                projectDirectoryBookmark: $newProjectDirectoryBookmark,
                 onCreate: createProject,
                 onCancel: { showingNewProject = false }
             )
@@ -166,12 +168,17 @@ struct SidebarView: View {
     private func createProject() {
         guard !newProjectName.isEmpty, !newProjectDirectory.isEmpty else { return }
         
-        let project = projectManager.createProject(name: newProjectName, outputDirectory: newProjectDirectory)
+        let project = projectManager.createProject(
+            name: newProjectName,
+            outputDirectory: newProjectDirectory,
+            outputDirectoryBookmark: newProjectDirectoryBookmark
+        )
         projectManager.selectProject(project)
         onSelectProject?(project)
         
         newProjectName = ""
         newProjectDirectory = ""
+        newProjectDirectoryBookmark = nil
         showingNewProject = false
     }
     

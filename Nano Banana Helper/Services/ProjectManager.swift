@@ -52,8 +52,12 @@ class ProjectManager {
     
     // MARK: - Project CRUD
     
-    func createProject(name: String, outputDirectory: String) -> Project {
-        let project = Project(name: name, outputDirectory: outputDirectory)
+    func createProject(name: String, outputDirectory: String, outputDirectoryBookmark: Data? = nil) -> Project {
+        let project = Project(
+            name: name,
+            outputDirectory: outputDirectory,
+            outputDirectoryBookmark: outputDirectoryBookmark
+        )
         projects.append(project)
         
         // Create project directory

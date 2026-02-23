@@ -423,9 +423,21 @@ struct OutputLocationView: View {
         var isDir: ObjCBool = false
         isMissing = !FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) || !isDir.boolValue
         
-        // Simple accessibility check
-        isAccessible = FileManager.default.isWritableFile(atPath: url.path) || 
-                      (try? url.checkResourceIsReachable()) ?? false
+        // Prefer validating the persisted bookmark when present. A plain path check can
+        // appear reachable even when sandbox access has expired.
+        if let bookmark = project.outputDirectoryBookmark {
+            guard let scopedURL = AppPaths.resolveBookmark(bookmark) else {
+                isAccessible = false
+                return
+            }
+            defer { scopedURL.stopAccessingSecurityScopedResource() }
+            isAccessible = FileManager.default.isWritableFile(atPath: scopedURL.path) ||
+                ((try? scopedURL.checkResourceIsReachable()) ?? false)
+            return
+        }
+        
+        isAccessible = FileManager.default.isWritableFile(atPath: url.path) ||
+            ((try? url.checkResourceIsReachable()) ?? false)
     }
     
     private func openInFinder() {

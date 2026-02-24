@@ -252,7 +252,8 @@ actor DebugLogger {
         metadata: [String: String] = [:],
         force: Bool = false
     ) async {
-        let enabled = force || await MainActor.run { AppConfig.load().debugLoggingEnabled }
+        let configEnabled = await MainActor.run { AppConfig.load().debugLoggingEnabled }
+        let enabled = force || configEnabled
         guard enabled else { return }
         
         ensureLogFileExists()

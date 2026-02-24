@@ -174,18 +174,7 @@ struct ProgressQueueView: View {
             
             Divider()
             
-            // Control buttons
-            if !orchestrator.completedJobs.isEmpty {
-                HStack {
-                    Spacer()
-                    Button(action: openOutputFolder) {
-                        Label("Open Output", systemImage: "folder")
-                    }
-                    .buttonStyle(.bordered)
-                    Spacer()
-                }
-                .padding()
-            }
+
         }
         .navigationSplitViewColumnWidth(min: 300, ideal: 350)
     }
@@ -200,13 +189,7 @@ struct ProgressQueueView: View {
         return .accentColor
     }
     
-    private func openOutputFolder() {
-        if let firstCompleted = orchestrator.completedJobs.first,
-           let outputPath = firstCompleted.outputPath {
-            let folderURL = URL(fileURLWithPath: outputPath).deletingLastPathComponent()
-            NSWorkspace.shared.open(folderURL)
-        }
-    }
+
 }
 
 struct StatusIndicator: View {
@@ -308,14 +291,23 @@ struct TaskRowView: View {
             
             Spacer()
             
-            // Open output button for completed tasks
+            // Open output buttons for completed tasks
             if task.status == "completed", let outputURL = task.outputURL {
-                Button(action: { NSWorkspace.shared.open(outputURL) }) {
-                    Image(systemName: "arrow.up.right.square")
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    Button(action: { NSWorkspace.shared.open(outputURL.deletingLastPathComponent()) }) {
+                        Image(systemName: "folder")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Show in Finder")
+                    
+                    Button(action: { NSWorkspace.shared.open(outputURL) }) {
+                        Image(systemName: "arrow.up.right.square")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open in Preview")
                 }
-                .buttonStyle(.plain)
-                .help("Open in Preview")
             }
         }
         .padding(.vertical, 4)

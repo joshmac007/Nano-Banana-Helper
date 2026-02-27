@@ -8,6 +8,8 @@ struct InspectorView: View {
     @Environment(BatchOrchestrator.self) private var orchestrator
     
     @State private var showingSavePromptAlert = false
+    @State private var showingBatchStartAlert = false
+    @State private var batchStartAlertMessage = "Batch start is blocked by current settings."
     @State private var newPromptName = ""
     @State private var activePromptTab: PromptType = .user // Tab State
     
@@ -247,6 +249,17 @@ struct InspectorView: View {
                                 Toggle("", isOn: $stagingManager.isMultiInput)
                                     .toggleStyle(.switch)
                                     .labelsHidden()
+                                    .disabled(stagingManager.hasAnyRegionEdits)
+                            }
+                            
+                            if stagingManager.hasAnyRegionEdits {
+                                Label("Region Edit is only available in standard batch mode.", systemImage: "info.circle.fill")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 4)
+                                    .background(Color.orange.opacity(0.15))
+                                    .foregroundStyle(.orange)
+                                    .cornerRadius(4)
                             }
                         }
                     }
@@ -278,10 +291,37 @@ struct InspectorView: View {
         } message: {
             Text(activePromptTab == .user ? "Enter a name for this user prompt." : "Enter a name for this system prompt.")
         }
+        .alert("Cannot Start Batch", isPresented: $showingBatchStartAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(batchStartAlertMessage)
+        }
     }
     
     private func startBatch() {
         guard let project = projectManager.currentProject else { return }
+        if let _ = stagingManager.startBlockReason {
+            batchStartAlertMessage = stagingManager.startBlockReason ?? "Batch start is blocked by current settings."
+            showingBatchStartAlert = true
+            return
+        }
+
+        let missingInputBookmarkPaths = stagingManager.stagedFiles
+            .filter { stagingManager.bookmark(for: $0) == nil && likelyNeedsSecurityScope(for: $0.path) }
+            .map { $0.lastPathComponent }
+        if !missingInputBookmarkPaths.isEmpty {
+            let sample = missingInputBookmarkPaths.prefix(3).joined(separator: ", ")
+            let suffix = missingInputBookmarkPaths.count > 3 ? " (+\(missingInputBookmarkPaths.count - 3) more)" : ""
+            batchStartAlertMessage = "Some staged files are missing sandbox access bookmarks: \(sample)\(suffix). Re-add them using Browse Files or drag them in again, then retry."
+            showingBatchStartAlert = true
+            return
+        }
+
+        if project.outputDirectoryBookmark == nil && likelyNeedsSecurityScope(for: project.outputDirectory) {
+            batchStartAlertMessage = "The selected output folder needs permission again. Re-select Output Location and retry."
+            showingBatchStartAlert = true
+            return
+        }
         
         let batch = BatchJob(
             prompt: stagingManager.prompt,
@@ -304,15 +344,12 @@ struct InspectorView: View {
             // All staged files become ONE task with multiple inputs
             let inputPaths = stagingManager.stagedFiles.map { $0.path }
             let inputBookmarks = stagingManager.stagedFiles.compactMap { stagingManager.bookmark(for: $0) }
-            // For multi-input, if a mask was provided, we'll arbitrarily use the first one available
-            let firstMaskURL = stagingManager.stagedFiles.first { stagingManager.hasMaskEdit(for: $0) }
-            let stagedEdit = firstMaskURL.flatMap { stagingManager.stagedMaskEdits[$0] }
             
             tasks = [ImageTask(
                 inputPaths: inputPaths,
                 inputBookmarks: inputBookmarks.isEmpty ? nil : inputBookmarks,
-                maskImageData: stagedEdit?.maskData,
-                customPrompt: stagedEdit?.prompt
+                maskImageData: nil,
+                customPrompt: nil
             )]
         } else {
             // Standard: One task per file
@@ -333,6 +370,18 @@ struct InspectorView: View {
         // Clear staging
         withAnimation {
             stagingManager.clearAll()
+        }
+    }
+
+    private func likelyNeedsSecurityScope(for path: String) -> Bool {
+        let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
+        let managedRoots = [
+            AppPaths.appSupportURL.standardizedFileURL.path,
+            AppPaths.defaultOutputDirectory.standardizedFileURL.path,
+            FileManager.default.temporaryDirectory.standardizedFileURL.path
+        ]
+        return !managedRoots.contains { root in
+            normalized == root || normalized.hasPrefix(root + "/")
         }
     }
 }

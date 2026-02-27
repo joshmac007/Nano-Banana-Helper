@@ -145,8 +145,23 @@ class ProjectManager {
         
         do {
             let data = try Data(contentsOf: projectsListURL)
-            projects = try decoder.decode([Project].self, from: data)
+            if let decoded = tryDecodeProjects(data: data) {
+                projects = decoded.projects
+                DebugLog.info("project.persistence", "Loaded projects list", metadata: [
+                    "count": String(projects.count),
+                    "bytes": String(data.count),
+                    "decode_mode": decoded.mode,
+                    "projects_with_output_bookmark": String(projects.filter { $0.outputDirectoryBookmark != nil }.count)
+                ])
+            } else {
+                DebugLog.error("project.persistence", "Failed to decode projects list", metadata: [
+                    "bytes": String(data.count)
+                ])
+            }
         } catch {
+            DebugLog.error("project.persistence", "Failed to load projects list", metadata: [
+                "error": String(describing: error)
+            ])
             print("Failed to load projects: \(error)")
         }
     }
@@ -154,10 +169,11 @@ class ProjectManager {
     func saveProjects() {
         do {
             let data = try encoder.encode(projects)
-            try data.write(to: projectsListURL)
+            try data.write(to: projectsListURL, options: .atomic)
             DebugLog.debug("project.persistence", "Saved projects list", metadata: [
                 "count": String(projects.count),
-                "bytes": String(data.count)
+                "bytes": String(data.count),
+                "projects_with_output_bookmark": String(projects.filter { $0.outputDirectoryBookmark != nil }.count)
             ])
         } catch {
             DebugLog.error("project.persistence", "Failed to save projects list", metadata: [
@@ -165,6 +181,20 @@ class ProjectManager {
             ])
             print("Failed to save projects: \(error)")
         }
+    }
+
+    private func tryDecodeProjects(data: Data) -> (projects: [Project], mode: String)? {
+        if let projects = try? decoder.decode([Project].self, from: data) {
+            return (projects, "array_iso8601")
+        }
+
+        // Backward compatibility for older saves that used the default Date strategy.
+        let legacyDecoder = JSONDecoder()
+        if let projects = try? legacyDecoder.decode([Project].self, from: data) {
+            return (projects, "array_legacy_default")
+        }
+
+        return nil
     }
     
     private func saveProjectMetadata(_ project: Project) {

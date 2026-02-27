@@ -485,11 +485,13 @@ class ImageTask: Identifiable, Codable {
     var completedAt: Date?
     var externalJobName: String? // Store Gemini API job ID
     var projectId: UUID? // Added for filtering results by project
-    var maskImageData: Data? // Added for inpainting
+    var maskImageData: Data? // Local region-edit mask (crop/composite guidance; not sent as Gemini mask)
+    var regionEditCropRect: CGRect? // Top-left pixel coordinates for local composite pipeline
+    var regionEditProcessingImageSize: String? // Actual Gemini request size used for region edits (1K/2K/4K)
     var customPrompt: String? // Added for overriding
 
     enum CodingKeys: String, CodingKey {
-        case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount, error, startedAt, submittedAt, completedAt, externalJobName, projectId, maskImageData, customPrompt
+        case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount, error, startedAt, submittedAt, completedAt, externalJobName, projectId, maskImageData, regionEditCropRect, regionEditProcessingImageSize, customPrompt
     }
 
     required init(from decoder: Decoder) throws {
@@ -508,6 +510,8 @@ class ImageTask: Identifiable, Codable {
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
         projectId = try container.decodeIfPresent(UUID.self, forKey: .projectId)
         maskImageData = try container.decodeIfPresent(Data.self, forKey: .maskImageData)
+        regionEditCropRect = try container.decodeIfPresent(CGRect.self, forKey: .regionEditCropRect)
+        regionEditProcessingImageSize = try container.decodeIfPresent(String.self, forKey: .regionEditProcessingImageSize)
         customPrompt = try container.decodeIfPresent(String.self, forKey: .customPrompt)
     }
 
@@ -527,6 +531,8 @@ class ImageTask: Identifiable, Codable {
         try container.encode(externalJobName, forKey: .externalJobName)
         try container.encode(projectId, forKey: .projectId)
         try container.encodeIfPresent(maskImageData, forKey: .maskImageData)
+        try container.encodeIfPresent(regionEditCropRect, forKey: .regionEditCropRect)
+        try container.encodeIfPresent(regionEditProcessingImageSize, forKey: .regionEditProcessingImageSize)
         try container.encodeIfPresent(customPrompt, forKey: .customPrompt)
     }
     
@@ -539,6 +545,8 @@ class ImageTask: Identifiable, Codable {
         self.pollCount = 0
         self.projectId = projectId
         self.maskImageData = maskImageData
+        self.regionEditCropRect = nil
+        self.regionEditProcessingImageSize = nil
         self.customPrompt = customPrompt
     }
     
@@ -551,6 +559,8 @@ class ImageTask: Identifiable, Codable {
         self.pollCount = 0
         self.projectId = projectId
         self.maskImageData = maskImageData
+        self.regionEditCropRect = nil
+        self.regionEditProcessingImageSize = nil
         self.customPrompt = customPrompt
     }
     

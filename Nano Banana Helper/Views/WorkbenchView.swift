@@ -72,14 +72,23 @@ struct WorkbenchView: View {
                             
                             // Note: We can't easily restore file paths if they moved, 
                             // but we could try to add them if they exist.
-                            for path in entry.sourceImagePaths {
+                            var reusableURLs: [URL] = []
+                            var reusableBookmarks: [URL: Data] = [:]
+                            let sourceBookmarks = entry.sourceImageBookmarks ?? []
+                            for (index, path) in entry.sourceImagePaths.enumerated() {
                                 let url = URL(fileURLWithPath: path)
                                 if FileManager.default.fileExists(atPath: path) {
-                                    stagingManager.addFiles([url])
+                                    reusableURLs.append(url)
+                                    if sourceBookmarks.indices.contains(index) {
+                                        reusableBookmarks[url] = sourceBookmarks[index]
+                                    }
                                     if let maskData = entry.maskImageData {
                                         stagingManager.saveMaskEdit(for: url, maskData: maskData, prompt: entry.prompt, paths: [])
                                     }
                                 }
+                            }
+                            if !reusableURLs.isEmpty {
+                                stagingManager.addFilesCapturingBookmarks(reusableURLs, preferredBookmarks: reusableBookmarks)
                             }
                         },
                         onResumePolling: { entry in

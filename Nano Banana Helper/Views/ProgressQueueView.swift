@@ -37,11 +37,11 @@ struct ProgressQueueView: View {
                 Divider()
                     .frame(height: 16)
                 
-                if orchestrator.isRunning {
-                    Button(action: { orchestrator.pause() }) {
-                        Label("Pause", systemImage: "pause.fill")
+                if orchestrator.isPaused {
+                    Button(action: { Task { await orchestrator.startAll() } }) {
+                        Label("Resume", systemImage: "play.fill")
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     
                     Button(role: .destructive, action: { orchestrator.cancel() }) {
@@ -49,11 +49,11 @@ struct ProgressQueueView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                } else if orchestrator.isPaused {
-                    Button(action: { Task { await orchestrator.startAll() } }) {
-                        Label("Resume", systemImage: "play.fill")
+                } else if orchestrator.isRunning {
+                    Button(action: { orchestrator.pause() }) {
+                        Label("Pause", systemImage: "pause.fill")
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.bordered)
                     .controlSize(.small)
                     
                     Button(role: .destructive, action: { orchestrator.cancel() }) {
@@ -218,14 +218,14 @@ struct StatusIndicator: View {
     }
     
     private var statusColor: Color {
-        if isRunning { return .green }
         if isPaused { return .yellow }
+        if isRunning { return .green }
         return .gray
     }
     
     private var statusText: String {
-        if isRunning { return "Running" }
         if isPaused { return "Paused" }
+        if isRunning { return "Running" }
         return "Idle"
     }
 }

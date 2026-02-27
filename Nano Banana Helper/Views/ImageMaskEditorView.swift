@@ -13,7 +13,6 @@ struct ImageMaskEditorView: View {
     
     @State private var baseImage: NSImage?
     @State private var loadedMaskImage: NSImage?
-    @State private var maskImage: NSImage?
     @State private var drawingPaths: [BatchStagingManager.DrawingPath] = []
     @State private var currentPath: BatchStagingManager.DrawingPath?
     
@@ -34,7 +33,7 @@ struct ImageMaskEditorView: View {
         VStack(spacing: 0) {
             // Header
             HStack {
-                Text("Edit with Mask")
+                Text("Region Edit (Gemini)")
                     .font(.headline)
                 Spacer()
                 Button("Cancel") {
@@ -100,60 +99,52 @@ struct ImageMaskEditorView: View {
                             .resizable()
                             .scaledToFit()
                             .overlay {
-                                // Drawing Canvas over the image
-                                Canvas { context, size in
-                                    if let priorMask = loadedMaskImage {
-                                        var drawContext = context
-                                        drawContext.blendMode = .screen
-                                        drawContext.opacity = 0.6
-                                        drawContext.draw(Image(nsImage: priorMask), in: CGRect(origin: .zero, size: size))
-                                    }
-                                    
-                                    // Calculate scale factor if the image is scaled to fit
-                                    // For simplicity in this overlay, the canvas coordinate space matches the image view space
-                                    for path in drawingPaths {
-                                        var cgPath = Path()
-                                        guard let firstPoint = path.points.first else { continue }
-                                        cgPath.move(to: firstPoint)
-                                        for point in path.points.dropFirst() {
-                                            cgPath.addLine(to: point)
+                                GeometryReader { overlayGeo in
+                                    let overlaySize = overlayGeo.size
+                                    let previewImageRect = fittedImageRect(in: overlaySize)
+                                    Canvas { context, size in
+                                        let imageRect = fittedImageRect(in: size)
+                                        if let priorMask = loadedMaskImage {
+                                            var drawContext = context
+                                            drawContext.blendMode = .screen
+                                            drawContext.opacity = 0.6
+                                            drawContext.draw(Image(nsImage: priorMask), in: imageRect)
                                         }
-                                        var copyContext = context
-                                        copyContext.blendMode = path.isEraser ? .destinationOut : .normal
-                                        let alpha = path.isEraser ? 1.0 : 0.6
-                                        copyContext.stroke(cgPath, with: .color(.white.opacity(alpha)), style: StrokeStyle(lineWidth: path.size, lineCap: .round, lineJoin: .round))
-                                    }
-                                    
-                                    if let currentPath = currentPath {
-                                        var cgPath = Path()
-                                        guard let firstPoint = currentPath.points.first else { return }
-                                        cgPath.move(to: firstPoint)
-                                        for point in currentPath.points.dropFirst() {
-                                            cgPath.addLine(to: point)
+
+                                        for path in drawingPaths {
+                                            draw(path: path, in: size, imageRect: imageRect, using: context, alpha: path.isEraser ? 1.0 : 0.6)
                                         }
-                                        var copyContext = context
-                                        copyContext.blendMode = currentPath.isEraser ? .destinationOut : .normal
-                                        let alpha = currentPath.isEraser ? 1.0 : 0.6
-                                        copyContext.stroke(cgPath, with: .color(.white.opacity(alpha)), style: StrokeStyle(lineWidth: currentPath.size, lineCap: .round, lineJoin: .round))
+
+                                        if let currentPath = currentPath {
+                                            draw(path: currentPath, in: size, imageRect: imageRect, using: context, alpha: currentPath.isEraser ? 1.0 : 0.6)
+                                        }
                                     }
+                                    .contentShape(Rectangle())
+                                    .gesture(
+                                        DragGesture(minimumDistance: 0)
+                                            .onChanged { value in
+                                                guard let normalizedPoint = normalizePoint(value.location, in: previewImageRect) else { return }
+                                                let normalizedBrush = normalizedBrushSize(for: previewImageRect.size)
+                                                if currentPath == nil {
+                                                    currentPath = BatchStagingManager.DrawingPath(
+                                                        points: [normalizedPoint],
+                                                        size: normalizedBrush,
+                                                        isEraser: isEraserActive
+                                                    )
+                                                } else {
+                                                    currentPath?.points.append(normalizedPoint)
+                                                    currentPath?.size = normalizedBrush
+                                                    currentPath?.isEraser = isEraserActive
+                                                }
+                                            }
+                                            .onEnded { _ in
+                                                if let path = currentPath, !path.points.isEmpty {
+                                                    drawingPaths.append(path)
+                                                }
+                                                currentPath = nil
+                                            }
+                                    )
                                 }
-                                .gesture(
-                                    DragGesture(minimumDistance: 0)
-                                        .onChanged { value in
-                                            let point = value.location
-                                            if currentPath == nil {
-                                                currentPath = BatchStagingManager.DrawingPath(points: [point], size: brushSize, isEraser: isEraserActive)
-                                            } else {
-                                                currentPath?.points.append(point)
-                                            }
-                                        }
-                                        .onEnded { _ in
-                                            if let path = currentPath {
-                                                drawingPaths.append(path)
-                                            }
-                                            currentPath = nil
-                                        }
-                                )
                             }
                     } else {
                         ProgressView("Loading Image...")
@@ -163,7 +154,7 @@ struct ImageMaskEditorView: View {
             
             // Footer: Prompt & Submit
             VStack(spacing: 12) {
-                TextField("Describe what to generate in the masked area...", text: $prompt)
+                TextField("Describe the edit for the selected region...", text: $prompt)
                     .textFieldStyle(.roundedBorder)
                     .controlSize(.large)
                 
@@ -174,7 +165,7 @@ struct ImageMaskEditorView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .disabled(prompt.isEmpty || drawingPaths.isEmpty || isGenerating)
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || drawingPaths.isEmpty || isGenerating)
                 }
             }
             .padding()
@@ -223,45 +214,19 @@ struct ImageMaskEditorView: View {
         // The mask needs to be the exact pixel dimensions of the original image
         let imageSize = baseImage.size
         
-        let maskImage = NSImage(size: imageSize)
-        maskImage.lockFocus()
-        
-        // 1. Fill background with black
-        NSColor.black.set()
-        NSRect(origin: .zero, size: imageSize).fill()
-        
-        // 2. Draw white paths
-        NSColor.white.set()
-        
-        // We need to scale the drawing paths from the View's coordinate space to the Image's pixel coordinate space.
-        // For accurate scaling, we need to know the rendered frame size of the image in the UI.
-        // Simplified approach for MVP: render paths directly based on proportions.
-        
-        // A better approach is to rasterize the SwiftUI Canvas directly, but that requires iOS 16/macOS 13 specific ViewRenderer.
-        // Let's use ImageRenderer
         Task { @MainActor in
             let maskView = ZStack {
                 Color.black
                 Canvas { context, size in
+                    let fullImageRect = CGRect(origin: .zero, size: size)
                     if let priorMask = loadedMaskImage {
                         var drawContext = context
                         drawContext.blendMode = .screen
-                        drawContext.draw(Image(nsImage: priorMask), in: CGRect(origin: .zero, size: size))
+                        drawContext.draw(Image(nsImage: priorMask), in: fullImageRect)
                     }
                     
                     for path in drawingPaths {
-                        var cgPath = Path()
-                        guard let firstPoint = path.points.first else { continue }
-                        // Scale points from UI space to Image space.
-                        // For this implementation, we assume the GeometryReader frame is square.
-                        // In a robust implementation, we'd pass the actual rendered frame size.
-                        cgPath.move(to: firstPoint)
-                        for point in path.points.dropFirst() {
-                            cgPath.addLine(to: point)
-                        }
-                        var copyContext = context
-                        copyContext.blendMode = path.isEraser ? .destinationOut : .normal
-                        copyContext.stroke(cgPath, with: .color(.white), style: StrokeStyle(lineWidth: path.size, lineCap: .round, lineJoin: .round))
+                        draw(path: path, in: size, imageRect: fullImageRect, using: context, alpha: 1.0)
                     }
                 }
             }
@@ -282,6 +247,98 @@ struct ImageMaskEditorView: View {
                 print("Failed to generate mask image data")
             }
         }
-        maskImage.unlockFocus()
+    }
+
+    private func fittedImageRect(in containerSize: CGSize) -> CGRect {
+        guard
+            let baseImage = baseImage,
+            containerSize.width > 0,
+            containerSize.height > 0,
+            baseImage.size.width > 0,
+            baseImage.size.height > 0
+        else {
+            return CGRect(origin: .zero, size: containerSize)
+        }
+
+        let imageAspect = baseImage.size.width / baseImage.size.height
+        let containerAspect = containerSize.width / containerSize.height
+
+        if imageAspect > containerAspect {
+            let width = containerSize.width
+            let height = width / imageAspect
+            return CGRect(
+                x: 0,
+                y: (containerSize.height - height) / 2,
+                width: width,
+                height: height
+            )
+        } else {
+            let height = containerSize.height
+            let width = height * imageAspect
+            return CGRect(
+                x: (containerSize.width - width) / 2,
+                y: 0,
+                width: width,
+                height: height
+            )
+        }
+    }
+
+    private func normalizePoint(_ point: CGPoint, in imageRect: CGRect) -> CGPoint? {
+        guard imageRect.width > 0, imageRect.height > 0 else { return nil }
+        guard imageRect.contains(point) else { return nil }
+        let x = (point.x - imageRect.minX) / imageRect.width
+        let y = (point.y - imageRect.minY) / imageRect.height
+        guard (0...1).contains(x), (0...1).contains(y) else { return nil }
+        return CGPoint(x: x, y: y)
+    }
+
+    private func denormalizePoint(_ point: CGPoint, in imageRect: CGRect) -> CGPoint {
+        CGPoint(
+            x: imageRect.minX + (point.x * imageRect.width),
+            y: imageRect.minY + (point.y * imageRect.height)
+        )
+    }
+
+    private func normalizedBrushSize(for canvasSize: CGSize) -> CGFloat {
+        let base = max(1, min(canvasSize.width, canvasSize.height))
+        return CGFloat(brushSize) / base
+    }
+
+    private func lineWidth(for path: BatchStagingManager.DrawingPath, in canvasSize: CGSize) -> CGFloat {
+        let base = max(1, min(canvasSize.width, canvasSize.height))
+        let candidate = path.size * base
+        // Backward-compat fallback: older in-memory paths may have absolute pixel widths.
+        if path.size > 1 { return path.size }
+        return max(1, candidate)
+    }
+
+    private func draw(
+        path: BatchStagingManager.DrawingPath,
+        in canvasSize: CGSize,
+        imageRect: CGRect,
+        using context: GraphicsContext,
+        alpha: Double
+    ) {
+        guard let firstPoint = path.points.first else { return }
+        let usesNormalizedPoints = path.points.allSatisfy { (0...1).contains($0.x) && (0...1).contains($0.y) }
+        var cgPath = Path()
+        let startPoint = usesNormalizedPoints ? denormalizePoint(firstPoint, in: imageRect) : firstPoint
+        cgPath.move(to: startPoint)
+        for point in path.points.dropFirst() {
+            let drawPoint = usesNormalizedPoints ? denormalizePoint(point, in: imageRect) : point
+            cgPath.addLine(to: drawPoint)
+        }
+        var copyContext = context
+        copyContext.blendMode = path.isEraser ? .destinationOut : .normal
+        copyContext.stroke(
+            cgPath,
+            with: .color(.white.opacity(alpha)),
+            style: StrokeStyle(
+                lineWidth: lineWidth(for: path, in: imageRect.size),
+                lineCap: .round,
+                lineJoin: .round
+            )
+        )
     }
 }

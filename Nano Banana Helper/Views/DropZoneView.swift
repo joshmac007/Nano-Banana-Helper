@@ -89,7 +89,7 @@ struct DropZoneView: View {
         }
         
         // Add to manager
-        stagingManager.addFiles(gatheredUrls)
+        stagingManager.addFilesCapturingBookmarks(gatheredUrls)
     }
     
     private func scanDirectory(_ directory: URL) -> [URL] {

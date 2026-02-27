@@ -11,7 +11,9 @@ class BatchStagingManager {
     
     struct DrawingPath: Identifiable, Sendable {
         let id = UUID()
+        // Normalized points in the rendered image coordinate space (0...1).
         var points: [CGPoint]
+        // Normalized brush size as a fraction of min(canvasWidth, canvasHeight).
         var size: CGFloat
         var isEraser: Bool = false
     }
@@ -37,8 +39,12 @@ class BatchStagingManager {
     // Derived Properties
     var isEmpty: Bool { stagedFiles.isEmpty }
     var count: Int { stagedFiles.isEmpty ? textToImageCount : stagedFiles.count }
+    var hasAnyRegionEdits: Bool {
+        stagedFiles.contains { stagedMaskEdits[$0] != nil }
+    }
     
     var hasSufficientPrompts: Bool {
+        if isMultiInput && hasAnyRegionEdits { return false }
         if !prompt.isEmpty { return true }
         if stagedFiles.isEmpty { return false } // Text-to-image requires a prompt
         
@@ -60,6 +66,13 @@ class BatchStagingManager {
         let hasValidInput = !stagedFiles.isEmpty || (textToImageCount > 0 && aspectRatio != "Auto")
         return hasValidInput && hasSufficientPrompts
     }
+
+    var startBlockReason: String? {
+        if isMultiInput && hasAnyRegionEdits {
+            return "Region Edit is only available in standard batch mode (one output per input image). Turn off Multi-Input Mode to continue."
+        }
+        return nil
+    }
     
     // Actions
     func addFiles(_ urls: [URL], bookmarks: [URL: Data] = [:]) {
@@ -73,6 +86,24 @@ class BatchStagingManager {
         for (url, bookmark) in bookmarks {
             stagedBookmarks[url] = bookmark
         }
+    }
+
+    /// Adds files and captures security-scoped bookmarks where available.
+    /// Any provided bookmarks are preserved and preferred over newly generated ones.
+    func addFilesCapturingBookmarks(_ urls: [URL], preferredBookmarks: [URL: Data] = [:]) {
+        var bookmarks = preferredBookmarks
+
+        for url in urls where bookmarks[url] == nil {
+            let didStart = url.startAccessingSecurityScopedResource()
+            if let bookmark = AppPaths.bookmark(for: url) {
+                bookmarks[url] = bookmark
+            }
+            if didStart {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        addFiles(urls, bookmarks: bookmarks)
     }
     
     func removeFile(_ url: URL) {
@@ -102,6 +133,9 @@ class BatchStagingManager {
     }
     
     func saveMaskEdit(for url: URL, maskData: Data, prompt: String, paths: [DrawingPath]) {
+        if isMultiInput {
+            isMultiInput = false
+        }
         stagedMaskEdits[url] = StagedMaskEdit(maskData: maskData, prompt: prompt, paths: paths)
     }
     

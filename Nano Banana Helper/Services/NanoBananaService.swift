@@ -138,6 +138,9 @@ actor NanoBananaService {
     }
     
     private func buildRequestPayload(request: ImageEditRequest) async throws -> [String: Any] {
+        let activeModel = await modelName
+        try validateImageCount(request.inputImageURLs.count, forModel: activeModel)
+
         // Build multimodal parts
         var parts: [[String: Any]] = []
         parts.append(["text": request.prompt])
@@ -158,8 +161,17 @@ actor NanoBananaService {
         }
         
         // Validate size for batch requests (20MB limit for inline requests)
-        if request.useBatchTier && totalDataSize > maxBatchPayloadSize {
-            throw NanoBananaError.batchError(message: "Total image data (\(totalDataSize / 1024 / 1024)MB) exceeds 20MB limit for batch inline requests. Use smaller images or fewer images per batch.")
+        if request.useBatchTier {
+            let estimatedPayloadBytes = estimatedBatchInlinePayloadBytes(
+                rawImageBytes: totalDataSize,
+                prompt: request.prompt,
+                systemInstruction: request.systemInstruction
+            )
+            if estimatedPayloadBytes > maxBatchPayloadSize {
+                throw NanoBananaError.batchError(
+                    message: "Estimated inline batch payload (\(estimatedPayloadBytes / 1024 / 1024)MB) exceeds the 20MB limit. Use smaller images or fewer images per batch."
+                )
+            }
         }
         
         // Build imageConfig — omit aspectRatio entirely when Auto is selected,
@@ -171,16 +183,8 @@ actor NanoBananaService {
             imageConfig["aspectRatio"] = aspectRatioEntry.id
         }
         
-        // Add mask image if we have one
-        if let maskImageData = request.maskImageData {
-            // Append mask image to parts (as the first or second image depending on order API expects; usually second after base)
-            parts.append([
-                "inlineData": [
-                    "mimeType": "image/png",
-                    "data": maskImageData.base64EncodedString()
-                ]
-            ])
-        }
+        // Region-edit masks are local-only guidance for crop/composite in the app.
+        // Gemini receives only the prompt and image inputs (full image or pre-cropped region).
         
         var payload: [String: Any] = [
             "contents": [["parts": parts]],
@@ -213,17 +217,13 @@ actor NanoBananaService {
         urlRequest.httpBody = httpBody
         
         // Log request
-        if let jsonString = String(data: httpBody, encoding: .utf8) {
-            await LogManager.shared.log(.request, payload: jsonString)
-        }
+        await LogManager.shared.log(.request, payload: summarizedRequestLog(payload, httpBody: httpBody))
         
         // Execute with retry
         let (data, response) = try await executeWithRetry(urlRequest)
         
         // Log response
-        if let jsonString = String(data: data, encoding: .utf8) {
-            await LogManager.shared.log(.response, payload: jsonString)
-        }
+        await LogManager.shared.log(.response, payload: summarizedGenerateContentResponseLog(data))
         
         guard let httpResponse = response as? HTTPURLResponse else {
             throw NanoBananaError.invalidResponse
@@ -279,6 +279,7 @@ actor NanoBananaService {
         
         let httpBody = try JSONSerialization.data(withJSONObject: batchPayload)
         urlRequest.httpBody = httpBody
+        await LogManager.shared.log(.request, payload: summarizedBatchCreateLog(batchPayload, httpBody: httpBody))
         
         let (data, response) = try await session.data(for: urlRequest)
         
@@ -296,6 +297,110 @@ actor NanoBananaService {
         }
         
         return BatchJobInfo(jobName: jobName, requestKey: requestKey)
+    }
+
+    private func validateImageCount(_ count: Int, forModel model: String) throws {
+        guard count > 0 else { return }
+
+        // Current Gemini image generation docs for gemini-3-pro-image-preview document
+        // up to 14 reference images. Apply conservatively to this model family.
+        if model.contains("gemini-3-pro-image-preview"), count > 14 {
+            throw NanoBananaError.batchError(
+                message: "This model supports up to 14 input images per request. Reduce the number of images and retry."
+            )
+        }
+    }
+
+    private func estimatedBatchInlinePayloadBytes(rawImageBytes: Int, prompt: String, systemInstruction: String?) -> Int {
+        // Base64 expansion is ~4/3, plus JSON escaping/keys and request framing.
+        let base64Estimate = Int(Double(rawImageBytes) * 1.37)
+        let textBytes = prompt.utf8.count + (systemInstruction?.utf8.count ?? 0)
+        let jsonOverhead = 32_768
+        return base64Estimate + textBytes + jsonOverhead
+    }
+
+    private func summarizedRequestLog(_ payload: [String: Any], httpBody: Data) -> String {
+        let (imageCount, imageBytes) = extractInlineImageStats(from: payload)
+        let promptLength = extractPromptLength(from: payload)
+        let model = (payload["model"] as? String) ?? "implicit"
+        return """
+        generateContent request summary:
+        model=\(model)
+        image_parts=\(imageCount)
+        inline_image_bytes_est=\(imageBytes)
+        prompt_chars=\(promptLength)
+        body_bytes=\(httpBody.count)
+        """
+    }
+
+    private func summarizedBatchCreateLog(_ batchPayload: [String: Any], httpBody: Data) -> String {
+        let requests = (((batchPayload["batch"] as? [String: Any])?["input_config"] as? [String: Any])?["requests"] as? [String: Any])?["requests"] as? [[String: Any]] ?? []
+        let requestCount = requests.count
+        let firstRequest = (((requests.first?["request"] as? [String: Any])) ?? [:])
+        let (imageCount, imageBytes) = extractInlineImageStats(from: firstRequest)
+        let promptLength = extractPromptLength(from: firstRequest)
+        return """
+        batch create request summary:
+        requests=\(requestCount)
+        first_request_image_parts=\(imageCount)
+        first_request_inline_image_bytes_est=\(imageBytes)
+        first_request_prompt_chars=\(promptLength)
+        body_bytes=\(httpBody.count)
+        """
+    }
+
+    private func extractInlineImageStats(from payload: [String: Any]) -> (count: Int, estimatedDecodedBytes: Int) {
+        let contents = payload["contents"] as? [[String: Any]] ?? []
+        let parts = (contents.first?["parts"] as? [[String: Any]]) ?? []
+        var count = 0
+        var estimatedBytes = 0
+        for part in parts {
+            guard let inline = part["inlineData"] as? [String: Any],
+                  let base64 = inline["data"] as? String else { continue }
+            count += 1
+            estimatedBytes += Int(Double(base64.count) * 0.75)
+        }
+        return (count, estimatedBytes)
+    }
+
+    private func extractPromptLength(from payload: [String: Any]) -> Int {
+        let contents = payload["contents"] as? [[String: Any]] ?? []
+        let parts = (contents.first?["parts"] as? [[String: Any]]) ?? []
+        return (parts.first?["text"] as? String)?.count ?? 0
+    }
+
+    private func summarizedGenerateContentResponseLog(_ data: Data) -> String {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return "generateContent response summary: non-JSON body (\(data.count) bytes)"
+        }
+
+        let (imageCount, imageBytes) = extractInlineImageStatsFromResponse(json)
+        let candidateCount = (json["candidates"] as? [[String: Any]])?.count ?? 0
+        return """
+        generateContent response summary:
+        candidates=\(candidateCount)
+        inline_images=\(imageCount)
+        inline_image_bytes_est=\(imageBytes)
+        body_bytes=\(data.count)
+        """
+    }
+
+    private func extractInlineImageStatsFromResponse(_ json: [String: Any]) -> (count: Int, estimatedDecodedBytes: Int) {
+        let candidates = json["candidates"] as? [[String: Any]] ?? []
+        var count = 0
+        var estimatedBytes = 0
+
+        for candidate in candidates {
+            let content = candidate["content"] as? [String: Any]
+            let parts = content?["parts"] as? [[String: Any]] ?? []
+            for part in parts {
+                guard let inline = (part["inline_data"] as? [String: Any]) ?? (part["inlineData"] as? [String: Any]),
+                      let base64 = inline["data"] as? String else { continue }
+                count += 1
+                estimatedBytes += Int(Double(base64.count) * 0.75)
+            }
+        }
+        return (count, estimatedBytes)
     }
     
     /// Convenience wrapper for polling a known batch job
@@ -315,6 +420,9 @@ actor NanoBananaService {
         var consecutiveErrors = 0
         
         while pollCount <= maxPollCount {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
             pollCount += 1
             onPollUpdate?(pollCount)
             // Poll using the operation name
@@ -389,8 +497,15 @@ actor NanoBananaService {
                 try await Task.sleep(nanoseconds: pollInterval)
                 
             } catch {
+                if error is CancellationError || Task.isCancelled {
+                    throw CancellationError()
+                }
+
                 // Network error handling
                 let nsError = error as NSError
+                if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+                    throw CancellationError()
+                }
                 // Retry on network loss or timeout
                 if nsError.domain == NSURLErrorDomain {
                     consecutiveErrors += 1

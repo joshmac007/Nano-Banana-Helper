@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import UserNotifications
+import CoreGraphics
 
 // MARK: - Sendable Helpers
 struct JobSubmissionData: Sendable {
@@ -23,19 +24,20 @@ struct BatchSettings: Sendable {
     let projectId: UUID?
     
     // Helper for cost calculation
-    func cost(inputCount: Int) -> Double {
+    func cost(inputCount: Int, imageSizeOverride: String? = nil) -> Double {
         let inputRate = useBatchTier ? 0.0006 : 0.0011
         let inputCost = inputRate * Double(inputCount)
         
         let outputCost: Double
+        let outputSize = imageSizeOverride ?? imageSize
         if useBatchTier {
-            switch imageSize {
+            switch outputSize {
             case "4K": outputCost = 0.12
             case "2K", "1K": outputCost = 0.067
             default: outputCost = 0.067
             }
         } else {
-            switch imageSize {
+            switch outputSize {
             case "4K": outputCost = 0.24
             case "2K", "1K": outputCost = 0.134
             default: outputCost = 0.134
@@ -56,10 +58,54 @@ private enum OutputDirectoryAccessError: LocalizedError {
     }
 }
 
+private enum InputFileAccessError: LocalizedError {
+    case bookmarkAccessFailed(path: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .bookmarkAccessFailed(let path):
+            return "Cannot access the source image anymore. Re-add the file and retry. (\(path))"
+        }
+    }
+}
+
+private enum RegionEditPipelineError: LocalizedError {
+    case requiresSingleInput
+    case missingMask
+    case missingCropMetadata
+    case missingSourceImage
+    case sourceBookmarkAccessFailed(path: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .requiresSingleInput:
+            return "Region Edit requires exactly one input image."
+        case .missingMask:
+            return "Region Edit mask is missing for this task."
+        case .missingCropMetadata:
+            return "Region Edit crop metadata is missing. Re-save the region edit and retry."
+        case .missingSourceImage:
+            return "Source image could not be loaded for local region compositing."
+        case .sourceBookmarkAccessFailed(let path):
+            return "Cannot access the source image anymore. Re-add the image and retry. (\(path))"
+        }
+    }
+}
+
 /// Orchestrates batch processing of image editing tasks
 @Observable
 @MainActor
 final class BatchOrchestrator {
+    private enum RunState {
+        case idle
+        case running
+        case pausing
+        case paused
+        case cancelling
+    }
+
+    private let regionEditPromptClause = "Only change the intended region in this cropped image. Preserve all unrequested details, lighting, perspective, and style consistency."
+
     // Computed views over activeBatches
     var pendingJobs: [ImageTask] {
         activeBatches.flatMap { $0.tasks.filter { $0.status == "pending" } }
@@ -75,15 +121,20 @@ final class BatchOrchestrator {
     }
     
     var isRunning: Bool {
-        !activeBatches.filter { $0.status == "processing" }.isEmpty
+        !isPaused && !activeBatches.filter { $0.status == "processing" }.isEmpty
     }
-    var isPaused: Bool = false
+    var isPaused: Bool {
+        runState == .pausing || runState == .paused
+    }
     var currentProgress: Double = 0.0
     var statusMessage: String = "Ready"
     
     private var activeBatches: [BatchJob] = []
     private let service = NanoBananaService()
     private let concurrencyLimit = 5 // Paid tier: safe default for concurrent submissions
+    private var runState: RunState = .idle
+    private var batchRunnerTasks: [UUID: Task<Void, Never>] = [:]
+    private var pollTasks: [UUID: Task<Void, Never>] = [:]
 
     // Callbacks for history/cost tracking
     var onImageCompleted: ((HistoryEntry) -> Void)?
@@ -96,6 +147,7 @@ final class BatchOrchestrator {
 
     init() {
         loadActiveBatches()
+        refreshRunStateFromBatches()
         DebugLog.info("batch", "BatchOrchestrator initialized", metadata: [
             "restored_batches": String(activeBatches.count)
         ])
@@ -104,11 +156,13 @@ final class BatchOrchestrator {
     /// Enqueue a new batch job for processing
     func enqueue(_ batch: BatchJob) {
         activeBatches.append(batch)
+        let tasksMissingInputBookmarks = batch.tasks.filter { !$0.inputPaths.isEmpty && (($0.inputBookmarks ?? []).isEmpty) }.count
         DebugLog.info("batch.enqueue", "Enqueued batch", metadata: [
             "batch_id": batch.id.uuidString,
             "task_count": String(batch.tasks.count),
             "project_id": batch.projectId?.uuidString ?? "nil",
-            "has_output_bookmark": String(batch.outputDirectoryBookmark != nil)
+            "has_output_bookmark": String(batch.outputDirectoryBookmark != nil),
+            "tasks_missing_input_bookmarks": String(tasksMissingInputBookmarks)
         ])
         
         // Ensure all tasks have the project ID
@@ -120,14 +174,13 @@ final class BatchOrchestrator {
         updateProgress()
         
         // Auto-start this batch
-        Task {
-            await start(batch: batch)
-        }
+        _ = launchBatchRunner(for: batch)
     }
     
     /// Start or resume batch processing
     func start(batch: BatchJob) async {
-        guard batch.status != "processing" && batch.status != "completed" else { return }
+        guard batch.status != "completed" && batch.status != "cancelled" else { return }
+        guard runState != .cancelling else { return }
         DebugLog.info("batch.start", "Starting batch", metadata: [
             "batch_id": batch.id.uuidString,
             "status": batch.status,
@@ -139,6 +192,7 @@ final class BatchOrchestrator {
             _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
         }
         
+        runState = .running
         batch.status = "processing"
         statusMessage = "Processing \(activeBatches.count) batches..."
         
@@ -147,26 +201,58 @@ final class BatchOrchestrator {
     
     /// Resume all interrupted batches
     func startAll() async {
-        for batch in activeBatches where batch.status == "pending" || batch.status == "processing" {
-            await start(batch: batch)
+        if runState == .paused || runState == .pausing {
+            runState = .running
+        }
+
+        var runners: [Task<Void, Never>] = []
+        for batch in activeBatches where batch.status == "pending" || batch.status == "processing" || batch.status == "paused" {
+            if let runner = launchBatchRunner(for: batch) {
+                runners.append(runner)
+            }
+        }
+        if runners.isEmpty {
+            refreshRunStateFromBatches()
+        }
+        for runner in runners {
+            await runner.value
         }
     }
     
     /// Pause batch processing
     func pause() {
-        isPaused = true
-        statusMessage = "Paused"
+        guard runState != .paused && runState != .pausing else { return }
+        guard runState != .cancelling else { return }
+        guard activeBatches.contains(where: { $0.status == "processing" }) || !pollTasks.isEmpty else { return }
+
+        runState = .pausing
+        statusMessage = "Pausing..."
+        markProcessingBatchesAsPaused()
+        cancelActivePollTasks()
+        saveActiveBatches()
+
+        if pollTasks.isEmpty {
+            finalizePause()
+        }
     }
     
     /// Cancel all pending tasks
     func cancel() {
+        runState = .cancelling
+        cancelActivePollTasks()
+        cancelActiveBatchRunners()
+
         // Cancel all batches
         for batch in activeBatches {
              cancel(batch: batch)
         }
         activeBatches = []
-        isPaused = false
+        batchRunnerTasks.removeAll()
+        pollTasks.removeAll()
+        runState = .idle
         statusMessage = "Cancelled all jobs"
+        saveActiveBatches()
+        updateProgress()
     }
     
     func cancel(batch: BatchJob) {
@@ -218,7 +304,12 @@ final class BatchOrchestrator {
     
     /// Reset the orchestrator for a new session (clears history of current view)
     func reset() {
+        cancelActivePollTasks()
+        cancelActiveBatchRunners()
         activeBatches = []
+        batchRunnerTasks.removeAll()
+        pollTasks.removeAll()
+        runState = .idle
         currentProgress = 0.0
         statusMessage = "Ready"
     }
@@ -278,8 +369,127 @@ final class BatchOrchestrator {
     func resumeInterruptedJobs() async {
         await startAll()
     }
+
+    private var shouldPauseProcessing: Bool {
+        runState == .pausing || runState == .paused
+    }
+
+    private var isPauseRequested: Bool {
+        runState == .pausing || runState == .paused
+    }
+
+    @discardableResult
+    private func launchBatchRunner(for batch: BatchJob) -> Task<Void, Never>? {
+        guard batch.status != "completed" && batch.status != "cancelled" else { return nil }
+        guard runState != .pausing && runState != .paused && runState != .cancelling else { return nil }
+        if let existing = batchRunnerTasks[batch.id], !existing.isCancelled {
+            return existing
+        }
+
+        let runner = Task { [weak self] in
+            guard let self else { return }
+            await self.start(batch: batch)
+            self.finishBatchRunner(batchId: batch.id)
+        }
+        batchRunnerTasks[batch.id] = runner
+        return runner
+    }
+
+    private func finishBatchRunner(batchId: UUID) {
+        batchRunnerTasks.removeValue(forKey: batchId)
+        if runState != .pausing && runState != .paused {
+            refreshRunStateFromBatches()
+        }
+    }
+
+    private func cancelActivePollTasks() {
+        for task in pollTasks.values {
+            task.cancel()
+        }
+    }
+
+    private func cancelActiveBatchRunners() {
+        for task in batchRunnerTasks.values {
+            task.cancel()
+        }
+    }
+
+    private func markProcessingBatchesAsPaused() {
+        for batch in activeBatches where batch.status == "processing" {
+            batch.status = "paused"
+        }
+    }
+
+    private func finalizePause() {
+        markProcessingBatchesAsPaused()
+        runState = .paused
+        statusMessage = "Paused"
+        saveActiveBatches()
+        refreshRunStateFromBatches()
+    }
+
+    private func markPollJobInterrupted(jobId: UUID) {
+        if let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == jobId }),
+           job.status == "processing" {
+            job.phase = .reconnecting
+        }
+    }
+
+    private func refreshRunStateFromBatches() {
+        guard runState != .cancelling else { return }
+
+        let hasProcessing = activeBatches.contains { $0.status == "processing" }
+        let hasPaused = activeBatches.contains { $0.status == "paused" }
+
+        if isPauseRequested {
+            if hasProcessing {
+                runState = .pausing
+            } else if hasPaused {
+                runState = .paused
+            } else {
+                runState = .idle
+            }
+            return
+        }
+
+        if hasProcessing {
+            runState = .running
+        } else if hasPaused {
+            runState = .paused
+        } else {
+            runState = .idle
+        }
+    }
+
+    @discardableResult
+    private func finalizeBatchStatusIfFinished(_ batch: BatchJob) -> Bool {
+        guard !batch.tasks.contains(where: { $0.status == "processing" || $0.status == "pending" }) else {
+            return false
+        }
+
+        if batch.tasks.contains(where: { $0.status == "failed" }) {
+            batch.status = "failed"
+            statusMessage = "Completed with errors"
+        } else {
+            batch.status = "completed"
+            let count = batch.tasks.filter { $0.status == "completed" }.count
+            statusMessage = "Completed: \(count) output images"
+        }
+
+        refreshRunStateFromBatches()
+        return true
+    }
     
     private func processQueue(batch: BatchJob) async {
+        if shouldPauseProcessing {
+            if finalizeBatchStatusIfFinished(batch) {
+                await sendCompletionNotification()
+                return
+            }
+            finalizePause()
+            return
+        }
+
         // 1. Queue all pending jobs in THIS batch to Processing immediately
         let jobsToSubmit = batch.tasks.filter { $0.status == "pending" }
         for job in jobsToSubmit {
@@ -288,49 +498,6 @@ final class BatchOrchestrator {
         updateProgress()
         
         statusMessage = "Submitting \(jobsToSubmit.count) jobs..."
-        
-        let submissionDataList: [JobSubmissionData] = jobsToSubmit.map { job in
-            // Resolve security-scoped URLs from bookmarks if available.
-            // resolveBookmarkAccess calls startAccessingSecurityScopedResource internally.
-            if let bookmarks = job.inputBookmarks, !bookmarks.isEmpty {
-                var resolvedURLs: [URL] = []
-                var refreshedBookmarks = bookmarks
-                var didRefreshBookmarks = false
-                
-                for (index, bookmark) in bookmarks.enumerated() {
-                    guard let resolved = AppPaths.resolveBookmarkAccess(bookmark) else {
-                        DebugLog.error("batch.input", "Input bookmark resolution failed; falling back to path URLs", metadata: [
-                            "job_id": job.id.uuidString,
-                            "bookmark_index": String(index),
-                            "input_count": String(bookmarks.count)
-                        ])
-                        // Avoid partially submitting multi-input jobs when only some bookmarks resolve.
-                        resolvedURLs.forEach { $0.stopAccessingSecurityScopedResource() }
-                        resolvedURLs = []
-                        break
-                    }
-                    resolvedURLs.append(resolved.url)
-                    if let refreshed = resolved.refreshedBookmarkData {
-                        refreshedBookmarks[index] = refreshed
-                        didRefreshBookmarks = true
-                    }
-                }
-                
-                if didRefreshBookmarks {
-                    job.inputBookmarks = refreshedBookmarks
-                    DebugLog.info("batch.input", "Refreshed one or more input bookmarks", metadata: [
-                        "job_id": job.id.uuidString,
-                        "input_count": String(bookmarks.count)
-                    ])
-                }
-                
-                if !resolvedURLs.isEmpty {
-                    return JobSubmissionData(id: job.id, inputURLs: resolvedURLs, inputPaths: job.inputPaths, hasSecurityScope: true, maskImageData: job.maskImageData ?? batch.maskImageData, customPrompt: job.customPrompt)
-                }
-            }
-            // Fallback to plain path-based URLs (drag-and-drop, or already-accessible files)
-            return JobSubmissionData(id: job.id, inputURLs: job.inputPaths.map { URL(fileURLWithPath: $0) }, inputPaths: job.inputPaths, hasSecurityScope: false, maskImageData: job.maskImageData ?? batch.maskImageData, customPrompt: job.customPrompt)
-        }
         
         let batchSettings = BatchSettings(
             prompt: batch.prompt,
@@ -342,6 +509,93 @@ final class BatchOrchestrator {
             useBatchTier: batch.useBatchTier,
             projectId: batch.projectId
         )
+
+        var submissionDataList: [JobSubmissionData] = []
+        submissionDataList.reserveCapacity(jobsToSubmit.count)
+
+        for job in jobsToSubmit {
+            // Resolve security-scoped URLs from bookmarks if available.
+            // resolveBookmarkAccess calls startAccessingSecurityScopedResource internally.
+            if let bookmarks = job.inputBookmarks, !bookmarks.isEmpty {
+                var resolvedURLs: [URL] = []
+                var refreshedBookmarks = bookmarks
+                var didRefreshBookmarks = false
+                var failedPath = job.inputPaths.first ?? "unknown"
+                var resolutionFailed = false
+                
+                for (index, bookmark) in bookmarks.enumerated() {
+                    guard let resolved = AppPaths.resolveBookmarkAccess(bookmark) else {
+                        DebugLog.error("batch.input", "Input bookmark resolution failed; marking job failed", metadata: [
+                            "job_id": job.id.uuidString,
+                            "bookmark_index": String(index),
+                            "input_count": String(bookmarks.count)
+                        ])
+                        // Avoid partially submitting multi-input jobs when only some bookmarks resolve.
+                        resolvedURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+                        resolvedURLs = []
+                        failedPath = job.inputPaths.indices.contains(index) ? job.inputPaths[index] : failedPath
+                        resolutionFailed = true
+                        break
+                    }
+                    resolvedURLs.append(resolved.url)
+                    if let refreshed = resolved.refreshedBookmarkData {
+                        refreshedBookmarks[index] = refreshed
+                        didRefreshBookmarks = true
+                    }
+                }
+                
+                if didRefreshBookmarks {
+                    job.inputBookmarks = refreshedBookmarks
+                    saveActiveBatches()
+                    DebugLog.info("batch.input", "Refreshed one or more input bookmarks", metadata: [
+                        "job_id": job.id.uuidString,
+                        "input_count": String(bookmarks.count)
+                    ])
+                }
+                
+                if resolutionFailed {
+                    await handleError(
+                        jobId: job.id,
+                        data: JobSubmissionData(
+                            id: job.id,
+                            inputURLs: [],
+                            inputPaths: job.inputPaths,
+                            hasSecurityScope: false,
+                            maskImageData: job.maskImageData ?? batch.maskImageData,
+                            customPrompt: job.customPrompt
+                        ),
+                        settings: batchSettings,
+                        error: InputFileAccessError.bookmarkAccessFailed(path: failedPath)
+                    )
+                    continue
+                }
+
+                if !resolvedURLs.isEmpty {
+                    submissionDataList.append(
+                        JobSubmissionData(
+                            id: job.id,
+                            inputURLs: resolvedURLs,
+                            inputPaths: job.inputPaths,
+                            hasSecurityScope: true,
+                            maskImageData: job.maskImageData ?? batch.maskImageData,
+                            customPrompt: job.customPrompt
+                        )
+                    )
+                    continue
+                }
+            }
+            // Fallback to plain path-based URLs (drag-and-drop, or already-accessible files)
+            submissionDataList.append(
+                JobSubmissionData(
+                    id: job.id,
+                    inputURLs: job.inputPaths.map { URL(fileURLWithPath: $0) },
+                    inputPaths: job.inputPaths,
+                    hasSecurityScope: false,
+                    maskImageData: job.maskImageData ?? batch.maskImageData,
+                    customPrompt: job.customPrompt
+                )
+            )
+        }
         
         // 2. Submit all jobs to get IDs — throttled to concurrencyLimit concurrent submissions
         await withTaskGroup(of: Void.self) { group in
@@ -362,6 +616,19 @@ final class BatchOrchestrator {
         if batch.tasks.contains(where: { $0.phase == .failed }) {
             statusMessage = "Submission errors occurred."
         }
+
+        if runState == .cancelling {
+            return
+        }
+
+        if shouldPauseProcessing {
+            if finalizeBatchStatusIfFinished(batch) {
+                await sendCompletionNotification()
+                return
+            }
+            finalizePause()
+            return
+        }
         
         // 3. Poll all successfully submitted jobs concurrently
         statusMessage = "Polling batch jobs..."
@@ -370,31 +637,41 @@ final class BatchOrchestrator {
             guard let name = $0.externalJobName else { return nil }
             return ($0.id, name)
         }
-        
-        await withTaskGroup(of: Void.self) { group in
-            for (id, name) in validJobsData {
-                group.addTask {
-                    await self.performPoll(jobId: id, jobName: name, settings: batchSettings, recovering: false)
-                }
+
+        var workers: [(jobId: UUID, task: Task<Void, Never>)] = []
+        workers.reserveCapacity(validJobsData.count)
+        for (id, name) in validJobsData {
+            if shouldPauseProcessing {
+                break
             }
+            let worker = Task { [weak self] in
+                guard let self else { return }
+                await self.performPoll(jobId: id, jobName: name, settings: batchSettings, recovering: false)
+            }
+            pollTasks[id] = worker
+            workers.append((jobId: id, task: worker))
+        }
+
+        for worker in workers {
+            await worker.task.value
+            pollTasks.removeValue(forKey: worker.jobId)
+        }
+
+        if runState == .cancelling {
+            return
+        }
+
+        if shouldPauseProcessing {
+            if finalizeBatchStatusIfFinished(batch) {
+                await sendCompletionNotification()
+                return
+            }
+            finalizePause()
+            return
         }
         
-        // Batch complete check
-        if !batch.tasks.contains(where: { $0.status == "processing" || $0.status == "pending" }) {
-             if batch.tasks.contains(where: { $0.status == "failed" }) {
-                  batch.status = "failed"
-             } else {
-                  batch.status = "completed"
-             }
-        }
-        
-        if batch.status == "completed" {
-            let count = batch.tasks.filter { $0.status == "completed" }.count
-            statusMessage = "Completed: \(count) output images"
-        } else if batch.status == "failed" {
-            statusMessage = "Completed with errors"
-        }
-        
+        _ = finalizeBatchStatusIfFinished(batch)
+
         await sendCompletionNotification()
     }
     
@@ -409,13 +686,70 @@ final class BatchOrchestrator {
             }
         }
         
+        let mergedPrompt = mergedTaskPrompt(
+            globalPrompt: settings.prompt,
+            customPrompt: data.customPrompt,
+            isRegionEdit: data.maskImageData != nil
+        )
+
+        var requestInputURLs = data.inputURLs
+        var tempCropURL: URL?
+        var requestImageSize = settings.imageSize
+        defer {
+            if let tempCropURL {
+                try? FileManager.default.removeItem(at: tempCropURL)
+            }
+        }
+        if let maskImageData = data.maskImageData {
+            guard data.inputURLs.count == 1 else {
+                if data.hasSecurityScope {
+                    data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+                }
+                await handleError(jobId: data.id, data: data, settings: settings, error: RegionEditPipelineError.requiresSingleInput)
+                return
+            }
+
+            do {
+                let sourceImageData = try Data(contentsOf: data.inputURLs[0])
+                let preparation = try await MainActor.run {
+                    try RegionEditProcessor.prepareCrop(
+                        sourceImageData: sourceImageData,
+                        maskImageData: maskImageData
+                    )
+                }
+
+                if let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == data.id }) {
+                    job.regionEditCropRect = preparation.cropRect
+                    let chosenSize = chooseRegionEditProcessingImageSize(
+                        cropRect: preparation.cropRect,
+                        userSelectedMax: settings.imageSize
+                    )
+                    job.regionEditProcessingImageSize = chosenSize
+                    requestImageSize = chosenSize
+                }
+
+                let cropURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("region-edit-\(data.id.uuidString)")
+                    .appendingPathExtension("png")
+                try preparation.croppedImageData.write(to: cropURL, options: .atomic)
+                requestInputURLs = [cropURL]
+                tempCropURL = cropURL
+            } catch {
+                if data.hasSecurityScope {
+                    data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+                }
+                await handleError(jobId: data.id, data: data, settings: settings, error: error)
+                return
+            }
+        }
+
         let request = ImageEditRequest(
-            inputImageURLs: data.inputURLs,
+            inputImageURLs: requestInputURLs,
             maskImageData: data.maskImageData,
-            prompt: data.customPrompt ?? settings.prompt,
+            prompt: mergedPrompt,
             systemInstruction: settings.systemPrompt,
             aspectRatio: settings.aspectRatio,
-            imageSize: settings.imageSize,
+            imageSize: requestImageSize,
             useBatchTier: settings.useBatchTier
         )
         
@@ -441,9 +775,9 @@ final class BatchOrchestrator {
                                 projectId: projectId,
                                 sourceImagePaths: job.inputPaths,
                                 outputImagePath: "",
-                                prompt: data.customPrompt ?? settings.prompt,
+                                prompt: mergedPrompt,
                                 aspectRatio: settings.aspectRatio,
-                                imageSize: settings.imageSize,
+                                imageSize: job.regionEditProcessingImageSize ?? settings.imageSize,
                                 usedBatchTier: settings.useBatchTier,
                                 cost: 0,
                                 status: "processing",
@@ -453,6 +787,7 @@ final class BatchOrchestrator {
                         }
                     }
                 }
+                saveActiveBatches()
             } else {
                 let response = try await service.editImage(request)
                 DebugLog.info("batch.submit", "Standard job completed inline", metadata: [
@@ -509,7 +844,31 @@ final class BatchOrchestrator {
                 response: response,
                 jobName: jobName
             )
+        } catch is CancellationError {
+            if isPauseRequested {
+                markPollJobInterrupted(jobId: jobId)
+                return
+            }
+            if runState == .cancelling {
+                return
+            }
+            await handleError(
+                jobId: jobId,
+                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false, maskImageData: nil, customPrompt: nil),
+                settings: settings,
+                error: CancellationError()
+            )
         } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+                if isPauseRequested {
+                    markPollJobInterrupted(jobId: jobId)
+                    return
+                }
+                if runState == .cancelling {
+                    return
+                }
+            }
             await handleError(
                 jobId: jobId,
                 data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false, maskImageData: nil, customPrompt: nil),
@@ -565,20 +924,31 @@ final class BatchOrchestrator {
             }
         }
         
-        let outputURL = generateOutputURL(
-            for: job,
-            inDirectory: directoryURL,
-            mimeType: response.mimeType
-        )
-        
+        var attemptedOutputPath = settings.outputDirectory
+
         do {
+            let finalOutput: (data: Data, mimeType: String)
+            if job.maskImageData != nil {
+                finalOutput = try await compositeRegionEditOutput(job: job, response: response)
+            } else {
+                finalOutput = (response.imageData, response.mimeType)
+            }
+
+            let outputURL = generateOutputURL(
+                for: job,
+                inDirectory: directoryURL,
+                mimeType: finalOutput.mimeType
+            )
+            attemptedOutputPath = outputURL.path
+
             DebugLog.debug("batch.output", "Writing output image", metadata: [
                 "job_id": jobId.uuidString,
                 "path": outputURL.path,
-                "bytes": String(response.imageData.count),
-                "mime_type": response.mimeType
+                "bytes": String(finalOutput.data.count),
+                "mime_type": finalOutput.mimeType,
+                "region_edit": String(job.maskImageData != nil)
             ])
-            try response.imageData.write(to: outputURL)
+            try finalOutput.data.write(to: outputURL)
             DebugLog.info("batch.output", "Output image write succeeded", metadata: [
                 "job_id": jobId.uuidString,
                 "path": outputURL.path
@@ -589,7 +959,8 @@ final class BatchOrchestrator {
             job.outputPath = outputURL.path
             job.completedAt = Date()
             
-            let cost = settings.cost(inputCount: job.inputPaths.count)
+            let effectiveImageSize = job.regionEditProcessingImageSize ?? settings.imageSize
+            let cost = settings.cost(inputCount: job.inputPaths.count, imageSizeOverride: effectiveImageSize)
             if let projectId = settings.projectId {
                 // Use bookmarks already captured before security scope was stopped.
                 // Do NOT use job.inputURLs here — that computed property calls
@@ -601,9 +972,13 @@ final class BatchOrchestrator {
                     projectId: projectId,
                     sourceImagePaths: job.inputPaths,
                     outputImagePath: outputURL.path,
-                    prompt: job.customPrompt ?? settings.prompt,
+                    prompt: mergedTaskPrompt(
+                        globalPrompt: settings.prompt,
+                        customPrompt: job.customPrompt,
+                        isRegionEdit: (job.maskImageData ?? data.maskImageData) != nil
+                    ),
                     aspectRatio: settings.aspectRatio,
-                    imageSize: settings.imageSize,
+                    imageSize: effectiveImageSize,
                     usedBatchTier: settings.useBatchTier,
                     cost: cost,
                     status: "completed",
@@ -617,7 +992,7 @@ final class BatchOrchestrator {
                 } else {
                     onImageCompleted?(historyEntry)
                 }
-                onCostIncurred?(cost, settings.imageSize, projectId)
+                onCostIncurred?(cost, effectiveImageSize, projectId)
             }
             
             saveActiveBatches()
@@ -625,7 +1000,7 @@ final class BatchOrchestrator {
         } catch {
             DebugLog.error("batch.output", "Output image write failed", metadata: [
                 "job_id": jobId.uuidString,
-                "path": outputURL.path,
+                "path": attemptedOutputPath,
                 "error": String(describing: error)
             ])
             await handleError(jobId: jobId, data: data, settings: settings, error: error)
@@ -649,9 +1024,13 @@ final class BatchOrchestrator {
                 projectId: projectId,
                 sourceImagePaths: job.inputPaths,
                 outputImagePath: "",
-                prompt: job.customPrompt ?? settings.prompt,
+                prompt: mergedTaskPrompt(
+                    globalPrompt: settings.prompt,
+                    customPrompt: job.customPrompt,
+                    isRegionEdit: (job.maskImageData ?? data.maskImageData) != nil
+                ),
                 aspectRatio: settings.aspectRatio,
-                imageSize: settings.imageSize,
+                imageSize: job.regionEditProcessingImageSize ?? settings.imageSize,
                 usedBatchTier: settings.useBatchTier,
                 cost: 0,
                 status: "failed",
@@ -668,6 +1047,106 @@ final class BatchOrchestrator {
         
         saveActiveBatches()
         updateProgress()
+    }
+
+    private func compositeRegionEditOutput(job: ImageTask, response: ImageEditResponse) async throws -> (data: Data, mimeType: String) {
+        guard job.inputPaths.count == 1 else {
+            throw RegionEditPipelineError.requiresSingleInput
+        }
+        guard let maskImageData = job.maskImageData else {
+            throw RegionEditPipelineError.missingMask
+        }
+        guard let cropRect = job.regionEditCropRect else {
+            throw RegionEditPipelineError.missingCropMetadata
+        }
+
+        let sourceImageData = try readSingleSourceImageData(for: job)
+        let composite = try await MainActor.run {
+            try RegionEditProcessor.compositeEditedCrop(
+                originalImageData: sourceImageData,
+                editedCropImageData: response.imageData,
+                maskImageData: maskImageData,
+                cropRect: cropRect
+            )
+        }
+        return (data: composite.imageData, mimeType: composite.mimeType)
+    }
+
+    private func readSingleSourceImageData(for job: ImageTask) throws -> Data {
+        guard let sourcePath = job.inputPaths.first else {
+            throw RegionEditPipelineError.missingSourceImage
+        }
+
+        if let bookmark = job.inputBookmarks?.first {
+            guard let resolved = AppPaths.resolveBookmarkAccess(bookmark) else {
+                throw RegionEditPipelineError.sourceBookmarkAccessFailed(path: sourcePath)
+            }
+            defer { resolved.url.stopAccessingSecurityScopedResource() }
+            return try Data(contentsOf: resolved.url)
+        }
+
+        let sourceURL = URL(fileURLWithPath: sourcePath)
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+            throw RegionEditPipelineError.missingSourceImage
+        }
+        return try Data(contentsOf: sourceURL)
+    }
+
+    private func mergedTaskPrompt(globalPrompt: String, customPrompt: String?, isRegionEdit: Bool) -> String {
+        let global = globalPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let custom = (customPrompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let base: String
+        if !global.isEmpty && !custom.isEmpty {
+            base = "Global instructions:\n\(global)\n\nRegion edit instructions:\n\(custom)"
+        } else if !custom.isEmpty {
+            base = custom
+        } else {
+            base = global
+        }
+
+        guard isRegionEdit else { return base }
+        if base.isEmpty {
+            return regionEditPromptClause
+        }
+        return "\(base)\n\n\(regionEditPromptClause)"
+    }
+
+    private func chooseRegionEditProcessingImageSize(cropRect: CGRect, userSelectedMax: String) -> String {
+        let maxDimension = max(cropRect.width, cropRect.height)
+        let allowedSizes = allowedImageSizes(upTo: userSelectedMax)
+        for candidate in allowedSizes {
+            if maxDimension <= pixelDimension(forImageSize: candidate) {
+                return candidate
+            }
+        }
+        return allowedSizes.last ?? userSelectedMax
+    }
+
+    private func allowedImageSizes(upTo userSelectedMax: String) -> [String] {
+        switch userSelectedMax {
+        case "4K":
+            return ["1K", "2K", "4K"]
+        case "2K":
+            return ["1K", "2K"]
+        case "1K":
+            return ["1K"]
+        default:
+            return [userSelectedMax]
+        }
+    }
+
+    private func pixelDimension(forImageSize imageSize: String) -> CGFloat {
+        switch imageSize {
+        case "4K":
+            return 4096
+        case "2K":
+            return 2048
+        case "1K":
+            return 1024
+        default:
+            return 1024
+        }
     }
 
     private func generateOutputURL(for task: ImageTask, inDirectory directoryURL: URL, mimeType: String) -> URL {
@@ -726,8 +1205,10 @@ final class BatchOrchestrator {
              return
         }
         do {
-            let data = try JSONEncoder().encode(activeBatches)
-            try data.write(to: activeBatchURL)
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(activeBatches)
+            try data.write(to: activeBatchURL, options: .atomic)
             DebugLog.debug("batch.persistence", "Saved active batches", metadata: [
                 "count": String(activeBatches.count),
                 "bytes": String(data.count)
@@ -744,21 +1225,18 @@ final class BatchOrchestrator {
         guard FileManager.default.fileExists(atPath: activeBatchURL.path) else { return }
         do {
             let data = try Data(contentsOf: activeBatchURL)
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
+            let decoded = try decodePersistedActiveBatches(from: data)
+            activeBatches = decoded.batches
             
-            if let batches = try? decoder.decode([BatchJob].self, from: data) {
-                activeBatches = batches
-            } else if let singleBatch = try? decoder.decode(BatchJob.self, from: data) {
-                 activeBatches = [singleBatch]
-            }
-            
-            if !processingJobs.isEmpty || !pendingJobs.isEmpty {
+            if activeBatches.contains(where: { $0.status == "paused" }) {
+                statusMessage = "Paused"
+            } else if !processingJobs.isEmpty || !pendingJobs.isEmpty {
                 statusMessage = "Resumed sessions"
             }
             updateProgress()
             DebugLog.info("batch.persistence", "Loaded active batches", metadata: [
-                "count": String(activeBatches.count)
+                "count": String(activeBatches.count),
+                "decode_mode": decoded.mode
             ])
         } catch {
             DebugLog.error("batch.persistence", "Failed to load active batches", metadata: [
@@ -766,6 +1244,48 @@ final class BatchOrchestrator {
             ])
             print("Failed to load active batches: \(error)")
         }
+    }
+
+    private func decodePersistedActiveBatches(from data: Data) throws -> (batches: [BatchJob], mode: String) {
+        let attempts: [(label: String, decoder: JSONDecoder, decodeArray: Bool)] = [
+            {
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                return (label: "array_iso8601", decoder: decoder, decodeArray: true)
+            }(),
+            {
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                return (label: "single_iso8601", decoder: decoder, decodeArray: false)
+            }(),
+            (label: "array_legacy_default", decoder: JSONDecoder(), decodeArray: true),
+            (label: "single_legacy_default", decoder: JSONDecoder(), decodeArray: false)
+        ]
+
+        var errors: [String] = []
+
+        for attempt in attempts {
+            do {
+                if attempt.decodeArray {
+                    let batches = try attempt.decoder.decode([BatchJob].self, from: data)
+                    return (batches, attempt.label)
+                } else {
+                    let batch = try attempt.decoder.decode(BatchJob.self, from: data)
+                    return ([batch], attempt.label)
+                }
+            } catch {
+                errors.append("\(attempt.label): \(error)")
+            }
+        }
+
+        throw NSError(
+            domain: "BatchOrchestrator.Persistence",
+            code: 1,
+            userInfo: [
+                NSLocalizedDescriptionKey: "Unable to decode active batches using any supported format",
+                "attempt_errors": errors.joined(separator: " | ")
+            ]
+        )
     }
 
     func resumePollingFromHistory(for entry: HistoryEntry) {

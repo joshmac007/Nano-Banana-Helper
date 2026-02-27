@@ -50,6 +50,7 @@ struct BottomDockView: View {
     }
     
     private var statusColor: Color {
+        if orchestrator.isPaused { return .yellow }
         if orchestrator.failedJobs.count > 0 { return .red }
         if orchestrator.completedJobs.count > 0 && !orchestrator.isRunning { return .green }
         return .secondary

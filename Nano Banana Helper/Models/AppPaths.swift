@@ -8,7 +8,7 @@ struct AppPaths {
     }
 
     /// The primary application support directory for the current app version
-    static let appSupportURL: URL = {
+    nonisolated(unsafe) static let appSupportURL: URL = {
         let fileManager = FileManager.default
         let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let url = appSupport.appendingPathComponent("NanoBananaProAssistant", isDirectory: true)
@@ -17,7 +17,7 @@ struct AppPaths {
     }()
     
     /// Path to the legacy data directory for migration
-    static let legacyAppSupportURL: URL = {
+    nonisolated(unsafe) static let legacyAppSupportURL: URL = {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return appSupport.appendingPathComponent("NanoBananaPro", isDirectory: true)
     }()
@@ -48,19 +48,19 @@ struct AppPaths {
     }
 
     /// Directory for local debug logs
-    static var debugLogsDirectoryURL: URL {
+    nonisolated(unsafe) static var debugLogsDirectoryURL: URL {
         let url = appSupportURL.appendingPathComponent("logs", isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
 
     /// Primary debug log file used for local troubleshooting
-    static var debugLogURL: URL {
+    nonisolated(unsafe) static var debugLogURL: URL {
         debugLogsDirectoryURL.appendingPathComponent("debug.log")
     }
 
     /// Rotated debug log file (previous)
-    static var debugLogArchiveURL: URL {
+    nonisolated(unsafe) static var debugLogArchiveURL: URL {
         debugLogsDirectoryURL.appendingPathComponent("debug.previous.log")
     }
     

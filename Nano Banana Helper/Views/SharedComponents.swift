@@ -21,60 +21,56 @@ struct VisualEffectView: NSViewRepresentable {
 
 // MARK: - Cost Estimator
 struct CostEstimatorView: View {
-    let imageCount: Int
+    let modelName: String
+    let stagedInputCount: Int
+    let generationCount: Int
+    let inputCount: Int
+    let outputCount: Int
     let imageSize: String
     let isBatchTier: Bool
     let isMultiInput: Bool
-    
-    private var inputCostPerImage: Double { isBatchTier ? 0.0006 : 0.0011 }
-    
-    private var outputCostPerImage: Double {
-        if isBatchTier {
-            // Batch Tier: 50% cheaper
-            switch imageSize {
-            case "4K": return 0.12
-            case "2K", "1K": return 0.067
-            default: return 0.067
-            }
-        } else {
-            // Standard Tier
-            switch imageSize {
-            case "4K": return 0.24
-            case "2K", "1K": return 0.134
-            default: return 0.134
-            }
-        }
-    }
-    
-    /// Number of output images: 1 if Multi-Input, otherwise same as input count
-    private var outputCount: Int {
-        isMultiInput ? 1 : imageCount
-    }
-    
-    private var totalCost: Double {
-        // Input cost: charged per input image
-        // Output cost: charged per output image (1 for Multi-Input, N otherwise)
-        let inputTotal = Double(imageCount) * inputCostPerImage
-        let outputTotal = Double(outputCount) * outputCostPerImage
-        return inputTotal + outputTotal
+
+    private var estimate: CostEstimate {
+        PricingEngine.estimate(
+            modelName: modelName,
+            imageSize: imageSize,
+            isBatchTier: isBatchTier,
+            inputCount: inputCount,
+            outputCount: outputCount
+        )
     }
     
     var body: some View {
         HStack {
             VStack(alignment: .leading) {
-                if isMultiInput {
-                    Text("\(imageCount) inputs → 1 output @ \(imageSize)")
+                if stagedInputCount == 0 {
+                    Text("\(generationCount) generated output\(generationCount == 1 ? "" : "s") @ \(imageSize)")
+                        .font(.subheadline)
+                } else if isMultiInput {
+                    Text("\(stagedInputCount) inputs x \(generationCount) generation\(generationCount == 1 ? "" : "s") -> \(outputCount) output\(outputCount == 1 ? "" : "s") @ \(imageSize)")
                         .font(.subheadline)
                 } else {
-                    Text("\(imageCount) images @ \(imageSize)")
+                    Text("\(stagedInputCount) inputs x \(generationCount) generation\(generationCount == 1 ? "" : "s") -> \(outputCount) output\(outputCount == 1 ? "" : "s") @ \(imageSize)")
                         .font(.subheadline)
                 }
-                Text("$\(inputCostPerImage, specifier: "%.4f")/input + $\(outputCostPerImage, specifier: "%.3f")/output")
+                Text(ModelCatalog.displayName(for: modelName))
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if estimate.inputCost > 0 {
+                    let inputRate = estimate.inputCost / Double(max(1, estimate.inputCount))
+                    let outputRate = estimate.outputCost / Double(max(1, estimate.outputCount))
+                    Text("$\(inputRate, specifier: "%.4f")/input + $\(outputRate, specifier: "%.4f")/output")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    let outputRate = estimate.outputCost / Double(max(1, estimate.outputCount))
+                    Text("$\(outputRate, specifier: "%.4f")/output")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer()
-            Text("≈ $\(totalCost, specifier: "%.2f")")
+            Text("≈ $\(estimate.total, specifier: "%.2f")")
                 .font(.headline)
                 .foregroundStyle(.green)
         }

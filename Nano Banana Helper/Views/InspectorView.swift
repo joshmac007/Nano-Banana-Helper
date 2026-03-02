@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct InspectorView: View {
     @Bindable var stagingManager: BatchStagingManager
@@ -10,10 +11,13 @@ struct InspectorView: View {
     @State private var showingSavePromptAlert = false
     @State private var showingBatchStartAlert = false
     @State private var batchStartAlertMessage = "Batch start is blocked by current settings."
+    @State private var batchStartAlertOffersFileReselect = false
     @State private var newPromptName = ""
     @State private var activePromptTab: PromptType = .user // Tab State
-    
-    let sizes = ["1K", "2K", "4K"]
+
+    private var modelDefinitions: [ModelDefinition] { ModelCatalog.all }
+    private var sizes: [String] { stagingManager.availableImageSizes }
+    private var allowedAspectRatioSet: Set<String> { Set(stagingManager.availableAspectRatios) }
     
     var body: some View {
         VStack(spacing: 0) {
@@ -41,6 +45,17 @@ struct InspectorView: View {
                     .padding(.horizontal)
                     .padding(.top)
                     .disabled(!stagingManager.canStartBatch)
+
+                    if let payloadWarning = stagingManager.batchPayloadPreflightWarning {
+                        Label(payloadWarning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10, weight: .medium))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 4)
+                            .background(Color.orange.opacity(0.15))
+                            .foregroundStyle(.orange)
+                            .cornerRadius(4)
+                            .padding(.horizontal)
+                    }
                     
                     if let project = projectManager.currentProject {
                         OutputLocationView(project: project) { newURL, newBookmark in
@@ -162,6 +177,23 @@ struct InspectorView: View {
                             .frame(height: 1)
                             .padding(.top, 6)
                             .padding(.vertical, 4)
+
+                        // Model Selector
+                        HStack {
+                            Text("Model")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(.secondary)
+                                .textCase(.uppercase)
+                            Spacer()
+                            Picker("", selection: $stagingManager.selectedModelName) {
+                                ForEach(modelDefinitions) { model in
+                                    Text(model.displayName).tag(model.id)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .frame(width: 190)
+                        }
                         
                         // Ratio Selector
                         VStack(alignment: .leading, spacing: 8) {
@@ -170,7 +202,10 @@ struct InspectorView: View {
                                 .foregroundStyle(.secondary)
                                 .textCase(.uppercase)
                             
-                            AspectRatioSelector(selectedRatio: $stagingManager.aspectRatio)
+                            AspectRatioSelector(
+                                selectedRatio: $stagingManager.aspectRatio,
+                                allowedRatioIDs: allowedAspectRatioSet
+                            )
                             
                             if stagingManager.isEmpty && stagingManager.aspectRatio == "Auto" && !stagingManager.prompt.isEmpty {
                                 Label("Aspect ratio required for Text-to-Image", systemImage: "info.circle.fill")
@@ -217,23 +252,22 @@ struct InspectorView: View {
                                 .toggleStyle(.switch)
                                 .labelsHidden()
                         }
-                        
-                        if stagingManager.isEmpty {
-                            // Text-To-Image stepper
-                            HStack(alignment: .top) {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Generated Images")
-                                        .font(.system(size: 11, weight: .bold)) // Standardized header
-                                        .foregroundStyle(.primary)
-                                        .textCase(.uppercase)
-                                    Text("Number of images to generate.")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Stepper("\(stagingManager.textToImageCount)", value: $stagingManager.textToImageCount, in: 1...100)
+
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Generations")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundStyle(.primary)
+                                    .textCase(.uppercase)
+                                Text("Outputs per input (or per merged request).")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
-                        } else {
+                            Spacer()
+                            Stepper("\(stagingManager.generationCount)", value: $stagingManager.generationCount, in: 1...8)
+                        }
+
+                        if !stagingManager.isEmpty {
                             // Multi-Input Toggle
                             HStack(alignment: .top) {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -266,7 +300,11 @@ struct InspectorView: View {
                     .padding(.horizontal)
                     
                     CostEstimatorView(
-                        imageCount: stagingManager.count,
+                        modelName: stagingManager.selectedModelName,
+                        stagedInputCount: stagingManager.stagedFiles.count,
+                        generationCount: stagingManager.generationCount,
+                        inputCount: stagingManager.estimatedInputCountForCost,
+                        outputCount: stagingManager.estimatedOutputCountForCost,
                         imageSize: stagingManager.imageSize,
                         isBatchTier: stagingManager.isBatchTier,
                         isMultiInput: stagingManager.isMultiInput
@@ -292,9 +330,17 @@ struct InspectorView: View {
             Text(activePromptTab == .user ? "Enter a name for this user prompt." : "Enter a name for this system prompt.")
         }
         .alert("Cannot Start Batch", isPresented: $showingBatchStartAlert) {
+            if batchStartAlertOffersFileReselect {
+                Button("Re-select Files...") {
+                    reselectStagedFiles()
+                }
+            }
             Button("OK", role: .cancel) { }
         } message: {
             Text(batchStartAlertMessage)
+        }
+        .onAppear {
+            stagingManager.sanitizeSelectionsForCurrentModel()
         }
     }
     
@@ -302,23 +348,59 @@ struct InspectorView: View {
         guard let project = projectManager.currentProject else { return }
         if let _ = stagingManager.startBlockReason {
             batchStartAlertMessage = stagingManager.startBlockReason ?? "Batch start is blocked by current settings."
+            batchStartAlertOffersFileReselect = false
             showingBatchStartAlert = true
             return
         }
 
         let missingInputBookmarkPaths = stagingManager.stagedFiles
-            .filter { stagingManager.bookmark(for: $0) == nil && likelyNeedsSecurityScope(for: $0.path) }
+            .filter { stagingManager.bookmark(for: $0) == nil && AppPaths.requiresSecurityScope(path: $0.path) }
             .map { $0.lastPathComponent }
         if !missingInputBookmarkPaths.isEmpty {
             let sample = missingInputBookmarkPaths.prefix(3).joined(separator: ", ")
             let suffix = missingInputBookmarkPaths.count > 3 ? " (+\(missingInputBookmarkPaths.count - 3) more)" : ""
             batchStartAlertMessage = "Some staged files are missing sandbox access bookmarks: \(sample)\(suffix). Re-add them using Browse Files or drag them in again, then retry."
+            batchStartAlertOffersFileReselect = true
             showingBatchStartAlert = true
             return
         }
 
-        if project.outputDirectoryBookmark == nil && likelyNeedsSecurityScope(for: project.outputDirectory) {
+        if project.outputDirectoryBookmark == nil && AppPaths.requiresSecurityScope(path: project.outputDirectory) {
             batchStartAlertMessage = "The selected output folder needs permission again. Re-select Output Location and retry."
+            batchStartAlertOffersFileReselect = false
+            showingBatchStartAlert = true
+            return
+        }
+
+        let sanitizedAspectRatio = ModelCatalog.sanitizeAspectRatio(
+            stagingManager.aspectRatio,
+            for: stagingManager.selectedModelName
+        )
+        if sanitizedAspectRatio != stagingManager.aspectRatio {
+            DebugLog.warning("ui.inspector", "Aspect ratio adjusted for selected model", metadata: [
+                "model": stagingManager.selectedModelName,
+                "from_ratio": stagingManager.aspectRatio,
+                "to_ratio": sanitizedAspectRatio
+            ])
+            stagingManager.aspectRatio = sanitizedAspectRatio
+        }
+
+        let sanitizedImageSize = ModelCatalog.sanitizeImageSize(
+            stagingManager.imageSize,
+            for: stagingManager.selectedModelName
+        )
+        if sanitizedImageSize != stagingManager.imageSize {
+            DebugLog.warning("ui.inspector", "Image size adjusted for selected model", metadata: [
+                "model": stagingManager.selectedModelName,
+                "from_size": stagingManager.imageSize,
+                "to_size": sanitizedImageSize
+            ])
+            stagingManager.imageSize = sanitizedImageSize
+        }
+
+        guard ModelCatalog.isAspectRatioSupported(stagingManager.aspectRatio, for: stagingManager.selectedModelName),
+              ModelCatalog.isImageSizeSupported(stagingManager.imageSize, for: stagingManager.selectedModelName) else {
+            batchStartAlertMessage = "The selected model does not support the chosen aspect ratio or output size."
             showingBatchStartAlert = true
             return
         }
@@ -326,6 +408,7 @@ struct InspectorView: View {
         let batch = BatchJob(
             prompt: stagingManager.prompt,
             systemPrompt: stagingManager.systemPrompt,
+            modelName: stagingManager.selectedModelName,
             aspectRatio: stagingManager.aspectRatio,
             imageSize: stagingManager.imageSize,
             outputDirectory: project.outputDirectory,
@@ -333,37 +416,23 @@ struct InspectorView: View {
             useBatchTier: stagingManager.isBatchTier,
             projectId: project.id
         )
-        
-        // Handle Multi-Input vs Standard Batch
-        let tasks: [ImageTask]
-        if stagingManager.isEmpty {
-            tasks = (0..<stagingManager.textToImageCount).map { _ in
-                ImageTask(inputPaths: [])
-            }
-        } else if stagingManager.isMultiInput {
-            // All staged files become ONE task with multiple inputs
-            let inputPaths = stagingManager.stagedFiles.map { $0.path }
-            let inputBookmarks = stagingManager.stagedFiles.compactMap { stagingManager.bookmark(for: $0) }
-            
-            tasks = [ImageTask(
-                inputPaths: inputPaths,
-                inputBookmarks: inputBookmarks.isEmpty ? nil : inputBookmarks,
-                maskImageData: nil,
-                customPrompt: nil
-            )]
-        } else {
-            // Standard: One task per file
-            tasks = stagingManager.stagedFiles.map { url in
-                let stagedEdit = stagingManager.stagedMaskEdits[url]
-                return ImageTask(
-                    inputPath: url.path,
-                    inputBookmark: stagingManager.bookmark(for: url),
-                    maskImageData: stagedEdit?.maskData,
-                    customPrompt: stagedEdit?.prompt
-                )
-            }
-        }
-        batch.tasks = tasks
+        let preflightEstimate = PricingEngine.estimate(
+            modelName: stagingManager.selectedModelName,
+            imageSize: stagingManager.imageSize,
+            isBatchTier: stagingManager.isBatchTier,
+            inputCount: stagingManager.estimatedInputCountForCost,
+            outputCount: stagingManager.estimatedOutputCountForCost
+        )
+        DebugLog.info("ui.inspector", "Starting batch", metadata: [
+            "model": stagingManager.selectedModelName,
+            "aspect_ratio": stagingManager.aspectRatio,
+            "image_size": stagingManager.imageSize,
+            "batch_tier": String(stagingManager.isBatchTier),
+            "generation_count": String(stagingManager.generationCount),
+            "estimated_outputs": String(stagingManager.estimatedOutputCountForCost),
+            "estimated_cost": String(preflightEstimate.total)
+        ])
+        batch.tasks = stagingManager.buildTasksForCurrentConfiguration()
         
         orchestrator.enqueue(batch)
         
@@ -373,16 +442,32 @@ struct InspectorView: View {
         }
     }
 
-    private func likelyNeedsSecurityScope(for path: String) -> Bool {
-        let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
-        let managedRoots = [
-            AppPaths.appSupportURL.standardizedFileURL.path,
-            AppPaths.defaultOutputDirectory.standardizedFileURL.path,
-            FileManager.default.temporaryDirectory.standardizedFileURL.path
-        ]
-        return !managedRoots.contains { root in
-            normalized == root || normalized.hasPrefix(root + "/")
+    private func reselectStagedFiles() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.image]
+        panel.message = "Re-select source files so Nano Banana Helper can access them."
+        panel.prompt = "Grant Access"
+        if let firstPath = stagingManager.stagedFiles.first?.path {
+            panel.directoryURL = URL(fileURLWithPath: firstPath).deletingLastPathComponent()
         }
+
+        guard panel.runModal() == .OK else { return }
+
+        let addResult = stagingManager.addFilesCapturingBookmarks(panel.urls)
+        if addResult.hasRejections {
+            let names = addResult.rejectedFiles.map { $0.url.lastPathComponent }
+            let sample = names.prefix(3).joined(separator: ", ")
+            let suffix = names.count > 3 ? " (+\(names.count - 3) more)" : ""
+            batchStartAlertMessage = "Access is still missing for: \(sample)\(suffix). Try re-selecting from Finder."
+            batchStartAlertOffersFileReselect = true
+            showingBatchStartAlert = true
+            return
+        }
+
+        batchStartAlertOffersFileReselect = false
     }
 }
 

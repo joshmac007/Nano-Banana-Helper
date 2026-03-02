@@ -1,10 +1,14 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import AppKit
 
 struct DropZoneView: View {
     @Bindable var stagingManager: BatchStagingManager
     var onBrowse: (() -> Void)? = nil
     @State private var isTargeted = false
+    @State private var showingPermissionRegrantAlert = false
+    @State private var permissionRegrantMessage = ""
+    @State private var rejectedFileURLs: [URL] = []
     
     private let supportedTypes: [UTType] = [.png, .jpeg, .webP, .heic, .heif, .image]
     
@@ -70,6 +74,14 @@ struct DropZoneView: View {
         } isTargeted: { targeted in
             isTargeted = targeted
         }
+        .alert("File Access Required", isPresented: $showingPermissionRegrantAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Re-select Files...") {
+                presentNativeFileReselectPanel()
+            }
+        } message: {
+            Text(permissionRegrantMessage)
+        }
     }
     
     private func handleDrop(_ urls: [URL]) {
@@ -89,7 +101,8 @@ struct DropZoneView: View {
         }
         
         // Add to manager
-        stagingManager.addFilesCapturingBookmarks(gatheredUrls)
+        let result = stagingManager.addFilesCapturingBookmarks(gatheredUrls)
+        handleAddFilesResult(result)
     }
     
     private func scanDirectory(_ directory: URL) -> [URL] {
@@ -113,5 +126,32 @@ struct DropZoneView: View {
     private func isValidImage(_ url: URL) -> Bool {
         let ext = url.pathExtension.lowercased()
         return ["png", "jpg", "jpeg", "webp", "heic", "heif"].contains(ext)
+    }
+
+    private func handleAddFilesResult(_ result: BatchStagingManager.AddFilesResult) {
+        guard result.hasRejections else { return }
+        rejectedFileURLs = result.rejectedFiles.map(\.url)
+        let names = result.rejectedFiles.map { $0.url.lastPathComponent }
+        let sample = names.prefix(3).joined(separator: ", ")
+        let suffix = names.count > 3 ? " (+\(names.count - 3) more)" : ""
+        permissionRegrantMessage = "Access was not granted for: \(sample)\(suffix). Re-select these files to continue."
+        showingPermissionRegrantAlert = true
+    }
+
+    private func presentNativeFileReselectPanel() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = supportedTypes
+        panel.message = "Re-select files so Nano Banana Helper can access them."
+        panel.prompt = "Grant Access"
+        if let firstRejected = rejectedFileURLs.first {
+            panel.directoryURL = firstRejected.deletingLastPathComponent()
+        }
+        if panel.runModal() == .OK {
+            let result = stagingManager.addFilesCapturingBookmarks(panel.urls)
+            handleAddFilesResult(result)
+        }
     }
 }

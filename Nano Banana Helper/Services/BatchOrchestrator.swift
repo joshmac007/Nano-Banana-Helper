@@ -16,6 +16,7 @@ struct JobSubmissionData: Sendable {
 struct BatchSettings: Sendable {
     let prompt: String
     let systemPrompt: String?
+    let modelName: String
     let aspectRatio: String
     let imageSize: String
     let outputDirectory: String
@@ -25,44 +26,38 @@ struct BatchSettings: Sendable {
     
     // Helper for cost calculation
     func cost(inputCount: Int, imageSizeOverride: String? = nil) -> Double {
-        let inputRate = useBatchTier ? 0.0006 : 0.0011
-        let inputCost = inputRate * Double(inputCount)
-        
-        let outputCost: Double
-        let outputSize = imageSizeOverride ?? imageSize
-        if useBatchTier {
-            switch outputSize {
-            case "4K": outputCost = 0.12
-            case "2K", "1K": outputCost = 0.067
-            default: outputCost = 0.067
-            }
-        } else {
-            switch outputSize {
-            case "4K": outputCost = 0.24
-            case "2K", "1K": outputCost = 0.134
-            default: outputCost = 0.134
-            }
-        }
-        return inputCost + outputCost
+        PricingEngine.estimate(
+            modelName: modelName,
+            imageSize: imageSizeOverride ?? imageSize,
+            isBatchTier: useBatchTier,
+            inputCount: inputCount,
+            outputCount: 1
+        ).total
     }
 }
 
 private enum OutputDirectoryAccessError: LocalizedError {
     case bookmarkAccessFailed(path: String)
+    case missingBookmark(path: String)
     
     var errorDescription: String? {
         switch self {
         case .bookmarkAccessFailed(let path):
             return "Cannot access the output folder anymore. Re-select Output Location and retry. (\(path))"
+        case .missingBookmark(let path):
+            return "Output folder permission is required before writing files. Re-select Output Location and retry. (\(path))"
         }
     }
 }
 
 private enum InputFileAccessError: LocalizedError {
+    case missingBookmark(path: String)
     case bookmarkAccessFailed(path: String)
 
     var errorDescription: String? {
         switch self {
+        case .missingBookmark(let path):
+            return "Source image access permission is missing. Re-select the file and retry. (\(path))"
         case .bookmarkAccessFailed(let path):
             return "Cannot access the source image anymore. Re-add the file and retry. (\(path))"
         }
@@ -96,6 +91,15 @@ private enum RegionEditPipelineError: LocalizedError {
 @Observable
 @MainActor
 final class BatchOrchestrator {
+    // Temporary rollout flag for permission hardening (Phase 1).
+    private let strictPermissionEnforcement: Bool = {
+#if DEBUG
+        true
+#else
+        true
+#endif
+    }()
+
     private enum RunState {
         case idle
         case running
@@ -138,7 +142,7 @@ final class BatchOrchestrator {
 
     // Callbacks for history/cost tracking
     var onImageCompleted: ((HistoryEntry) -> Void)?
-    var onCostIncurred: ((Double, String, UUID) -> Void)?
+    var onCostIncurred: ((Double, String, String, UUID) -> Void)?
     var onHistoryEntryUpdated: ((String, HistoryEntry) -> Void)?
     var onOutputDirectoryBookmarkRefreshed: ((UUID, Data) -> Void)?
     var onRestoreSettings: ((HistoryEntry) -> Void)?
@@ -147,6 +151,7 @@ final class BatchOrchestrator {
 
     init() {
         loadActiveBatches()
+        sanitizeRestoredBatchesForAccess()
         refreshRunStateFromBatches()
         DebugLog.info("batch", "BatchOrchestrator initialized", metadata: [
             "restored_batches": String(activeBatches.count)
@@ -157,12 +162,35 @@ final class BatchOrchestrator {
     func enqueue(_ batch: BatchJob) {
         activeBatches.append(batch)
         let tasksMissingInputBookmarks = batch.tasks.filter { !$0.inputPaths.isEmpty && (($0.inputBookmarks ?? []).isEmpty) }.count
+        let inputCount = batch.tasks.reduce(0) { $0 + $1.inputPaths.count }
+        let bookmarkCount = batch.tasks.reduce(0) { $0 + ($1.inputBookmarks?.count ?? 0) }
+        let scopeRequiredCount = batch.tasks
+            .flatMap(\.inputPaths)
+            .filter { AppPaths.requiresSecurityScope(path: $0) }
+            .count
+        let sourceMode: String
+        if inputCount == 0 {
+            sourceMode = "text_to_image"
+        } else if scopeRequiredCount == 0 {
+            sourceMode = "managed_paths"
+        } else if bookmarkCount == 0 {
+            sourceMode = "external_no_bookmarks"
+        } else if bookmarkCount < inputCount {
+            sourceMode = "external_partial_bookmarks"
+        } else {
+            sourceMode = "external_bookmarked"
+        }
         DebugLog.info("batch.enqueue", "Enqueued batch", metadata: [
             "batch_id": batch.id.uuidString,
             "task_count": String(batch.tasks.count),
             "project_id": batch.projectId?.uuidString ?? "nil",
             "has_output_bookmark": String(batch.outputDirectoryBookmark != nil),
-            "tasks_missing_input_bookmarks": String(tasksMissingInputBookmarks)
+            "tasks_missing_input_bookmarks": String(tasksMissingInputBookmarks),
+            "input_count": String(inputCount),
+            "bookmark_count": String(bookmarkCount),
+            "scope_required_count": String(scopeRequiredCount),
+            "source_mode": sourceMode,
+            "fallback_used": "false"
         ])
         
         // Ensure all tasks have the project ID
@@ -273,6 +301,7 @@ final class BatchOrchestrator {
                     sourceImagePaths: job.inputPaths,
                     outputImagePath: "",
                     prompt: batch.prompt,
+                    modelName: batch.modelName,
                     aspectRatio: batch.aspectRatio,
                     imageSize: batch.imageSize,
                     usedBatchTier: batch.useBatchTier,
@@ -502,6 +531,7 @@ final class BatchOrchestrator {
         let batchSettings = BatchSettings(
             prompt: batch.prompt,
             systemPrompt: batch.systemPrompt,
+            modelName: batch.modelName,
             aspectRatio: batch.aspectRatio,
             imageSize: batch.imageSize,
             outputDirectory: batch.outputDirectory,
@@ -514,26 +544,73 @@ final class BatchOrchestrator {
         submissionDataList.reserveCapacity(jobsToSubmit.count)
 
         for job in jobsToSubmit {
-            // Resolve security-scoped URLs from bookmarks if available.
-            // resolveBookmarkAccess calls startAccessingSecurityScopedResource internally.
-            if let bookmarks = job.inputBookmarks, !bookmarks.isEmpty {
+            let inputPaths = job.inputPaths
+            let inputCount = inputPaths.count
+            let bookmarkCount = job.inputBookmarks?.count ?? 0
+            let scopeRequiredCount = inputPaths.filter { AppPaths.requiresSecurityScope(path: $0) }.count
+            let sourceMode = inputCount == 0 ? "text_to_image" : (scopeRequiredCount == 0 ? "managed_paths" : "external_paths")
+
+            if inputCount == 0 {
+                DebugLog.debug("batch.input", "Prepared submission without source files", metadata: [
+                    "job_id": job.id.uuidString,
+                    "input_count": "0",
+                    "bookmark_count": "0",
+                    "scope_required_count": "0",
+                    "source_mode": sourceMode,
+                    "fallback_used": "false"
+                ])
+                submissionDataList.append(
+                    JobSubmissionData(
+                        id: job.id,
+                        inputURLs: [],
+                        inputPaths: [],
+                        hasSecurityScope: false,
+                        maskImageData: job.maskImageData ?? batch.maskImageData,
+                        customPrompt: job.customPrompt
+                    )
+                )
+                continue
+            }
+
+            if strictPermissionEnforcement && scopeRequiredCount > 0 {
+                guard let bookmarks = job.inputBookmarks, bookmarks.count == inputCount else {
+                    let missingPath = inputPaths.first(where: { AppPaths.requiresSecurityScope(path: $0) }) ?? (inputPaths.first ?? "unknown")
+                    DebugLog.error("batch.input", "Missing input bookmark; failing before submission", metadata: [
+                        "job_id": job.id.uuidString,
+                        "input_count": String(inputCount),
+                        "bookmark_count": String(bookmarkCount),
+                        "scope_required_count": String(scopeRequiredCount),
+                        "path": missingPath,
+                        "source_mode": sourceMode,
+                        "fallback_used": "false"
+                    ])
+                    await handleError(
+                        jobId: job.id,
+                        data: JobSubmissionData(
+                            id: job.id,
+                            inputURLs: [],
+                            inputPaths: inputPaths,
+                            hasSecurityScope: false,
+                            maskImageData: job.maskImageData ?? batch.maskImageData,
+                            customPrompt: job.customPrompt
+                        ),
+                        settings: batchSettings,
+                        error: InputFileAccessError.missingBookmark(path: missingPath)
+                    )
+                    continue
+                }
+
                 var resolvedURLs: [URL] = []
                 var refreshedBookmarks = bookmarks
                 var didRefreshBookmarks = false
-                var failedPath = job.inputPaths.first ?? "unknown"
+                var failedPath = inputPaths.first ?? "unknown"
                 var resolutionFailed = false
-                
+
                 for (index, bookmark) in bookmarks.enumerated() {
                     guard let resolved = AppPaths.resolveBookmarkAccess(bookmark) else {
-                        DebugLog.error("batch.input", "Input bookmark resolution failed; marking job failed", metadata: [
-                            "job_id": job.id.uuidString,
-                            "bookmark_index": String(index),
-                            "input_count": String(bookmarks.count)
-                        ])
-                        // Avoid partially submitting multi-input jobs when only some bookmarks resolve.
                         resolvedURLs.forEach { $0.stopAccessingSecurityScopedResource() }
                         resolvedURLs = []
-                        failedPath = job.inputPaths.indices.contains(index) ? job.inputPaths[index] : failedPath
+                        failedPath = inputPaths.indices.contains(index) ? inputPaths[index] : failedPath
                         resolutionFailed = true
                         break
                     }
@@ -543,23 +620,34 @@ final class BatchOrchestrator {
                         didRefreshBookmarks = true
                     }
                 }
-                
+
                 if didRefreshBookmarks {
                     job.inputBookmarks = refreshedBookmarks
                     saveActiveBatches()
                     DebugLog.info("batch.input", "Refreshed one or more input bookmarks", metadata: [
                         "job_id": job.id.uuidString,
-                        "input_count": String(bookmarks.count)
+                        "input_count": String(inputCount),
+                        "bookmark_refresh_persisted": "true"
                     ])
                 }
-                
+
                 if resolutionFailed {
+                    DebugLog.error("batch.input", "Input bookmark resolution failed; failing before submission", metadata: [
+                        "job_id": job.id.uuidString,
+                        "input_count": String(inputCount),
+                        "bookmark_count": String(bookmarkCount),
+                        "scope_required_count": String(scopeRequiredCount),
+                        "path": failedPath,
+                        "source_mode": sourceMode,
+                        "fallback_used": "false",
+                        "bookmark_resolve_failed": "true"
+                    ])
                     await handleError(
                         jobId: job.id,
                         data: JobSubmissionData(
                             id: job.id,
                             inputURLs: [],
-                            inputPaths: job.inputPaths,
+                            inputPaths: inputPaths,
                             hasSecurityScope: false,
                             maskImageData: job.maskImageData ?? batch.maskImageData,
                             customPrompt: job.customPrompt
@@ -570,26 +658,40 @@ final class BatchOrchestrator {
                     continue
                 }
 
-                if !resolvedURLs.isEmpty {
-                    submissionDataList.append(
-                        JobSubmissionData(
-                            id: job.id,
-                            inputURLs: resolvedURLs,
-                            inputPaths: job.inputPaths,
-                            hasSecurityScope: true,
-                            maskImageData: job.maskImageData ?? batch.maskImageData,
-                            customPrompt: job.customPrompt
-                        )
+                DebugLog.debug("batch.input", "Prepared submission with security-scoped inputs", metadata: [
+                    "job_id": job.id.uuidString,
+                    "input_count": String(inputCount),
+                    "bookmark_count": String(bookmarkCount),
+                    "scope_required_count": String(scopeRequiredCount),
+                    "source_mode": sourceMode,
+                    "fallback_used": "false"
+                ])
+                submissionDataList.append(
+                    JobSubmissionData(
+                        id: job.id,
+                        inputURLs: resolvedURLs,
+                        inputPaths: inputPaths,
+                        hasSecurityScope: true,
+                        maskImageData: job.maskImageData ?? batch.maskImageData,
+                        customPrompt: job.customPrompt
                     )
-                    continue
-                }
+                )
+                continue
             }
-            // Fallback to plain path-based URLs (drag-and-drop, or already-accessible files)
+
+            DebugLog.debug("batch.input", "Prepared submission with managed plain-path inputs", metadata: [
+                "job_id": job.id.uuidString,
+                "input_count": String(inputCount),
+                "bookmark_count": String(bookmarkCount),
+                "scope_required_count": String(scopeRequiredCount),
+                "source_mode": sourceMode,
+                "fallback_used": "false"
+            ])
             submissionDataList.append(
                 JobSubmissionData(
                     id: job.id,
-                    inputURLs: job.inputPaths.map { URL(fileURLWithPath: $0) },
-                    inputPaths: job.inputPaths,
+                    inputURLs: inputPaths.map { URL(fileURLWithPath: $0) },
+                    inputPaths: inputPaths,
                     hasSecurityScope: false,
                     maskImageData: job.maskImageData ?? batch.maskImageData,
                     customPrompt: job.customPrompt
@@ -678,6 +780,15 @@ final class BatchOrchestrator {
     // MARK: - Task Workers
     
     private func performSubmission(data: JobSubmissionData, settings: BatchSettings) async {
+        let inputCount = data.inputPaths.count
+        let scopeRequiredCount = data.inputPaths.filter { AppPaths.requiresSecurityScope(path: $0) }.count
+        let bookmarkCount = activeBatches.lazy
+            .flatMap({ $0.tasks })
+            .first(where: { $0.id == data.id })?
+            .inputBookmarks?
+            .count ?? 0
+        let sourceMode = inputCount == 0 ? "text_to_image" : (scopeRequiredCount == 0 ? "managed_paths" : "external_paths")
+
         await MainActor.run {
             if let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == data.id }) {
                 job.status = "processing"
@@ -722,7 +833,8 @@ final class BatchOrchestrator {
                     job.regionEditCropRect = preparation.cropRect
                     let chosenSize = chooseRegionEditProcessingImageSize(
                         cropRect: preparation.cropRect,
-                        userSelectedMax: settings.imageSize
+                        userSelectedMax: settings.imageSize,
+                        modelName: settings.modelName
                     )
                     job.regionEditProcessingImageSize = chosenSize
                     requestImageSize = chosenSize
@@ -748,6 +860,7 @@ final class BatchOrchestrator {
             maskImageData: data.maskImageData,
             prompt: mergedPrompt,
             systemInstruction: settings.systemPrompt,
+            modelName: settings.modelName,
             aspectRatio: settings.aspectRatio,
             imageSize: requestImageSize,
             useBatchTier: settings.useBatchTier
@@ -758,7 +871,12 @@ final class BatchOrchestrator {
                 let jobInfo = try await service.startBatchJob(request: request)
                 DebugLog.info("batch.submit", "Batch-tier job submitted", metadata: [
                     "job_id": data.id.uuidString,
-                    "remote_job": jobInfo.jobName
+                    "remote_job": jobInfo.jobName,
+                    "input_count": String(inputCount),
+                    "bookmark_count": String(bookmarkCount),
+                    "scope_required_count": String(scopeRequiredCount),
+                    "source_mode": sourceMode,
+                    "fallback_used": "false"
                 ])
                 // Stop security-scoped access now that the service has read the file data
                 if data.hasSecurityScope {
@@ -776,6 +894,7 @@ final class BatchOrchestrator {
                                 sourceImagePaths: job.inputPaths,
                                 outputImagePath: "",
                                 prompt: mergedPrompt,
+                                modelName: settings.modelName,
                                 aspectRatio: settings.aspectRatio,
                                 imageSize: job.regionEditProcessingImageSize ?? settings.imageSize,
                                 usedBatchTier: settings.useBatchTier,
@@ -793,7 +912,12 @@ final class BatchOrchestrator {
                 DebugLog.info("batch.submit", "Standard job completed inline", metadata: [
                     "job_id": data.id.uuidString,
                     "bytes": String(response.imageData.count),
-                    "mime_type": response.mimeType
+                    "mime_type": response.mimeType,
+                    "input_count": String(inputCount),
+                    "bookmark_count": String(bookmarkCount),
+                    "scope_required_count": String(scopeRequiredCount),
+                    "source_mode": sourceMode,
+                    "fallback_used": "false"
                 ])
                 // Stop security-scoped access now that the service has read the file data
                 if data.hasSecurityScope {
@@ -810,7 +934,12 @@ final class BatchOrchestrator {
         } catch {
             DebugLog.error("batch.submit", "Submission failed", metadata: [
                 "job_id": data.id.uuidString,
-                "error": String(describing: error)
+                "error": String(describing: error),
+                "input_count": String(inputCount),
+                "bookmark_count": String(bookmarkCount),
+                "scope_required_count": String(scopeRequiredCount),
+                "source_mode": sourceMode,
+                "fallback_used": "false"
             ])
             // Always stop security-scoped access on error too
             if data.hasSecurityScope {
@@ -892,6 +1021,11 @@ final class BatchOrchestrator {
         var directoryURL: URL!
         if let bookmark = settings.outputDirectoryBookmark {
             guard let resolved = AppPaths.resolveBookmarkAccess(bookmark) else {
+                DebugLog.error("batch.output", "Output bookmark resolution failed before write", metadata: [
+                    "job_id": jobId.uuidString,
+                    "path": settings.outputDirectory,
+                    "bookmark_resolve_failed": "true"
+                ])
                 await handleError(
                     jobId: jobId,
                     data: data,
@@ -912,9 +1046,33 @@ final class BatchOrchestrator {
                 ])
                 if let projectId = settings.projectId {
                     onOutputDirectoryBookmarkRefreshed?(projectId, refreshedBookmark)
+                    DebugLog.info("batch.output", "Dispatched refreshed output bookmark for persistence", metadata: [
+                        "job_id": jobId.uuidString,
+                        "project_id": projectId.uuidString,
+                        "bookmark_refresh_persisted": "callback_dispatched"
+                    ])
+                } else {
+                    DebugLog.warning("batch.output", "Output bookmark refreshed but project ID is missing", metadata: [
+                        "job_id": jobId.uuidString,
+                        "bookmark_refresh_persisted": "false"
+                    ])
                 }
             }
         } else {
+            if strictPermissionEnforcement && AppPaths.requiresSecurityScope(path: settings.outputDirectory) {
+                DebugLog.error("batch.output", "Missing output bookmark for external path; failing before write", metadata: [
+                    "job_id": jobId.uuidString,
+                    "path": settings.outputDirectory,
+                    "bookmark_missing": "true"
+                ])
+                await handleError(
+                    jobId: jobId,
+                    data: data,
+                    settings: settings,
+                    error: OutputDirectoryAccessError.missingBookmark(path: settings.outputDirectory)
+                )
+                return
+            }
             directoryURL = URL(fileURLWithPath: settings.outputDirectory)
         }
         
@@ -961,6 +1119,14 @@ final class BatchOrchestrator {
             
             let effectiveImageSize = job.regionEditProcessingImageSize ?? settings.imageSize
             let cost = settings.cost(inputCount: job.inputPaths.count, imageSizeOverride: effectiveImageSize)
+            DebugLog.info("batch.cost", "Calculated task cost", metadata: [
+                "job_id": jobId.uuidString,
+                "model": settings.modelName,
+                "aspect_ratio": settings.aspectRatio,
+                "image_size": effectiveImageSize,
+                "batch_tier": String(settings.useBatchTier),
+                "estimated_cost": String(cost)
+            ])
             if let projectId = settings.projectId {
                 // Use bookmarks already captured before security scope was stopped.
                 // Do NOT use job.inputURLs here — that computed property calls
@@ -977,6 +1143,7 @@ final class BatchOrchestrator {
                         customPrompt: job.customPrompt,
                         isRegionEdit: (job.maskImageData ?? data.maskImageData) != nil
                     ),
+                    modelName: settings.modelName,
                     aspectRatio: settings.aspectRatio,
                     imageSize: effectiveImageSize,
                     usedBatchTier: settings.useBatchTier,
@@ -992,7 +1159,7 @@ final class BatchOrchestrator {
                 } else {
                     onImageCompleted?(historyEntry)
                 }
-                onCostIncurred?(cost, effectiveImageSize, projectId)
+                onCostIncurred?(cost, effectiveImageSize, settings.modelName, projectId)
             }
             
             saveActiveBatches()
@@ -1029,6 +1196,7 @@ final class BatchOrchestrator {
                     customPrompt: job.customPrompt,
                     isRegionEdit: (job.maskImageData ?? data.maskImageData) != nil
                 ),
+                modelName: settings.modelName,
                 aspectRatio: settings.aspectRatio,
                 imageSize: job.regionEditProcessingImageSize ?? settings.imageSize,
                 usedBatchTier: settings.useBatchTier,
@@ -1085,6 +1253,10 @@ final class BatchOrchestrator {
             return try Data(contentsOf: resolved.url)
         }
 
+        if strictPermissionEnforcement && AppPaths.requiresSecurityScope(path: sourcePath) {
+            throw RegionEditPipelineError.sourceBookmarkAccessFailed(path: sourcePath)
+        }
+
         let sourceURL = URL(fileURLWithPath: sourcePath)
         guard FileManager.default.fileExists(atPath: sourceURL.path) else {
             throw RegionEditPipelineError.missingSourceImage
@@ -1112,9 +1284,9 @@ final class BatchOrchestrator {
         return "\(base)\n\n\(regionEditPromptClause)"
     }
 
-    private func chooseRegionEditProcessingImageSize(cropRect: CGRect, userSelectedMax: String) -> String {
+    private func chooseRegionEditProcessingImageSize(cropRect: CGRect, userSelectedMax: String, modelName: String) -> String {
         let maxDimension = max(cropRect.width, cropRect.height)
-        let allowedSizes = allowedImageSizes(upTo: userSelectedMax)
+        let allowedSizes = allowedImageSizes(upTo: userSelectedMax, modelName: modelName)
         for candidate in allowedSizes {
             if maxDimension <= pixelDimension(forImageSize: candidate) {
                 return candidate
@@ -1123,21 +1295,19 @@ final class BatchOrchestrator {
         return allowedSizes.last ?? userSelectedMax
     }
 
-    private func allowedImageSizes(upTo userSelectedMax: String) -> [String] {
-        switch userSelectedMax {
-        case "4K":
-            return ["1K", "2K", "4K"]
-        case "2K":
-            return ["1K", "2K"]
-        case "1K":
-            return ["1K"]
-        default:
-            return [userSelectedMax]
-        }
+    private func allowedImageSizes(upTo userSelectedMax: String, modelName: String) -> [String] {
+        let orderedSizes = ["0.5K", "1K", "2K", "4K"]
+        let supported = Set(ModelCatalog.supportedImageSizes(for: modelName))
+        let cappedIndex = orderedSizes.firstIndex(of: userSelectedMax) ?? (orderedSizes.count - 1)
+        return orderedSizes
+            .prefix(cappedIndex + 1)
+            .filter { supported.contains($0) }
     }
 
     private func pixelDimension(forImageSize imageSize: String) -> CGFloat {
         switch imageSize {
+        case "0.5K":
+            return 512
         case "4K":
             return 4096
         case "2K":
@@ -1197,6 +1367,84 @@ final class BatchOrchestrator {
     }
 
     // MARK: - Persistence Helpers
+
+    private func sanitizeRestoredBatchesForAccess() {
+        guard !activeBatches.isEmpty else {
+            DebugLog.info("batch.permissions", "Sanitized restored batches", metadata: [
+                "valid": "0",
+                "invalid_input": "0",
+                "invalid_output": "0",
+                "auto_failed": "0"
+            ])
+            return
+        }
+
+        var valid = 0
+        var invalidInput = 0
+        var invalidOutput = 0
+        var autoFailed = 0
+        var didMutate = false
+
+        for batch in activeBatches {
+            let outputRequiresScope = strictPermissionEnforcement && AppPaths.requiresSecurityScope(path: batch.outputDirectory)
+            let outputMissingBookmark = outputRequiresScope && batch.outputDirectoryBookmark == nil
+
+            for task in batch.tasks {
+                // Leave terminal tasks untouched.
+                if task.status == "completed" || task.status == "cancelled" || task.status == "failed" {
+                    valid += 1
+                    continue
+                }
+
+                var validationError: Error?
+
+                if !task.inputPaths.isEmpty {
+                    let scopeRequiredCount = task.inputPaths.filter { AppPaths.requiresSecurityScope(path: $0) }.count
+                    let bookmarkCount = task.inputBookmarks?.count ?? 0
+                    if strictPermissionEnforcement && scopeRequiredCount > 0 && bookmarkCount != task.inputPaths.count {
+                        let missingPath = task.inputPaths.first(where: { AppPaths.requiresSecurityScope(path: $0) }) ?? (task.inputPaths.first ?? "unknown")
+                        validationError = InputFileAccessError.missingBookmark(path: missingPath)
+                        invalidInput += 1
+                    }
+                }
+
+                if validationError == nil && outputMissingBookmark {
+                    validationError = OutputDirectoryAccessError.missingBookmark(path: batch.outputDirectory)
+                    invalidOutput += 1
+                }
+
+                if let validationError {
+                    task.status = "failed"
+                    task.phase = .failed
+                    task.error = validationError.localizedDescription
+                    autoFailed += 1
+                    didMutate = true
+                } else {
+                    valid += 1
+                }
+            }
+
+            if batch.tasks.contains(where: { $0.status == "processing" || $0.status == "pending" || $0.status == "submitting" }) {
+                batch.status = "processing"
+            } else if batch.tasks.contains(where: { $0.status == "failed" }) {
+                batch.status = "failed"
+            } else if batch.tasks.allSatisfy({ $0.status == "completed" || $0.status == "cancelled" }) {
+                batch.status = "completed"
+            }
+        }
+
+        DebugLog.info("batch.permissions", "Sanitized restored batches", metadata: [
+            "valid": String(valid),
+            "invalid_input": String(invalidInput),
+            "invalid_output": String(invalidOutput),
+            "auto_failed": String(autoFailed)
+        ])
+
+        if didMutate {
+            saveActiveBatches()
+            updateProgress()
+        }
+    }
 
     private func saveActiveBatches() {
         if activeBatches.isEmpty {
@@ -1314,6 +1562,7 @@ final class BatchOrchestrator {
 
         let batch = BatchJob(
             prompt: entry.prompt,
+            modelName: entry.modelName,
             aspectRatio: entry.aspectRatio,
             imageSize: entry.imageSize,
             outputDirectory: outputDir,

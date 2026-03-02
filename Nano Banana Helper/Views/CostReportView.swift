@@ -78,6 +78,41 @@ struct CostReportView: View {
                     .padding()
                     .background(.background.secondary)
                     .cornerRadius(12)
+
+                    // Breakdown by model
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("By Model")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+
+                        ForEach(Array(costSummary.byModel.keys.sorted()), id: \.self) { modelId in
+                            HStack {
+                                Text(ModelCatalog.displayName(for: modelId))
+                                    .font(.subheadline)
+
+                                Spacer()
+
+                                Text(formatCurrency(costSummary.byModel[modelId] ?? 0))
+                                    .font(.subheadline)
+                                    .fontWeight(.medium)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(.quaternary.opacity(0.5))
+                            .cornerRadius(6)
+                        }
+
+                        if costSummary.byModel.isEmpty {
+                            Text("No data yet")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                        }
+                    }
+                    .padding()
+                    .background(.background.secondary)
+                    .cornerRadius(12)
                     
                     // Breakdown by project
                     VStack(alignment: .leading, spacing: 12) {
@@ -134,34 +169,65 @@ struct CostReportView: View {
                         
                         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
                             GridRow {
+                                Text("Model")
+                                    .fontWeight(.medium)
                                 Text("Tier")
                                     .fontWeight(.medium)
                                 Text("Input")
                                     .fontWeight(.medium)
-                                Text("Output (4K)")
+                                Text("Output (1K)")
                                     .fontWeight(.medium)
-                                Text("Output (2K/1K)")
+                                Text("Output (2K)")
+                                    .fontWeight(.medium)
+                                Text("Output (4K)")
                                     .fontWeight(.medium)
                             }
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             
                             GridRow {
+                                Text("Gemini 3 Pro")
                                 Text("Standard")
                                 Text("$0.0011")
-                                Text("$0.24")
                                 Text("$0.134")
+                                Text("$0.134")
+                                Text("$0.24")
                             }
                             .font(.caption)
                             
                             GridRow {
+                                Text("Gemini 3 Pro")
                                 Text("Batch")
                                 Text("$0.0006")
-                                Text("$0.12")
                                 Text("$0.067")
+                                Text("$0.067")
+                                Text("$0.12")
+                            }
+                            .font(.caption)
+
+                            GridRow {
+                                Text("Gemini 3.1 Flash")
+                                Text("Standard")
+                                Text("-")
+                                Text("$0.067")
+                                Text("$0.101")
+                                Text("$0.151")
+                            }
+                            .font(.caption)
+
+                            GridRow {
+                                Text("Gemini 3.1 Flash")
+                                Text("Batch")
+                                Text("-")
+                                Text("$0.0335")
+                                Text("$0.0505")
+                                Text("$0.0755")
                             }
                             .font(.caption)
                         }
+                        Text("Gemini 3.1 Flash 0.5K: Standard $0.045, Batch $0.0225 per output image.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                     .padding()
                     .background(.background.secondary)

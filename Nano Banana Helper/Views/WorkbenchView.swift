@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 struct WorkbenchView: View {
     @Bindable var stagingManager: BatchStagingManager
@@ -61,38 +63,13 @@ struct WorkbenchView: View {
                             historyManager.deleteEntry(entry)
                         },
                         onReuse: { entry in
-                            // Reuse logic: Load prompt and settings back to staging
-                            stagingManager.prompt = entry.prompt
-                            stagingManager.aspectRatio = entry.aspectRatio
-                            stagingManager.imageSize = entry.imageSize
-                            stagingManager.isBatchTier = entry.usedBatchTier
-                            
-                            // Switch to Staging tab
-                            selectedTab = .staging
-                            
-                            // Note: We can't easily restore file paths if they moved, 
-                            // but we could try to add them if they exist.
-                            var reusableURLs: [URL] = []
-                            var reusableBookmarks: [URL: Data] = [:]
-                            let sourceBookmarks = entry.sourceImageBookmarks ?? []
-                            for (index, path) in entry.sourceImagePaths.enumerated() {
-                                let url = URL(fileURLWithPath: path)
-                                if FileManager.default.fileExists(atPath: path) {
-                                    reusableURLs.append(url)
-                                    if sourceBookmarks.indices.contains(index) {
-                                        reusableBookmarks[url] = sourceBookmarks[index]
-                                    }
-                                    if let maskData = entry.maskImageData {
-                                        stagingManager.saveMaskEdit(for: url, maskData: maskData, prompt: entry.prompt, paths: [])
-                                    }
-                                }
-                            }
-                            if !reusableURLs.isEmpty {
-                                stagingManager.addFilesCapturingBookmarks(reusableURLs, preferredBookmarks: reusableBookmarks)
-                            }
+                            reuseHistoryEntry(entry)
                         },
                         onResumePolling: { entry in
                             orchestrator.resumePollingFromHistory(for: entry)
+                        },
+                        onRegrantAccess: { entry in
+                            regrantAccessAndRetry(entry)
                         }
                     )
                 }
@@ -110,5 +87,82 @@ struct WorkbenchView: View {
                 historyManager.loadGlobalHistory(allProjects: projectManager.projects)
             }
         }
+    }
+
+    private func reuseHistoryEntry(_ entry: HistoryEntry) {
+        stagingManager.prompt = entry.prompt
+        stagingManager.selectedModelName = entry.modelName
+        stagingManager.aspectRatio = entry.aspectRatio
+        stagingManager.imageSize = entry.imageSize
+        stagingManager.isBatchTier = entry.usedBatchTier
+        stagingManager.sanitizeSelectionsForCurrentModel()
+
+        selectedTab = .staging
+
+        var reusableURLs: [URL] = []
+        var reusableBookmarks: [URL: Data] = [:]
+        let sourceBookmarks = entry.sourceImageBookmarks ?? []
+        for (index, path) in entry.sourceImagePaths.enumerated() {
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            if FileManager.default.fileExists(atPath: path) {
+                reusableURLs.append(url)
+                if sourceBookmarks.indices.contains(index) {
+                    reusableBookmarks[url] = sourceBookmarks[index]
+                }
+                if let maskData = entry.maskImageData {
+                    stagingManager.saveMaskEdit(for: url, maskData: maskData, prompt: entry.prompt, paths: [])
+                }
+            }
+        }
+        if !reusableURLs.isEmpty {
+            _ = stagingManager.addFilesCapturingBookmarks(reusableURLs, preferredBookmarks: reusableBookmarks)
+        }
+    }
+
+    private func regrantAccessAndRetry(_ entry: HistoryEntry) {
+        reuseHistoryEntry(entry)
+
+        if isOutputPermissionFailure(entry),
+           let project = projectManager.projects.first(where: { $0.id == entry.projectId }) {
+            let panel = NSOpenPanel()
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = false
+            panel.allowsMultipleSelection = false
+            panel.message = "Re-select the output folder for this project."
+            panel.prompt = "Grant Output Access"
+            panel.directoryURL = URL(fileURLWithPath: project.outputDirectory).deletingLastPathComponent()
+            if panel.runModal() == .OK, let url = panel.url, let bookmark = AppPaths.bookmark(for: url) {
+                project.outputDirectory = url.path
+                project.outputDirectoryBookmark = bookmark
+                projectManager.saveProjects()
+            }
+        }
+
+        guard !entry.sourceImagePaths.isEmpty else { return }
+
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.image]
+        panel.message = "Re-select source files so Nano Banana Helper can access them."
+        panel.prompt = "Grant File Access"
+        panel.directoryURL = URL(fileURLWithPath: entry.sourceImagePaths[0]).deletingLastPathComponent()
+        guard panel.runModal() == .OK else { return }
+
+        stagingManager.clearAll()
+        reuseHistoryEntry(entry)
+        let result = stagingManager.addFilesCapturingBookmarks(panel.urls)
+        if result.hasRejections {
+            DebugLog.warning("history.permissions", "Regrant flow still has rejected files", metadata: [
+                "entry_id": entry.id.uuidString,
+                "rejected_count": String(result.rejectedCount)
+            ])
+        }
+    }
+
+    private func isOutputPermissionFailure(_ entry: HistoryEntry) -> Bool {
+        guard let error = entry.error?.lowercased() else { return false }
+        return error.contains("output folder") || error.contains("output location")
     }
 }

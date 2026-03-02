@@ -87,8 +87,8 @@ struct MainLayoutView: View {
                  historyManager.updateEntry(byExternalJobName: jobName, with: entry)
              }
              
-             orchestrator.onCostIncurred = { cost, resolution, projectId in
-                 projectManager.costSummary.record(cost: cost, resolution: resolution, projectId: projectId)
+             orchestrator.onCostIncurred = { cost, resolution, modelName, projectId in
+                 projectManager.costSummary.record(cost: cost, resolution: resolution, modelName: modelName, projectId: projectId)
              }
 
              orchestrator.onOutputDirectoryBookmarkRefreshed = { projectId, bookmark in

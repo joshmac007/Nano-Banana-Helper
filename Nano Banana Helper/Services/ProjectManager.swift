@@ -231,10 +231,10 @@ class ProjectManager {
     
     // MARK: - Cost Tracking
     
-    func recordCost(_ cost: Double, resolution: String, for project: Project) {
+    func recordCost(_ cost: Double, resolution: String, modelName: String, for project: Project) {
         project.totalCost += cost
         project.imageCount += 1
-        costSummary.record(cost: cost, resolution: resolution, projectId: project.id)
+        costSummary.record(cost: cost, resolution: resolution, modelName: modelName, projectId: project.id)
         
         saveProjects()
         saveCostSummary()
@@ -246,7 +246,7 @@ class ProjectManager {
         
         // Re-accumulate from all history
         for entry in entries {
-            costSummary.record(cost: entry.cost, resolution: entry.imageSize, projectId: entry.projectId)
+            costSummary.record(cost: entry.cost, resolution: entry.imageSize, modelName: entry.modelName, projectId: entry.projectId)
         }
         
         saveCostSummary()
@@ -255,17 +255,20 @@ class ProjectManager {
     // MARK: - Export
     
     func exportCostReportCSV(entries: [HistoryEntry] = []) -> URL? {
-        var csv = "Date,Project,Prompt,Resolution,Tier,Cost,Status\n"
+        var csv = "Date,Project,Model,Prompt,Resolution,Tier,Cost,Status\n"
         
         if entries.isEmpty {
             // Fallback: summary rows only (no history entries provided)
-            csv += "Summary,All Projects,All Resolutions,All Tiers,\(costSummary.totalSpent),\n"
+            csv += "Summary,All Projects,All Models,,All Resolutions,All Tiers,\(costSummary.totalSpent),\n"
             for (resolution, cost) in costSummary.byResolution.sorted(by: { $0.key < $1.key }) {
-                csv += "Summary,All Projects,All Resolutions,\(resolution),,\(cost),\n"
+                csv += "Summary,All Projects,All Models,,\(resolution),,\(cost),\n"
+            }
+            for (modelId, cost) in costSummary.byModel.sorted(by: { $0.key < $1.key }) {
+                csv += "Summary,All Projects,\(ModelCatalog.displayName(for: modelId)),,All Resolutions,,\(cost),\n"
             }
             for (projectId, cost) in costSummary.byProject {
                 let projectName = projects.first { $0.id.uuidString == projectId }?.name ?? "Unknown"
-                csv += "Summary,\(projectName),All Resolutions,All Tiers,,\(cost),\n"
+                csv += "Summary,\(projectName),All Models,,All Resolutions,,\(cost),\n"
             }
         } else {
             // Per-image detail rows
@@ -279,7 +282,8 @@ class ProjectManager {
                     .replacingOccurrences(of: "\n", with: " ")
                 let tier = entry.usedBatchTier ? "Batch" : "Standard"
                 let date = entry.timestamp.ISO8601Format()
-                csv += "\(date),\(project),\(prompt),\(entry.imageSize),\(tier),\(entry.cost),\(entry.status)\n"
+                let model = ModelCatalog.displayName(for: entry.modelName)
+                csv += "\(date),\(project),\(model),\(prompt),\(entry.imageSize),\(tier),\(entry.cost),\(entry.status)\n"
             }
         }
         

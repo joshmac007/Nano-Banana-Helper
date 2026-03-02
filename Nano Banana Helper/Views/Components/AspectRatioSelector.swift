@@ -2,6 +2,7 @@ import SwiftUI
 
 struct AspectRatioSelector: View {
     @Binding var selectedRatio: String
+    var allowedRatioIDs: Set<String> = []
     
     // Internal state to track the active category TAB
     @State private var activeCategory: AspectRatioCategory = .landscape
@@ -12,6 +13,14 @@ struct AspectRatioSelector: View {
     // Compute current selection's category to sync tab if selection changes externally
     private var selectionCategory: AspectRatioCategory {
         AspectRatio.from(string: selectedRatio).category
+    }
+
+    private var hasRatioRestrictions: Bool {
+        !allowedRatioIDs.isEmpty
+    }
+
+    private func isRatioAllowed(_ ratioId: String) -> Bool {
+        !hasRatioRestrictions || allowedRatioIDs.contains(ratioId)
     }
     
     var body: some View {
@@ -51,14 +60,21 @@ struct AspectRatioSelector: View {
                     // Square State (Usually just 1:1)
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 60, maximum: 70))], spacing: 8) {
                         let ratio = AspectRatio.from(string: "1:1")
-                        RatioButton(ratio: ratio, isSelected: selectedRatio == ratio.id) {
-                            withAnimation(.interactiveSpring) { selectedRatio = ratio.id }
+                        if isRatioAllowed(ratio.id) {
+                            RatioButton(ratio: ratio, isSelected: selectedRatio == ratio.id) {
+                                withAnimation(.interactiveSpring) { selectedRatio = ratio.id }
+                            }
                         }
                     }
                     .transition(.blurReplace)
                 } else {
                     // Regular Grid
-                    let ratios = AspectRatio.all.filter { $0.category == activeCategory && $0.id != "Auto" && $0.id != "1:1" }
+                    let ratios = AspectRatio.all.filter {
+                        $0.category == activeCategory &&
+                        $0.id != "Auto" &&
+                        $0.id != "1:1" &&
+                        isRatioAllowed($0.id)
+                    }
                     
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 50, maximum: 60), spacing: 8)], spacing: 8) {
                         ForEach(ratios) { ratio in

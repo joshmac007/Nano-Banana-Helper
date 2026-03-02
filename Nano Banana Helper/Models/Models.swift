@@ -104,6 +104,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     let sourceImagePaths: [String] // Changed to array for multimodal support
     let outputImagePath: String
     let prompt: String
+    let modelName: String
     let aspectRatio: String
     let imageSize: String
     let usedBatchTier: Bool
@@ -118,6 +119,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         sourceImagePaths: [String],
         outputImagePath: String,
         prompt: String,
+        modelName: String = ModelCatalog.defaultModelId,
         aspectRatio: String,
         imageSize: String,
         usedBatchTier: Bool,
@@ -132,6 +134,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.sourceImagePaths = sourceImagePaths
         self.outputImagePath = outputImagePath
         self.prompt = prompt
+        self.modelName = modelName
         self.aspectRatio = aspectRatio
         self.imageSize = imageSize
         self.usedBatchTier = usedBatchTier
@@ -165,7 +168,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     
     enum CodingKeys: String, CodingKey {
         case id, projectId, timestamp, sourceImagePaths, outputImagePath
-        case prompt, aspectRatio, imageSize, usedBatchTier, cost
+        case prompt, modelName, aspectRatio, imageSize, usedBatchTier, cost
         case status, error, externalJobName
         case sourceImageBookmarks, outputImageBookmark
         case maskImageData
@@ -176,6 +179,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         sourceImagePaths: [String],
         outputImagePath: String,
         prompt: String,
+        modelName: String = ModelCatalog.defaultModelId,
         aspectRatio: String,
         imageSize: String,
         usedBatchTier: Bool,
@@ -193,6 +197,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.sourceImagePaths = sourceImagePaths
         self.outputImagePath = outputImagePath
         self.prompt = prompt
+        self.modelName = modelName
         self.aspectRatio = aspectRatio
         self.imageSize = imageSize
         self.usedBatchTier = usedBatchTier
@@ -213,6 +218,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         sourceImagePaths = try container.decode([String].self, forKey: .sourceImagePaths)
         outputImagePath = try container.decode(String.self, forKey: .outputImagePath)
         prompt = try container.decode(String.self, forKey: .prompt)
+        modelName = try container.decodeIfPresent(String.self, forKey: .modelName) ?? ModelCatalog.defaultModelId
         aspectRatio = try container.decode(String.self, forKey: .aspectRatio)
         imageSize = try container.decode(String.self, forKey: .imageSize)
         usedBatchTier = try container.decode(Bool.self, forKey: .usedBatchTier)
@@ -233,6 +239,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         try container.encode(sourceImagePaths, forKey: .sourceImagePaths)
         try container.encode(outputImagePath, forKey: .outputImagePath)
         try container.encode(prompt, forKey: .prompt)
+        try container.encode(modelName, forKey: .modelName)
         try container.encode(aspectRatio, forKey: .aspectRatio)
         try container.encode(imageSize, forKey: .imageSize)
         try container.encode(usedBatchTier, forKey: .usedBatchTier)
@@ -253,19 +260,44 @@ struct CostSummary: Codable {
     var totalSpent: Double
     var imageCount: Int
     var byResolution: [String: Double]
+    var byModel: [String: Double]
     var byProject: [String: Double]  // Project ID string -> cost
     
     init() {
         totalSpent = 0
         imageCount = 0
         byResolution = [:]
+        byModel = [:]
         byProject = [:]
     }
-    
-    mutating func record(cost: Double, resolution: String, projectId: UUID) {
+
+    enum CodingKeys: String, CodingKey {
+        case totalSpent, imageCount, byResolution, byModel, byProject
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        totalSpent = try container.decodeIfPresent(Double.self, forKey: .totalSpent) ?? 0
+        imageCount = try container.decodeIfPresent(Int.self, forKey: .imageCount) ?? 0
+        byResolution = try container.decodeIfPresent([String: Double].self, forKey: .byResolution) ?? [:]
+        byModel = try container.decodeIfPresent([String: Double].self, forKey: .byModel) ?? [:]
+        byProject = try container.decodeIfPresent([String: Double].self, forKey: .byProject) ?? [:]
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(totalSpent, forKey: .totalSpent)
+        try container.encode(imageCount, forKey: .imageCount)
+        try container.encode(byResolution, forKey: .byResolution)
+        try container.encode(byModel, forKey: .byModel)
+        try container.encode(byProject, forKey: .byProject)
+    }
+
+    mutating func record(cost: Double, resolution: String, modelName: String, projectId: UUID) {
         totalSpent += cost
         imageCount += 1
         byResolution[resolution, default: 0] += cost
+        byModel[modelName, default: 0] += cost
         byProject[projectId.uuidString, default: 0] += cost
     }
 }
@@ -323,6 +355,7 @@ class BatchJob: Identifiable, Codable {
     var projectId: UUID?
     var prompt: String
     var systemPrompt: String? // Added
+    var modelName: String
     var aspectRatio: String
     var imageSize: String
     var outputDirectory: String
@@ -333,7 +366,7 @@ class BatchJob: Identifiable, Codable {
     var maskImageData: Data?
 
     enum CodingKeys: String, CodingKey {
-        case id, createdAt, projectId, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, outputDirectoryBookmark, useBatchTier, status, tasks, maskImageData
+        case id, createdAt, projectId, prompt, systemPrompt, modelName, aspectRatio, imageSize, outputDirectory, outputDirectoryBookmark, useBatchTier, status, tasks, maskImageData
     }
 
     required init(from decoder: Decoder) throws {
@@ -343,6 +376,7 @@ class BatchJob: Identifiable, Codable {
         projectId = try container.decodeIfPresent(UUID.self, forKey: .projectId)
         prompt = try container.decode(String.self, forKey: .prompt)
         systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt) // Decode if present
+        modelName = try container.decodeIfPresent(String.self, forKey: .modelName) ?? ModelCatalog.defaultModelId
         aspectRatio = try container.decode(String.self, forKey: .aspectRatio)
         imageSize = try container.decode(String.self, forKey: .imageSize)
         outputDirectory = try container.decode(String.self, forKey: .outputDirectory)
@@ -360,6 +394,7 @@ class BatchJob: Identifiable, Codable {
         try container.encode(projectId, forKey: .projectId)
         try container.encode(prompt, forKey: .prompt)
         try container.encode(systemPrompt, forKey: .systemPrompt)
+        try container.encode(modelName, forKey: .modelName)
         try container.encode(aspectRatio, forKey: .aspectRatio)
         try container.encode(imageSize, forKey: .imageSize)
         try container.encode(outputDirectory, forKey: .outputDirectory)
@@ -373,6 +408,7 @@ class BatchJob: Identifiable, Codable {
     init(
         prompt: String,
         systemPrompt: String? = nil,
+        modelName: String = ModelCatalog.defaultModelId,
         aspectRatio: String = "16:9",
         imageSize: String = "4K",
         outputDirectory: String,
@@ -386,6 +422,7 @@ class BatchJob: Identifiable, Codable {
         self.projectId = projectId
         self.prompt = prompt
         self.systemPrompt = systemPrompt
+        self.modelName = modelName
         self.aspectRatio = aspectRatio
         self.imageSize = imageSize
         self.outputDirectory = outputDirectory
@@ -406,27 +443,13 @@ class BatchJob: Identifiable, Codable {
     
     /// Calculate cost for a specific task based on settings
     func cost(for task: ImageTask) -> Double {
-        let inputRate = useBatchTier ? 0.0006 : 0.0011
-        let inputCost = inputRate * Double(max(1, task.inputPaths.count))
-        
-        let outputCost: Double
-        if useBatchTier {
-            // Batch Tier: 50% cheaper
-            switch imageSize {
-            case "4K": outputCost = 0.12
-            case "2K", "1K": outputCost = 0.067
-            default: outputCost = 0.067
-            }
-        } else {
-            // Standard Tier
-            switch imageSize {
-            case "4K": outputCost = 0.24
-            case "2K", "1K": outputCost = 0.134
-            default: outputCost = 0.134
-            }
-        }
-        
-        return inputCost + outputCost
+        PricingEngine.estimate(
+            modelName: modelName,
+            imageSize: imageSize,
+            isBatchTier: useBatchTier,
+            inputCount: max(1, task.inputPaths.count),
+            outputCount: 1
+        ).total
     }
 }
 

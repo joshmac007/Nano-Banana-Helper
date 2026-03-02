@@ -3,6 +3,20 @@ import Observation
 
 @Observable
 class BatchStagingManager {
+    struct RejectedFile: Sendable {
+        let url: URL
+        let reason: String
+    }
+
+    struct AddFilesResult: Sendable {
+        let acceptedURLs: [URL]
+        let rejectedURLsWithReason: [RejectedFile]
+
+        var rejectedFiles: [RejectedFile] { rejectedURLsWithReason }
+        var rejectedCount: Int { rejectedURLsWithReason.count }
+        var hasRejections: Bool { !rejectedURLsWithReason.isEmpty }
+    }
+
     // Staged Items
     var stagedFiles: [URL] = []
     
@@ -30,17 +44,56 @@ class BatchStagingManager {
     // Batch Configuration (Synced with Inspector)
     var prompt: String = ""
     var systemPrompt: String = "" // New System Prompt
+    var selectedModelName: String = ModelCatalog.defaultModelId {
+        didSet {
+            sanitizeSelectionsForCurrentModel()
+        }
+    }
     var aspectRatio: String = "Auto" // Changed to Auto
     var imageSize: String = "4K"
     var isBatchTier: Bool = false
     var isMultiInput: Bool = false
-    var textToImageCount: Int = 1 // Support for generating without input images
+    var generationCount: Int = 1 {
+        didSet {
+            let clamped = Self.clampedGenerationCount(generationCount)
+            if generationCount != clamped {
+                generationCount = clamped
+            }
+        }
+    }
     
     // Derived Properties
     var isEmpty: Bool { stagedFiles.isEmpty }
-    var count: Int { stagedFiles.isEmpty ? textToImageCount : stagedFiles.count }
+    var count: Int { stagedFiles.isEmpty ? generationCount : stagedFiles.count }
+    var estimatedRequestCount: Int {
+        if stagedFiles.isEmpty {
+            return generationCount
+        }
+        if isMultiInput {
+            return generationCount
+        }
+        return stagedFiles.count * generationCount
+    }
+    var estimatedInputCountForCost: Int {
+        if stagedFiles.isEmpty {
+            return 0
+        }
+        if isMultiInput {
+            return stagedFiles.count * generationCount
+        }
+        return stagedFiles.count * generationCount
+    }
+    var estimatedOutputCountForCost: Int {
+        estimatedRequestCount
+    }
     var hasAnyRegionEdits: Bool {
         stagedFiles.contains { stagedMaskEdits[$0] != nil }
+    }
+    var availableAspectRatios: [String] {
+        ModelCatalog.supportedAspectRatios(for: selectedModelName)
+    }
+    var availableImageSizes: [String] {
+        ModelCatalog.supportedImageSizes(for: selectedModelName)
     }
     
     var hasSufficientPrompts: Bool {
@@ -63,37 +116,62 @@ class BatchStagingManager {
     }
     
     var canStartBatch: Bool {
-        let hasValidInput = !stagedFiles.isEmpty || (textToImageCount > 0 && aspectRatio != "Auto")
-        return hasValidInput && hasSufficientPrompts
+        let hasValidInput = !stagedFiles.isEmpty || (generationCount > 0 && aspectRatio != "Auto")
+        return hasValidInput && hasSufficientPrompts && startBlockReason == nil
+    }
+
+    var batchPayloadPreflightWarning: String? {
+        guard isBatchTier else { return nil }
+        guard let oversized = firstOversizedBatchPayloadEstimate else { return nil }
+        let estimatedMB = Double(oversized.estimatedBytes) / Double(1024 * 1024)
+        return String(
+            format: "Estimated inline batch payload (%.1fMB) exceeds the 20MB limit. Use smaller images or fewer images per batch.",
+            estimatedMB
+        )
     }
 
     var startBlockReason: String? {
         if isMultiInput && hasAnyRegionEdits {
             return "Region Edit is only available in standard batch mode (one output per input image). Turn off Multi-Input Mode to continue."
         }
+        if let payloadWarning = batchPayloadPreflightWarning {
+            return payloadWarning
+        }
         return nil
     }
     
     // Actions
     func addFiles(_ urls: [URL], bookmarks: [URL: Data] = [:]) {
+        let normalizedURLs = urls.map { $0.standardizedFileURL }
+        let normalizedBookmarks = bookmarks.reduce(into: [URL: Data]()) { partialResult, element in
+            partialResult[element.key.standardizedFileURL] = element.value
+        }
+
         // Filter for images and duplicates if needed
-        let newFiles = urls.filter { url in
+        let newFiles = normalizedURLs.filter { url in
             !stagedFiles.contains(url)
         }
         stagedFiles.append(contentsOf: newFiles)
         
         // Store any provided bookmarks
-        for (url, bookmark) in bookmarks {
+        for (url, bookmark) in normalizedBookmarks {
             stagedBookmarks[url] = bookmark
         }
     }
 
     /// Adds files and captures security-scoped bookmarks where available.
     /// Any provided bookmarks are preserved and preferred over newly generated ones.
-    func addFilesCapturingBookmarks(_ urls: [URL], preferredBookmarks: [URL: Data] = [:]) {
-        var bookmarks = preferredBookmarks
+    func addFilesCapturingBookmarks(_ urls: [URL], preferredBookmarks: [URL: Data] = [:]) -> AddFilesResult {
+        let normalizedURLs = urls.map { $0.standardizedFileURL }
+        var bookmarks = preferredBookmarks.reduce(into: [URL: Data]()) { partialResult, element in
+            partialResult[element.key.standardizedFileURL] = element.value
+        }
 
-        for url in urls where bookmarks[url] == nil {
+        var accepted: [URL] = []
+        var rejected: [RejectedFile] = []
+
+        for url in normalizedURLs {
+            if bookmarks[url] == nil {
             let didStart = url.startAccessingSecurityScopedResource()
             if let bookmark = AppPaths.bookmark(for: url) {
                 bookmarks[url] = bookmark
@@ -103,13 +181,29 @@ class BatchStagingManager {
             }
         }
 
-        addFiles(urls, bookmarks: bookmarks)
+            if AppPaths.requiresSecurityScope(path: url.path), bookmarks[url] == nil {
+                let reason = "Sandbox bookmark could not be created. Re-select this file to grant access."
+                rejected.append(RejectedFile(url: url, reason: reason))
+                DebugLog.error("staging.permissions", "Rejected staged file due to missing bookmark", metadata: [
+                    "path": url.path,
+                    "reason": reason
+                ])
+                continue
+            }
+
+            accepted.append(url)
+        }
+
+        let acceptedBookmarks = bookmarks.filter { key, _ in accepted.contains(key) }
+        addFiles(accepted, bookmarks: acceptedBookmarks)
+        return AddFilesResult(acceptedURLs: accepted, rejectedURLsWithReason: rejected)
     }
     
     func removeFile(_ url: URL) {
-        stagedFiles.removeAll { $0 == url }
-        stagedBookmarks.removeValue(forKey: url)
-        stagedMaskEdits.removeValue(forKey: url)
+        let normalized = url.standardizedFileURL
+        stagedFiles.removeAll { $0 == normalized }
+        stagedBookmarks.removeValue(forKey: normalized)
+        stagedMaskEdits.removeValue(forKey: normalized)
     }
     
     func clearAll() {
@@ -120,26 +214,139 @@ class BatchStagingManager {
     }
     
     func bookmark(for url: URL) -> Data? {
-        stagedBookmarks[url]
+        stagedBookmarks[url.standardizedFileURL]
     }
     
-    func updateSettings(prompt: String? = nil, systemPrompt: String? = nil, ratio: String? = nil, size: String? = nil, batch: Bool? = nil, multiInput: Bool? = nil) {
+    func updateSettings(prompt: String? = nil, systemPrompt: String? = nil, model: String? = nil, ratio: String? = nil, size: String? = nil, batch: Bool? = nil, multiInput: Bool? = nil) {
         if let p = prompt { self.prompt = p }
         if let sp = systemPrompt { self.systemPrompt = sp }
+        if let model = model { self.selectedModelName = model }
         if let r = ratio { self.aspectRatio = r }
         if let s = size { self.imageSize = s }
         if let b = batch { self.isBatchTier = b }
         if let m = multiInput { self.isMultiInput = m }
+        sanitizeSelectionsForCurrentModel()
+    }
+
+    func buildTasksForCurrentConfiguration() -> [ImageTask] {
+        if stagedFiles.isEmpty {
+            return (0..<generationCount).map { _ in
+                ImageTask(inputPaths: [])
+            }
+        }
+
+        if isMultiInput {
+            let inputPaths = stagedFiles.map { $0.path }
+            let inputBookmarks = stagedFiles.compactMap { bookmark(for: $0) }
+            let taskBookmarks = inputBookmarks.isEmpty ? nil : inputBookmarks
+            return (0..<generationCount).map { _ in
+                ImageTask(
+                    inputPaths: inputPaths,
+                    inputBookmarks: taskBookmarks,
+                    maskImageData: nil,
+                    customPrompt: nil
+                )
+            }
+        }
+
+        var tasks: [ImageTask] = []
+        tasks.reserveCapacity(stagedFiles.count * generationCount)
+        for url in stagedFiles {
+            let stagedEdit = stagedMaskEdits[url]
+            for _ in 0..<generationCount {
+                tasks.append(
+                    ImageTask(
+                        inputPath: url.path,
+                        inputBookmark: bookmark(for: url),
+                        maskImageData: stagedEdit?.maskData,
+                        customPrompt: stagedEdit?.prompt
+                    )
+                )
+            }
+        }
+        return tasks
     }
     
     func saveMaskEdit(for url: URL, maskData: Data, prompt: String, paths: [DrawingPath]) {
         if isMultiInput {
             isMultiInput = false
         }
-        stagedMaskEdits[url] = StagedMaskEdit(maskData: maskData, prompt: prompt, paths: paths)
+        stagedMaskEdits[url.standardizedFileURL] = StagedMaskEdit(maskData: maskData, prompt: prompt, paths: paths)
     }
     
     func hasMaskEdit(for url: URL) -> Bool {
-        return stagedMaskEdits[url] != nil
+        return stagedMaskEdits[url.standardizedFileURL] != nil
+    }
+
+    func sanitizeSelectionsForCurrentModel() {
+        let sanitizedRatio = ModelCatalog.sanitizeAspectRatio(aspectRatio, for: selectedModelName)
+        if aspectRatio != sanitizedRatio {
+            aspectRatio = sanitizedRatio
+        }
+
+        let sanitizedSize = ModelCatalog.sanitizeImageSize(imageSize, for: selectedModelName)
+        if imageSize != sanitizedSize {
+            imageSize = sanitizedSize
+        }
+    }
+
+    private static func clampedGenerationCount(_ value: Int) -> Int {
+        min(8, max(1, value))
+    }
+
+    private var firstOversizedBatchPayloadEstimate: (estimatedBytes: Int, limitBytes: Int)? {
+        guard !stagedFiles.isEmpty else { return nil }
+        let limit = NanoBananaService.maxInlineBatchPayloadBytes
+
+        if isMultiInput {
+            let rawBytes = stagedFiles.reduce(into: 0) { partialResult, fileURL in
+                partialResult += fileSizeBytes(for: fileURL)
+            }
+            let estimated = NanoBananaService.estimateInlineBatchPayloadBytes(
+                rawImageBytes: rawBytes,
+                prompt: prompt,
+                systemInstruction: systemPrompt
+            )
+            return estimated > limit ? (estimated, limit) : nil
+        }
+
+        for fileURL in stagedFiles {
+            // Region-edit tasks are cropped before API submission, so full-file size
+            // overestimates and can produce false positives in preflight.
+            if stagedMaskEdits[fileURL.standardizedFileURL] != nil {
+                continue
+            }
+
+            let estimated = NanoBananaService.estimateInlineBatchPayloadBytes(
+                rawImageBytes: fileSizeBytes(for: fileURL),
+                prompt: prompt,
+                systemInstruction: systemPrompt
+            )
+            if estimated > limit {
+                return (estimated, limit)
+            }
+        }
+        return nil
+    }
+
+    private func fileSizeBytes(for url: URL) -> Int {
+        let normalizedURL = url.standardizedFileURL
+        let path = normalizedURL.path
+
+        if let bookmark = stagedBookmarks[normalizedURL], AppPaths.requiresSecurityScope(path: path) {
+            return AppPaths.withResolvedBookmark(bookmark) { scopedURL in
+                fileSizeBytes(atPath: scopedURL.path)
+            } ?? fileSizeBytes(atPath: path)
+        }
+
+        return fileSizeBytes(atPath: path)
+    }
+
+    private func fileSizeBytes(atPath path: String) -> Int {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let sizeNumber = attributes[.size] as? NSNumber else {
+            return 0
+        }
+        return sizeNumber.intValue
     }
 }

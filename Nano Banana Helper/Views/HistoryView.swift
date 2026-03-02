@@ -9,6 +9,7 @@ struct HistoryView: View {
     var onDelete: ((HistoryEntry) -> Void)?
     var onReuse: ((HistoryEntry) -> Void)?
     var onResumePolling: ((HistoryEntry) -> Void)?
+    var onRegrantAccess: ((HistoryEntry) -> Void)?
     
     @State private var selectedEntry: HistoryEntry?
     @State private var rescueJobID: String = ""
@@ -25,7 +26,8 @@ struct HistoryView: View {
         activeJobIDs: Set<String> = [],
         onDelete: ((HistoryEntry) -> Void)? = nil,
         onReuse: ((HistoryEntry) -> Void)? = nil,
-        onResumePolling: ((HistoryEntry) -> Void)? = nil
+        onResumePolling: ((HistoryEntry) -> Void)? = nil,
+        onRegrantAccess: ((HistoryEntry) -> Void)? = nil
     ) {
         self.entries = entries
         self.projects = projects
@@ -33,6 +35,7 @@ struct HistoryView: View {
         self.onDelete = onDelete
         self.onReuse = onReuse
         self.onResumePolling = onResumePolling
+        self.onRegrantAccess = onRegrantAccess
         self._selectedProjectId = State(initialValue: initialProjectId)
     }
     
@@ -47,7 +50,8 @@ struct HistoryView: View {
         entries.filter { entry in
             let matchesSearch = searchText.isEmpty || 
                 entry.prompt.localizedCaseInsensitiveContains(searchText) ||
-                entry.externalJobName?.localizedCaseInsensitiveContains(searchText) == true
+                entry.externalJobName?.localizedCaseInsensitiveContains(searchText) == true ||
+                ModelCatalog.displayName(for: entry.modelName).localizedCaseInsensitiveContains(searchText)
             
             let matchesProject = selectedProjectId == nil || entry.projectId == selectedProjectId
             
@@ -129,6 +133,11 @@ struct HistoryView: View {
                             onReuse?(entry)
                         }
                         if entry.status == "failed" {
+                            if isPermissionFailure(entry) {
+                                Button("Regrant Access & Retry") {
+                                    onRegrantAccess?(entry)
+                                }
+                            }
                             if entry.externalJobName != nil {
                                 Button("Resume Polling (No Cost)") {
                                     onResumePolling?(entry)
@@ -181,6 +190,7 @@ struct HistoryView: View {
                                 sourceImagePaths: entry.sourceImagePaths,
                                 outputImagePath: entry.outputImagePath,
                                 prompt: entry.prompt,
+                                modelName: entry.modelName,
                                 aspectRatio: entry.aspectRatio,
                                 imageSize: entry.imageSize,
                                 usedBatchTier: entry.usedBatchTier,
@@ -200,6 +210,12 @@ struct HistoryView: View {
             .padding()
             .frame(width: 400)
         }
+    }
+
+    private func isPermissionFailure(_ entry: HistoryEntry) -> Bool {
+        guard let error = entry.error?.lowercased() else { return false }
+        let tokens = ["permission", "cannot access", "sandbox", "operation not permitted", "bookmark", "output folder"]
+        return tokens.contains { error.contains($0) }
     }
 }
 
@@ -340,12 +356,12 @@ struct HistoryRowView: View {
                     .lineLimit(2)
                 
                 // Line 2: Metadata Bundle (Cost, Project, Size, Aspect, Batch)
-                HStack(spacing: 8) {
-                    Text(formatCurrency(entry.cost))
+                    HStack(spacing: 8) {
+                        Text(formatCurrency(entry.cost))
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
                     
-                    Text("in \(projectName)")
+                        Text("in \(projectName)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 6)
@@ -353,6 +369,13 @@ struct HistoryRowView: View {
                         .background(Color.secondary.opacity(0.1))
                         .cornerRadius(4)
                     
+                    Text(ModelCatalog.displayName(for: entry.modelName))
+                        .font(.system(size: 9, weight: .semibold))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 2)
+                        .background(Color.blue.opacity(0.12))
+                        .cornerRadius(4)
+
                     // Meta Badges
                     HStack(spacing: 6) {
                         Text(entry.imageSize)

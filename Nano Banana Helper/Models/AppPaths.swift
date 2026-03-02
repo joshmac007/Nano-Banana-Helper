@@ -8,7 +8,7 @@ struct AppPaths {
     }
 
     /// The primary application support directory for the current app version
-    nonisolated(unsafe) static let appSupportURL: URL = {
+    nonisolated static let appSupportURL: URL = {
         let fileManager = FileManager.default
         let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let url = appSupport.appendingPathComponent("NanoBananaProAssistant", isDirectory: true)
@@ -17,7 +17,7 @@ struct AppPaths {
     }()
     
     /// Path to the legacy data directory for migration
-    nonisolated(unsafe) static let legacyAppSupportURL: URL = {
+    nonisolated static let legacyAppSupportURL: URL = {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return appSupport.appendingPathComponent("NanoBananaPro", isDirectory: true)
     }()
@@ -48,19 +48,19 @@ struct AppPaths {
     }
 
     /// Directory for local debug logs
-    nonisolated(unsafe) static var debugLogsDirectoryURL: URL {
+    nonisolated static var debugLogsDirectoryURL: URL {
         let url = appSupportURL.appendingPathComponent("logs", isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
 
     /// Primary debug log file used for local troubleshooting
-    nonisolated(unsafe) static var debugLogURL: URL {
+    nonisolated static var debugLogURL: URL {
         debugLogsDirectoryURL.appendingPathComponent("debug.log")
     }
 
     /// Rotated debug log file (previous)
-    nonisolated(unsafe) static var debugLogArchiveURL: URL {
+    nonisolated static var debugLogArchiveURL: URL {
         debugLogsDirectoryURL.appendingPathComponent("debug.previous.log")
     }
     
@@ -78,6 +78,31 @@ struct AppPaths {
         let url = documentsURL.appendingPathComponent("NanoBananaPro", isDirectory: true)
         try? fileManager.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    /// Returns whether a file-system path is managed internally by the app.
+    /// Managed paths do not require external sandbox re-grants.
+    static func isManagedPath(path: String) -> Bool {
+        guard !path.isEmpty else { return true }
+        let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
+        let managedRoots = [
+            appSupportURL.standardizedFileURL.path,
+            defaultOutputDirectory.standardizedFileURL.path,
+            FileManager.default.temporaryDirectory.standardizedFileURL.path
+        ]
+        return managedRoots.contains { root in
+            normalized == root || normalized.hasPrefix(root + "/")
+        }
+    }
+
+    static func isManagedPath(url: URL) -> Bool {
+        isManagedPath(path: url.path)
+    }
+
+    /// Returns true when the app must rely on a security-scoped bookmark
+    /// to access a path under sandbox.
+    static func requiresSecurityScope(path: String) -> Bool {
+        !isManagedPath(path: path)
     }
     
     /// Checks for legacy data and migrates it to the new directory if needed

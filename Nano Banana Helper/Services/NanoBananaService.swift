@@ -6,6 +6,7 @@ struct ImageEditRequest: Sendable {
     let maskImageData: Data? // Added for inpainting
     let prompt: String
     let systemInstruction: String?
+    let modelName: String
     let aspectRatio: String
     let imageSize: String
     let useBatchTier: Bool
@@ -66,19 +67,24 @@ struct AppConfig: Codable {
 
 /// Service for communicating with the Gemini API
 actor NanoBananaService {
-    // private let modelName = "gemini-3-pro-image-preview" // Removed hardcoded
     private let session: URLSession
-    
-    private var modelName: String {
-        get async {
-            await MainActor.run { AppConfig.load().modelName } ?? "gemini-3-pro-image-preview"
-        }
+    nonisolated static let maxInlineBatchPayloadBytes = 20 * 1024 * 1024
+    nonisolated static func estimateInlineBatchPayloadBytes(rawImageBytes: Int, prompt: String, systemInstruction: String?) -> Int {
+        // Base64 expansion is ~4/3, plus JSON escaping/keys and request framing.
+        let base64Estimate = Int(Double(rawImageBytes) * 1.37)
+        let textBytes = prompt.utf8.count + (systemInstruction?.utf8.count ?? 0)
+        let jsonOverhead = 32_768
+        return base64Estimate + textBytes + jsonOverhead
     }
     
-    private var baseURL: String {
+    private var fallbackModelName: String {
         get async {
-            "https://generativelanguage.googleapis.com/v1beta/models/\(await modelName)"
+            await MainActor.run { AppConfig.load().modelName } ?? ModelCatalog.defaultModelId
         }
+    }
+
+    private func baseURL(for modelName: String) -> String {
+        "https://generativelanguage.googleapis.com/v1beta/models/\(modelName)"
     }
     
     init() {
@@ -108,9 +114,6 @@ actor NanoBananaService {
     
     // MARK: - Image Editing
     
-    /// Maximum payload size for inline batch requests (20MB per documentation)
-    private let maxBatchPayloadSize = 20 * 1024 * 1024
-    
     func editImage(_ request: ImageEditRequest, onJobCreated: (@Sendable (String) -> Void)? = nil, onPollUpdate: (@Sendable (Int) -> Void)? = nil) async throws -> ImageEditResponse {
         guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
@@ -123,7 +126,8 @@ actor NanoBananaService {
             return try await pollBatchJob(jobName: jobInfo.jobName, requestKey: jobInfo.requestKey, onPollUpdate: onPollUpdate)
         } else {
             let requestPayload = try await buildRequestPayload(request: request)
-            return try await processStandardRequest(requestPayload, apiKey: apiKey)
+            let selectedModel = request.modelName.isEmpty ? await fallbackModelName : request.modelName
+            return try await processStandardRequest(requestPayload, modelName: selectedModel, apiKey: apiKey)
         }
     }
     
@@ -134,12 +138,18 @@ actor NanoBananaService {
         }
         
         let payload = try await buildRequestPayload(request: request)
-        return try await createBatchJobRecord(payload, apiKey: apiKey)
+        let selectedModel = request.modelName.isEmpty ? await fallbackModelName : request.modelName
+        return try await createBatchJobRecord(payload, modelName: selectedModel, apiKey: apiKey)
     }
     
     private func buildRequestPayload(request: ImageEditRequest) async throws -> [String: Any] {
-        let activeModel = await modelName
+        let activeModel = request.modelName.isEmpty ? await fallbackModelName : request.modelName
         try validateImageCount(request.inputImageURLs.count, forModel: activeModel)
+        if !ModelCatalog.isAspectRatioSupported(request.aspectRatio, for: activeModel) {
+            throw NanoBananaError.batchError(
+                message: "Aspect ratio \(request.aspectRatio) is not supported by \(ModelCatalog.displayName(for: activeModel))."
+            )
+        }
 
         // Build multimodal parts
         var parts: [[String: Any]] = []
@@ -162,12 +172,12 @@ actor NanoBananaService {
         
         // Validate size for batch requests (20MB limit for inline requests)
         if request.useBatchTier {
-            let estimatedPayloadBytes = estimatedBatchInlinePayloadBytes(
+            let estimatedPayloadBytes = Self.estimateInlineBatchPayloadBytes(
                 rawImageBytes: totalDataSize,
                 prompt: request.prompt,
                 systemInstruction: request.systemInstruction
             )
-            if estimatedPayloadBytes > maxBatchPayloadSize {
+            if estimatedPayloadBytes > Self.maxInlineBatchPayloadBytes {
                 throw NanoBananaError.batchError(
                     message: "Estimated inline batch payload (\(estimatedPayloadBytes / 1024 / 1024)MB) exceeds the 20MB limit. Use smaller images or fewer images per batch."
                 )
@@ -177,10 +187,11 @@ actor NanoBananaService {
         // Build imageConfig — omit aspectRatio entirely when Auto is selected,
         // because the Gemini API only accepts explicit ratio strings (1:1, 16:9, etc.)
         // and will return HTTP 400 for any other value.
-        let aspectRatioEntry = AspectRatio.from(string: request.aspectRatio)
-        var imageConfig: [String: Any] = ["imageSize": request.imageSize]
-        if aspectRatioEntry.id != "Auto" {
-            imageConfig["aspectRatio"] = aspectRatioEntry.id
+        let aspectRatio = ModelCatalog.sanitizeAspectRatio(request.aspectRatio, for: activeModel)
+        let apiImageSize = try apiImageSizeValue(for: request.imageSize, modelName: activeModel)
+        var imageConfig: [String: Any] = ["imageSize": apiImageSize]
+        if aspectRatio != "Auto" {
+            imageConfig["aspectRatio"] = aspectRatio
         }
         
         // Region-edit masks are local-only guidance for crop/composite in the app.
@@ -208,8 +219,8 @@ actor NanoBananaService {
     
     // MARK: - Standard API
     
-    private func processStandardRequest(_ payload: [String: Any], apiKey: String) async throws -> ImageEditResponse {
-        var urlRequest = URLRequest(url: URL(string: "\(await baseURL):generateContent?key=\(apiKey)")!)
+    private func processStandardRequest(_ payload: [String: Any], modelName: String, apiKey: String) async throws -> ImageEditResponse {
+        var urlRequest = URLRequest(url: URL(string: "\(baseURL(for: modelName)):generateContent?key=\(apiKey)")!)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
@@ -217,7 +228,7 @@ actor NanoBananaService {
         urlRequest.httpBody = httpBody
         
         // Log request
-        await LogManager.shared.log(.request, payload: summarizedRequestLog(payload, httpBody: httpBody))
+        await LogManager.shared.log(.request, payload: summarizedRequestLog(payload, modelName: modelName, httpBody: httpBody))
         
         // Execute with retry
         let (data, response) = try await executeWithRetry(urlRequest)
@@ -231,6 +242,13 @@ actor NanoBananaService {
         
         guard httpResponse.statusCode == 200 else {
             await LogManager.shared.log(.error, payload: "HTTP \(httpResponse.statusCode): \(String(data: data, encoding: .utf8) ?? "Unknown error")")
+            if httpResponse.statusCode == 400,
+               modelName == ModelCatalog.flash31ImageId,
+               currentImageSize(in: payload) == "0.5K" {
+                throw NanoBananaError.batchError(
+                    message: "The API rejected image size 0.5K for this request. Retry with 1K or higher."
+                )
+            }
             throw NanoBananaError.apiError(statusCode: httpResponse.statusCode, data: data)
         }
         
@@ -253,7 +271,7 @@ actor NanoBananaService {
     
     // MARK: - Batch API (Async Job-Based)
     
-    private func createBatchJobRecord(_ payload: [String: Any], apiKey: String) async throws -> BatchJobInfo {
+    private func createBatchJobRecord(_ payload: [String: Any], modelName: String, apiKey: String) async throws -> BatchJobInfo {
         let requestKey = UUID().uuidString
         let batchPayload: [String: Any] = [
             "batch": [
@@ -272,14 +290,14 @@ actor NanoBananaService {
         ]
         
         // POST to :batchGenerateContent endpoint
-        let url = URL(string: "\(await baseURL):batchGenerateContent?key=\(apiKey)")!
+        let url = URL(string: "\(baseURL(for: modelName)):batchGenerateContent?key=\(apiKey)")!
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
         let httpBody = try JSONSerialization.data(withJSONObject: batchPayload)
         urlRequest.httpBody = httpBody
-        await LogManager.shared.log(.request, payload: summarizedBatchCreateLog(batchPayload, httpBody: httpBody))
+        await LogManager.shared.log(.request, payload: summarizedBatchCreateLog(batchPayload, modelName: modelName, httpBody: httpBody))
         
         let (data, response) = try await session.data(for: urlRequest)
         
@@ -288,6 +306,13 @@ actor NanoBananaService {
         }
         
         guard httpResponse.statusCode == 200 else {
+            if httpResponse.statusCode == 400,
+               modelName == ModelCatalog.flash31ImageId,
+               currentImageSize(in: payload) == "0.5K" {
+                throw NanoBananaError.batchError(
+                    message: "The API rejected image size 0.5K for this request. Retry with 1K or higher."
+                )
+            }
             throw NanoBananaError.apiError(statusCode: httpResponse.statusCode, data: data)
         }
         
@@ -302,30 +327,40 @@ actor NanoBananaService {
     private func validateImageCount(_ count: Int, forModel model: String) throws {
         guard count > 0 else { return }
 
-        // Current Gemini image generation docs for gemini-3-pro-image-preview document
-        // up to 14 reference images. Apply conservatively to this model family.
-        if model.contains("gemini-3-pro-image-preview"), count > 14 {
+        let definition = ModelCatalog.definition(for: model)
+        if let maxInputImages = definition.capabilities.maxInputImages, count > maxInputImages {
             throw NanoBananaError.batchError(
-                message: "This model supports up to 14 input images per request. Reduce the number of images and retry."
+                message: "This model supports up to \(maxInputImages) input images per request. Reduce the number of images and retry."
             )
         }
     }
 
-    private func estimatedBatchInlinePayloadBytes(rawImageBytes: Int, prompt: String, systemInstruction: String?) -> Int {
-        // Base64 expansion is ~4/3, plus JSON escaping/keys and request framing.
-        let base64Estimate = Int(Double(rawImageBytes) * 1.37)
-        let textBytes = prompt.utf8.count + (systemInstruction?.utf8.count ?? 0)
-        let jsonOverhead = 32_768
-        return base64Estimate + textBytes + jsonOverhead
+    private func apiImageSizeValue(for selectedSize: String, modelName: String) throws -> String {
+        let sanitizedSize = ModelCatalog.sanitizeImageSize(selectedSize, for: modelName)
+        guard ModelCatalog.isImageSizeSupported(sanitizedSize, for: modelName) else {
+            throw NanoBananaError.batchError(
+                message: "Selected size \(selectedSize) is not supported by \(ModelCatalog.displayName(for: modelName))."
+            )
+        }
+
+        switch sanitizedSize {
+        case "0.5K":
+            return "0.5K"
+        case "1K", "2K", "4K":
+            return sanitizedSize
+        default:
+            throw NanoBananaError.batchError(
+                message: "Unsupported image size token: \(sanitizedSize). Choose 1K, 2K, or 4K and retry."
+            )
+        }
     }
 
-    private func summarizedRequestLog(_ payload: [String: Any], httpBody: Data) -> String {
+    private func summarizedRequestLog(_ payload: [String: Any], modelName: String, httpBody: Data) -> String {
         let (imageCount, imageBytes) = extractInlineImageStats(from: payload)
         let promptLength = extractPromptLength(from: payload)
-        let model = (payload["model"] as? String) ?? "implicit"
         return """
         generateContent request summary:
-        model=\(model)
+        model=\(modelName)
         image_parts=\(imageCount)
         inline_image_bytes_est=\(imageBytes)
         prompt_chars=\(promptLength)
@@ -333,7 +368,7 @@ actor NanoBananaService {
         """
     }
 
-    private func summarizedBatchCreateLog(_ batchPayload: [String: Any], httpBody: Data) -> String {
+    private func summarizedBatchCreateLog(_ batchPayload: [String: Any], modelName: String, httpBody: Data) -> String {
         let requests = (((batchPayload["batch"] as? [String: Any])?["input_config"] as? [String: Any])?["requests"] as? [String: Any])?["requests"] as? [[String: Any]] ?? []
         let requestCount = requests.count
         let firstRequest = (((requests.first?["request"] as? [String: Any])) ?? [:])
@@ -341,6 +376,7 @@ actor NanoBananaService {
         let promptLength = extractPromptLength(from: firstRequest)
         return """
         batch create request summary:
+        model=\(modelName)
         requests=\(requestCount)
         first_request_image_parts=\(imageCount)
         first_request_inline_image_bytes_est=\(imageBytes)
@@ -367,6 +403,10 @@ actor NanoBananaService {
         let contents = payload["contents"] as? [[String: Any]] ?? []
         let parts = (contents.first?["parts"] as? [[String: Any]]) ?? []
         return (parts.first?["text"] as? String)?.count ?? 0
+    }
+
+    private func currentImageSize(in payload: [String: Any]) -> String? {
+        (((payload["generationConfig"] as? [String: Any])?["imageConfig"] as? [String: Any])?["imageSize"] as? String)
     }
 
     private func summarizedGenerateContentResponseLog(_ data: Data) -> String {

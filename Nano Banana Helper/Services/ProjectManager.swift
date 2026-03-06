@@ -129,6 +129,7 @@ class ProjectManager {
         guard let project = projects.first(where: { $0.id == projectId }) else { return }
         guard project.outputDirectoryBookmark != bookmark else { return }
         project.outputDirectoryBookmark = bookmark
+        project.invalidateOutputPathCache()
         DebugLog.info("project", "Persisted refreshed output bookmark", metadata: [
             "project_id": projectId.uuidString,
             "output_directory": project.outputDirectory

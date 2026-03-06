@@ -4,13 +4,60 @@ import UserNotifications
 import CoreGraphics
 
 // MARK: - Sendable Helpers
+struct InputProbeData: Sendable {
+    let exists: Bool
+    let readable: Bool
+    let sizeBytes: Int?
+    let modifiedAtISO8601: String?
+    let inode: UInt64?
+    let volumeUUID: String?
+    let iCloudStatus: String
+}
+
+struct InputForensicRecord: Sendable {
+    let inputIndex: Int
+    let path: String
+    let pathHash: String
+    let pathBasename: String
+    var bookmarkPresent: Bool
+    var bookmarkResolveOK: Bool?
+    var bookmarkIsStale: Bool?
+    var scopeStartOK: Bool?
+    var probe: InputProbeData?
+}
+
 struct JobSubmissionData: Sendable {
     let id: UUID
+    let batchId: UUID?
+    let projectId: UUID?
     let inputURLs: [URL]       // Security-scoped URLs (already started access)
     let inputPaths: [String]
     let hasSecurityScope: Bool // Whether we need to stop access after use
     let maskImageData: Data?   // Added for inpainting
     let customPrompt: String?  // Added for individual custom prompts
+    let inputForensics: [InputForensicRecord]
+
+    init(
+        id: UUID,
+        batchId: UUID? = nil,
+        projectId: UUID? = nil,
+        inputURLs: [URL],
+        inputPaths: [String],
+        hasSecurityScope: Bool,
+        maskImageData: Data?,
+        customPrompt: String?,
+        inputForensics: [InputForensicRecord] = []
+    ) {
+        self.id = id
+        self.batchId = batchId
+        self.projectId = projectId
+        self.inputURLs = inputURLs
+        self.inputPaths = inputPaths
+        self.hasSecurityScope = hasSecurityScope
+        self.maskImageData = maskImageData
+        self.customPrompt = customPrompt
+        self.inputForensics = inputForensics
+    }
 }
 
 struct BatchSettings: Sendable {
@@ -87,18 +134,84 @@ private enum RegionEditPipelineError: LocalizedError {
     }
 }
 
+private enum FailureClassification: String, Codable {
+    case permissionDenied = "permission_denied"
+    case bookmarkResolveFailed = "bookmark_resolve_failed"
+    case bookmarkStale = "bookmark_stale"
+    case fileMissing = "file_missing"
+    case fileUnreadable = "file_unreadable"
+    case payloadLimitExceeded = "payload_limit_exceeded"
+    case unknown = "unknown"
+}
+
+private struct FailureSnapshotInput: Codable {
+    struct BookmarkState: Codable {
+        let present: Bool
+        let resolveOK: Bool?
+        let isStale: Bool?
+    }
+
+    struct ScopeState: Codable {
+        let startOK: Bool?
+        let stopCalled: Bool
+    }
+
+    struct ProbeState: Codable {
+        let exists: Bool
+        let readable: Bool
+        let sizeBytes: Int?
+        let modifiedAtISO8601: String?
+        let inode: UInt64?
+        let volumeUUID: String?
+        let iCloudStatus: String
+    }
+
+    let inputIndex: Int
+    let pathHash: String
+    let pathBasename: String
+    let bookmark: BookmarkState
+    let scope: ScopeState
+    let probe: ProbeState?
+}
+
+private struct FailureSnapshot: Codable {
+    struct SnapshotError: Codable {
+        let classifiedAs: FailureClassification
+        let message: String
+        let errorDomain: String
+        let errorCode: Int
+        let underlyingErrorDomain: String?
+        let underlyingErrorCode: Int?
+    }
+
+    let schemaVersion: Int
+    let createdAt: Date
+    let launchId: String
+    let sessionId: String
+    let projectId: String
+    let batchId: String
+    let taskId: String
+    let jobId: String
+    let model: String
+    let batchTier: Bool
+    let submitMode: String
+    let payloadEstimateBytes: Int?
+    let payloadLimitBytes: Int
+    let error: SnapshotError
+    let inputs: [FailureSnapshotInput]
+}
+
+private struct ResolvedOutputScope {
+    let directoryURL: URL
+    let requiresStopAccess: Bool
+}
+
 /// Orchestrates batch processing of image editing tasks
 @Observable
 @MainActor
 final class BatchOrchestrator {
-    // Temporary rollout flag for permission hardening (Phase 1).
-    private let strictPermissionEnforcement: Bool = {
-#if DEBUG
-        true
-#else
-        true
-#endif
-    }()
+    // Permission hardening is always enforced (rollout complete).
+    private let strictPermissionEnforcement = true
 
     private enum RunState {
         case idle
@@ -112,20 +225,20 @@ final class BatchOrchestrator {
 
     // Computed views over activeBatches
     var pendingJobs: [ImageTask] {
-        activeBatches.flatMap { $0.tasks.filter { $0.status == "pending" } }
+        activeBatches.flatMap { $0.tasks.filter { $0.status == .pending } }
     }
     var processingJobs: [ImageTask] {
-        activeBatches.flatMap { $0.tasks.filter { $0.status == "processing" } }
+        activeBatches.flatMap { $0.tasks.filter { $0.status == .processing } }
     }
     var completedJobs: [ImageTask] {
-        activeBatches.flatMap { $0.tasks.filter { $0.status == "completed" } }
+        activeBatches.flatMap { $0.tasks.filter { $0.status == .completed } }
     }
     var failedJobs: [ImageTask] {
-        activeBatches.flatMap { $0.tasks.filter { $0.status == "failed" } }
+        activeBatches.flatMap { $0.tasks.filter { $0.status == .failed } }
     }
     
     var isRunning: Bool {
-        !isPaused && !activeBatches.filter { $0.status == "processing" }.isEmpty
+        !isPaused && !activeBatches.filter { $0.status == .processing }.isEmpty
     }
     var isPaused: Bool {
         runState == .pausing || runState == .paused
@@ -135,7 +248,14 @@ final class BatchOrchestrator {
     
     private var activeBatches: [BatchJob] = []
     private let service = NanoBananaService()
+    private let securityScopedPathing: any SecurityScopedPathing
     private let concurrencyLimit = 5 // Paid tier: safe default for concurrent submissions
+    private let sessionID = UUID().uuidString
+    private let forensicDateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
     private var runState: RunState = .idle
     private var batchRunnerTasks: [UUID: Task<Void, Never>] = [:]
     private var pollTasks: [UUID: Task<Void, Never>] = [:]
@@ -149,7 +269,9 @@ final class BatchOrchestrator {
     
     private let activeBatchURL = AppPaths.activeBatchURL
 
-    init() {
+    @MainActor
+    init(securityScopedPathing: any SecurityScopedPathing = LiveSecurityScopedPathing()) {
+        self.securityScopedPathing = securityScopedPathing
         loadActiveBatches()
         sanitizeRestoredBatchesForAccess()
         refreshRunStateFromBatches()
@@ -166,7 +288,7 @@ final class BatchOrchestrator {
         let bookmarkCount = batch.tasks.reduce(0) { $0 + ($1.inputBookmarks?.count ?? 0) }
         let scopeRequiredCount = batch.tasks
             .flatMap(\.inputPaths)
-            .filter { AppPaths.requiresSecurityScope(path: $0) }
+            .filter { securityScopedPathing.requiresSecurityScope(path: $0) }
             .count
         let sourceMode: String
         if inputCount == 0 {
@@ -207,11 +329,11 @@ final class BatchOrchestrator {
     
     /// Start or resume batch processing
     func start(batch: BatchJob) async {
-        guard batch.status != "completed" && batch.status != "cancelled" else { return }
+        guard batch.status != .completed && batch.status != .cancelled else { return }
         guard runState != .cancelling else { return }
         DebugLog.info("batch.start", "Starting batch", metadata: [
             "batch_id": batch.id.uuidString,
-            "status": batch.status,
+            "status": batch.status.rawValue,
             "tasks": String(batch.tasks.count)
         ])
         
@@ -221,7 +343,7 @@ final class BatchOrchestrator {
         }
         
         runState = .running
-        batch.status = "processing"
+        batch.status = .processing
         statusMessage = "Processing \(activeBatches.count) batches..."
         
         await processQueue(batch: batch)
@@ -234,7 +356,7 @@ final class BatchOrchestrator {
         }
 
         var runners: [Task<Void, Never>] = []
-        for batch in activeBatches where batch.status == "pending" || batch.status == "processing" || batch.status == "paused" {
+        for batch in activeBatches where batch.status == .pending || batch.status == .processing || batch.status == .paused {
             if let runner = launchBatchRunner(for: batch) {
                 runners.append(runner)
             }
@@ -251,7 +373,7 @@ final class BatchOrchestrator {
     func pause() {
         guard runState != .paused && runState != .pausing else { return }
         guard runState != .cancelling else { return }
-        guard activeBatches.contains(where: { $0.status == "processing" }) || !pollTasks.isEmpty else { return }
+        guard activeBatches.contains(where: { $0.status == .processing }) || !pollTasks.isEmpty else { return }
 
         runState = .pausing
         statusMessage = "Pausing..."
@@ -284,13 +406,13 @@ final class BatchOrchestrator {
     }
     
     func cancel(batch: BatchJob) {
-        batch.status = "cancelled"
+        batch.status = .cancelled
         
         // Move all pending/processing to failed and cancel on API side
-        let jobsToCancel = batch.tasks.filter { $0.status == "processing" || $0.status == "pending" || $0.status == "submitting" }
+        let jobsToCancel = batch.tasks.filter { $0.status == .processing || $0.status == .pending || $0.status == .submitting }
         
         for job in jobsToCancel {
-            job.status = "failed"
+            job.status = .failed
             job.phase = .failed
             job.error = "Cancelled by user"
             
@@ -318,9 +440,11 @@ final class BatchOrchestrator {
             }
         }
         
-        // Cancel API jobs in background — capture names (strings) not ImageTask references
+        // Fix #2: Cancel API jobs in background — capture service explicitly to avoid implicit
+        // main-actor capture; store task to give ARC a chance to keep it alive until completion.
         let namesToCancel = jobsToCancel.compactMap { $0.externalJobName }
-        Task {
+        let service = self.service
+        Task.detached {
             for jobName in namesToCancel {
                 try? await service.cancelBatchJob(jobName: jobName)
             }
@@ -345,7 +469,9 @@ final class BatchOrchestrator {
     
     /// Remove failed tasks at specific indices
     func removeFailedTasks(at offsets: IndexSet) {
-        let tasksToRemove = offsets.map { failedJobs[$0] }
+        // Fix #4: snapshot the collection before mutating to avoid stale index reads.
+        let snapshot = failedJobs
+        let tasksToRemove = offsets.map { snapshot[$0] }
         for task in tasksToRemove {
              if let batchIndex = activeBatches.firstIndex(where: { $0.tasks.contains(where: { $0.id == task.id }) }) {
                  activeBatches[batchIndex].tasks.removeAll(where: { $0.id == task.id })
@@ -360,7 +486,9 @@ final class BatchOrchestrator {
     
     /// Remove completed tasks at specific indices
     func removeCompletedTasks(at offsets: IndexSet) {
-        let tasksToRemove = offsets.map { completedJobs[$0] }
+        // Fix #4: snapshot the collection before mutating to avoid stale index reads.
+        let snapshot = completedJobs
+        let tasksToRemove = offsets.map { snapshot[$0] }
         for task in tasksToRemove {
              if let batchIndex = activeBatches.firstIndex(where: { $0.tasks.contains(where: { $0.id == task.id }) }) {
                  activeBatches[batchIndex].tasks.removeAll(where: { $0.id == task.id })
@@ -375,7 +503,9 @@ final class BatchOrchestrator {
     
     /// Remove pending tasks at specific indices
     func removePendingTasks(at offsets: IndexSet) {
-        let tasksToRemove = offsets.map { pendingJobs[$0] }
+        // Fix #4: snapshot the collection before mutating to avoid stale index reads.
+        let snapshot = pendingJobs
+        let tasksToRemove = offsets.map { snapshot[$0] }
         for task in tasksToRemove {
              if let batchIndex = activeBatches.firstIndex(where: { $0.tasks.contains(where: { $0.id == task.id }) }) {
                  activeBatches[batchIndex].tasks.removeAll(where: { $0.id == task.id })
@@ -391,7 +521,7 @@ final class BatchOrchestrator {
     /// Check if there are interrupted jobs that need resuming
     var hasInterruptedJobs: Bool {
         activeBatches.contains { batch in
-            batch.tasks.contains { $0.externalJobName != nil && ($0.phase == .polling || $0.phase == .reconnecting) } && batch.status != "processing"
+            batch.tasks.contains { $0.externalJobName != nil && ($0.phase == .polling || $0.phase == .reconnecting) } && batch.status != .processing
         }
     }
     
@@ -403,13 +533,9 @@ final class BatchOrchestrator {
         runState == .pausing || runState == .paused
     }
 
-    private var isPauseRequested: Bool {
-        runState == .pausing || runState == .paused
-    }
-
     @discardableResult
     private func launchBatchRunner(for batch: BatchJob) -> Task<Void, Never>? {
-        guard batch.status != "completed" && batch.status != "cancelled" else { return nil }
+        guard batch.status != .completed && batch.status != .cancelled else { return nil }
         guard runState != .pausing && runState != .paused && runState != .cancelling else { return nil }
         if let existing = batchRunnerTasks[batch.id], !existing.isCancelled {
             return existing
@@ -444,8 +570,8 @@ final class BatchOrchestrator {
     }
 
     private func markProcessingBatchesAsPaused() {
-        for batch in activeBatches where batch.status == "processing" {
-            batch.status = "paused"
+        for batch in activeBatches where batch.status == .processing {
+            batch.status = .paused
         }
     }
 
@@ -459,7 +585,7 @@ final class BatchOrchestrator {
 
     private func markPollJobInterrupted(jobId: UUID) {
         if let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == jobId }),
-           job.status == "processing" {
+           job.status == .processing {
             job.phase = .reconnecting
         }
     }
@@ -467,10 +593,10 @@ final class BatchOrchestrator {
     private func refreshRunStateFromBatches() {
         guard runState != .cancelling else { return }
 
-        let hasProcessing = activeBatches.contains { $0.status == "processing" }
-        let hasPaused = activeBatches.contains { $0.status == "paused" }
+        let hasProcessing = activeBatches.contains { $0.status == .processing }
+        let hasPaused = activeBatches.contains { $0.status == .paused }
 
-        if isPauseRequested {
+        if shouldPauseProcessing {
             if hasProcessing {
                 runState = .pausing
             } else if hasPaused {
@@ -492,16 +618,16 @@ final class BatchOrchestrator {
 
     @discardableResult
     private func finalizeBatchStatusIfFinished(_ batch: BatchJob) -> Bool {
-        guard !batch.tasks.contains(where: { $0.status == "processing" || $0.status == "pending" }) else {
+        guard !batch.tasks.contains(where: { $0.status == .processing || $0.status == .pending }) else {
             return false
         }
 
-        if batch.tasks.contains(where: { $0.status == "failed" }) {
-            batch.status = "failed"
+        if batch.tasks.contains(where: { $0.status == .failed }) {
+            batch.status = .failed
             statusMessage = "Completed with errors"
         } else {
-            batch.status = "completed"
-            let count = batch.tasks.filter { $0.status == "completed" }.count
+            batch.status = .completed
+            let count = batch.tasks.filter { $0.status == .completed }.count
             statusMessage = "Completed: \(count) output images"
         }
 
@@ -520,9 +646,9 @@ final class BatchOrchestrator {
         }
 
         // 1. Queue all pending jobs in THIS batch to Processing immediately
-        let jobsToSubmit = batch.tasks.filter { $0.status == "pending" }
+        let jobsToSubmit = batch.tasks.filter { $0.status == .pending }
         for job in jobsToSubmit {
-             job.status = "processing"
+             job.status = .processing
         }
         updateProgress()
         
@@ -540,6 +666,59 @@ final class BatchOrchestrator {
             projectId: batch.projectId
         )
 
+        // Resolve output directory scope ONCE for the entire batch runtime
+        let resolvedOutput: ResolvedOutputScope
+        let batchBaseMeta = forensicMetadata(
+            batchId: batch.id,
+            projectId: batch.projectId,
+            taskId: batch.tasks.first?.id ?? UUID(),
+            jobId: batch.tasks.first?.id ?? UUID()
+        )
+        if let bookmark = batch.outputDirectoryBookmark {
+            guard let resolved = securityScopedPathing.resolveBookmarkAccess(bookmark, metadata: mergedMetadata(batchBaseMeta, [
+                "path": batch.outputDirectory
+            ])) else {
+                DebugLog.error("batch.output", "Batch output bookmark resolution failed", metadata: mergedMetadata(batchBaseMeta, [
+                    "batch_id": batch.id.uuidString,
+                    "path": batch.outputDirectory
+                ]))
+                statusMessage = "Output folder access denied. Re-select it."
+                for job in batch.tasks where job.status == .pending || job.status == .processing {
+                    job.status = .failed
+                    job.phase = .failed
+                    job.error = "Output folder access denied"
+                }
+                _ = finalizeBatchStatusIfFinished(batch)
+                return
+            }
+            resolvedOutput = ResolvedOutputScope(directoryURL: resolved.url, requiresStopAccess: true)
+            if let refreshed = resolved.refreshedBookmarkData {
+                batch.outputDirectoryBookmark = refreshed
+                if let projectId = batch.projectId {
+                    onOutputDirectoryBookmarkRefreshed?(projectId, refreshed)
+                }
+            }
+        } else if strictPermissionEnforcement && securityScopedPathing.requiresSecurityScope(path: batch.outputDirectory) {
+            statusMessage = "Output folder needs permission. Re-select it."
+            for job in batch.tasks where job.status == .pending || job.status == .processing {
+                job.status = .failed
+                job.phase = .failed
+                job.error = "Output folder requires permission"
+            }
+            _ = finalizeBatchStatusIfFinished(batch)
+            return
+        } else {
+            resolvedOutput = ResolvedOutputScope(directoryURL: URL(fileURLWithPath: batch.outputDirectory), requiresStopAccess: false)
+        }
+        defer {
+            if resolvedOutput.requiresStopAccess {
+                securityScopedPathing.stopAccessing(resolvedOutput.directoryURL, metadata: mergedMetadata(batchBaseMeta, [
+                    "batch_id": batch.id.uuidString,
+                    "event": "security.scope.stop.batch"
+                ]))
+            }
+        }
+
         var submissionDataList: [JobSubmissionData] = []
         submissionDataList.reserveCapacity(jobsToSubmit.count)
 
@@ -547,154 +726,279 @@ final class BatchOrchestrator {
             let inputPaths = job.inputPaths
             let inputCount = inputPaths.count
             let bookmarkCount = job.inputBookmarks?.count ?? 0
-            let scopeRequiredCount = inputPaths.filter { AppPaths.requiresSecurityScope(path: $0) }.count
+            let scopeRequiredCount = inputPaths.filter { securityScopedPathing.requiresSecurityScope(path: $0) }.count
             let sourceMode = inputCount == 0 ? "text_to_image" : (scopeRequiredCount == 0 ? "managed_paths" : "external_paths")
+            let baseMeta = forensicMetadata(
+                batchId: batch.id,
+                projectId: batch.projectId,
+                taskId: job.id,
+                jobId: job.id
+            )
+            var inputForensics: [InputForensicRecord] = inputPaths.enumerated().map { index, path in
+                InputForensicRecord(
+                    inputIndex: index,
+                    path: path,
+                    pathHash: securityScopedPathing.pathHash(for: path),
+                    pathBasename: securityScopedPathing.pathBasename(for: path),
+                    bookmarkPresent: false,
+                    bookmarkResolveOK: nil,
+                    bookmarkIsStale: nil,
+                    scopeStartOK: nil,
+                    probe: nil
+                )
+            }
 
             if inputCount == 0 {
-                DebugLog.debug("batch.input", "Prepared submission without source files", metadata: [
+                DebugLog.debug("batch.input", "Prepared submission without source files", metadata: mergedMetadata(baseMeta, [
                     "job_id": job.id.uuidString,
                     "input_count": "0",
                     "bookmark_count": "0",
                     "scope_required_count": "0",
                     "source_mode": sourceMode,
                     "fallback_used": "false"
-                ])
+                ]))
                 submissionDataList.append(
                     JobSubmissionData(
                         id: job.id,
+                        batchId: batch.id,
+                        projectId: batch.projectId,
                         inputURLs: [],
                         inputPaths: [],
                         hasSecurityScope: false,
                         maskImageData: job.maskImageData ?? batch.maskImageData,
-                        customPrompt: job.customPrompt
+                        customPrompt: job.customPrompt,
+                        inputForensics: []
                     )
                 )
                 continue
             }
 
             if strictPermissionEnforcement && scopeRequiredCount > 0 {
-                guard let bookmarks = job.inputBookmarks, bookmarks.count == inputCount else {
-                    let missingPath = inputPaths.first(where: { AppPaths.requiresSecurityScope(path: $0) }) ?? (inputPaths.first ?? "unknown")
-                    DebugLog.error("batch.input", "Missing input bookmark; failing before submission", metadata: [
+                let resolution = SecurityScopedInputResolver.resolve(
+                    inputPaths: inputPaths,
+                    inputBookmarks: job.inputBookmarks,
+                    pathing: securityScopedPathing,
+                    metadataForBookmark: { bookmarkIndex, expectedPath in
+                        forensicMetadata(
+                            batchId: batch.id,
+                            projectId: batch.projectId,
+                            taskId: job.id,
+                            jobId: job.id,
+                            inputIndex: bookmarkIndex,
+                            path: expectedPath
+                        )
+                    }
+                )
+
+                switch resolution {
+                case .failure(.missingBookmark(let missingPath)):
+                    if let failedIndex = inputPaths.firstIndex(where: {
+                        URL(fileURLWithPath: $0).standardizedFileURL.path == URL(fileURLWithPath: missingPath).standardizedFileURL.path
+                    }), inputForensics.indices.contains(failedIndex) {
+                        inputForensics[failedIndex].bookmarkPresent = false
+                        inputForensics[failedIndex].bookmarkResolveOK = false
+                        inputForensics[failedIndex].scopeStartOK = false
+                    }
+
+                    DebugLog.error("batch.input", "Missing input bookmark; failing before submission", metadata: mergedMetadata(baseMeta, [
                         "job_id": job.id.uuidString,
                         "input_count": String(inputCount),
                         "bookmark_count": String(bookmarkCount),
                         "scope_required_count": String(scopeRequiredCount),
                         "path": missingPath,
+                        "path_hash": securityScopedPathing.pathHash(for: missingPath),
+                        "path_basename": securityScopedPathing.pathBasename(for: missingPath),
                         "source_mode": sourceMode,
                         "fallback_used": "false"
-                    ])
+                    ]))
+
+                    let failureData = JobSubmissionData(
+                        id: job.id,
+                        batchId: batch.id,
+                        projectId: batch.projectId,
+                        inputURLs: [],
+                        inputPaths: inputPaths,
+                        hasSecurityScope: false,
+                        maskImageData: job.maskImageData ?? batch.maskImageData,
+                        customPrompt: job.customPrompt,
+                        inputForensics: inputForensics
+                    )
+
+                    await writeFailureSnapshot(
+                        for: InputFileAccessError.missingBookmark(path: missingPath),
+                        data: failureData,
+                        settings: batchSettings
+                    )
                     await handleError(
                         jobId: job.id,
-                        data: JobSubmissionData(
-                            id: job.id,
-                            inputURLs: [],
-                            inputPaths: inputPaths,
-                            hasSecurityScope: false,
-                            maskImageData: job.maskImageData ?? batch.maskImageData,
-                            customPrompt: job.customPrompt
-                        ),
+                        data: failureData,
                         settings: batchSettings,
                         error: InputFileAccessError.missingBookmark(path: missingPath)
                     )
                     continue
-                }
 
-                var resolvedURLs: [URL] = []
-                var refreshedBookmarks = bookmarks
-                var didRefreshBookmarks = false
-                var failedPath = inputPaths.first ?? "unknown"
-                var resolutionFailed = false
-
-                for (index, bookmark) in bookmarks.enumerated() {
-                    guard let resolved = AppPaths.resolveBookmarkAccess(bookmark) else {
-                        resolvedURLs.forEach { $0.stopAccessingSecurityScopedResource() }
-                        resolvedURLs = []
-                        failedPath = inputPaths.indices.contains(index) ? inputPaths[index] : failedPath
-                        resolutionFailed = true
-                        break
+                case .failure(.bookmarkAccessFailed(let failedPath)):
+                    if let failedIndex = inputPaths.firstIndex(where: {
+                        URL(fileURLWithPath: $0).standardizedFileURL.path == URL(fileURLWithPath: failedPath).standardizedFileURL.path
+                    }), inputForensics.indices.contains(failedIndex) {
+                        inputForensics[failedIndex].bookmarkPresent = true
+                        inputForensics[failedIndex].bookmarkResolveOK = false
+                        inputForensics[failedIndex].scopeStartOK = false
                     }
-                    resolvedURLs.append(resolved.url)
-                    if let refreshed = resolved.refreshedBookmarkData {
-                        refreshedBookmarks[index] = refreshed
-                        didRefreshBookmarks = true
-                    }
-                }
 
-                if didRefreshBookmarks {
-                    job.inputBookmarks = refreshedBookmarks
-                    saveActiveBatches()
-                    DebugLog.info("batch.input", "Refreshed one or more input bookmarks", metadata: [
-                        "job_id": job.id.uuidString,
-                        "input_count": String(inputCount),
-                        "bookmark_refresh_persisted": "true"
-                    ])
-                }
-
-                if resolutionFailed {
-                    DebugLog.error("batch.input", "Input bookmark resolution failed; failing before submission", metadata: [
+                    DebugLog.error("batch.input", "Input bookmark resolution failed; failing before submission", metadata: mergedMetadata(baseMeta, [
                         "job_id": job.id.uuidString,
                         "input_count": String(inputCount),
                         "bookmark_count": String(bookmarkCount),
                         "scope_required_count": String(scopeRequiredCount),
                         "path": failedPath,
+                        "path_hash": securityScopedPathing.pathHash(for: failedPath),
+                        "path_basename": securityScopedPathing.pathBasename(for: failedPath),
                         "source_mode": sourceMode,
                         "fallback_used": "false",
                         "bookmark_resolve_failed": "true"
-                    ])
+                    ]))
+
+                    let failureData = JobSubmissionData(
+                        id: job.id,
+                        batchId: batch.id,
+                        projectId: batch.projectId,
+                        inputURLs: [],
+                        inputPaths: inputPaths,
+                        hasSecurityScope: false,
+                        maskImageData: job.maskImageData ?? batch.maskImageData,
+                        customPrompt: job.customPrompt,
+                        inputForensics: inputForensics
+                    )
+
+                    await writeFailureSnapshot(
+                        for: InputFileAccessError.bookmarkAccessFailed(path: failedPath),
+                        data: failureData,
+                        settings: batchSettings
+                    )
                     await handleError(
                         jobId: job.id,
-                        data: JobSubmissionData(
-                            id: job.id,
-                            inputURLs: [],
-                            inputPaths: inputPaths,
-                            hasSecurityScope: false,
-                            maskImageData: job.maskImageData ?? batch.maskImageData,
-                            customPrompt: job.customPrompt
-                        ),
+                        data: failureData,
                         settings: batchSettings,
                         error: InputFileAccessError.bookmarkAccessFailed(path: failedPath)
                     )
                     continue
-                }
 
-                DebugLog.debug("batch.input", "Prepared submission with security-scoped inputs", metadata: [
+                case .success(let resolvedInputs):
+                    if let bookmarks = job.inputBookmarks {
+                        let refreshedBookmarks = resolvedInputs.applyingRefreshes(to: bookmarks)
+                        if refreshedBookmarks != bookmarks {
+                            job.inputBookmarks = refreshedBookmarks
+                            saveActiveBatches()
+                            DebugLog.info("batch.input", "Refreshed one or more input bookmarks", metadata: mergedMetadata(baseMeta, [
+                                "job_id": job.id.uuidString,
+                                "input_count": String(inputCount),
+                                "bookmark_refresh_persisted": "true"
+                            ]))
+                        }
+                    }
+
+                    for (index, path) in inputPaths.enumerated() {
+                        if let bookmarkIndex = resolvedInputs.bookmarkIndexByInputIndex[index] {
+                            inputForensics[index].bookmarkPresent = true
+                            inputForensics[index].bookmarkResolveOK = true
+                            inputForensics[index].bookmarkIsStale = resolvedInputs.staleByInputIndex[index]
+                            inputForensics[index].scopeStartOK = true
+                            let probe = probeInputFile(url: resolvedInputs.inputURLs[index])
+                            inputForensics[index].probe = probe
+                            logInputProbe(
+                                probe,
+                                metadata: forensicMetadata(
+                                    batchId: batch.id,
+                                    projectId: batch.projectId,
+                                    taskId: job.id,
+                                    jobId: job.id,
+                                    inputIndex: bookmarkIndex,
+                                    path: path
+                                )
+                            )
+                        } else {
+                            inputForensics[index].bookmarkPresent = false
+                            let url = URL(fileURLWithPath: path)
+                            let probe = probeInputFile(url: url)
+                            inputForensics[index].probe = probe
+                            logInputProbe(
+                                probe,
+                                metadata: forensicMetadata(
+                                    batchId: batch.id,
+                                    projectId: batch.projectId,
+                                    taskId: job.id,
+                                    jobId: job.id,
+                                    inputIndex: index,
+                                    path: path
+                                )
+                            )
+                        }
+                    }
+
+                    DebugLog.debug("batch.input", "Prepared submission with security-scoped inputs", metadata: mergedMetadata(baseMeta, [
                     "job_id": job.id.uuidString,
                     "input_count": String(inputCount),
                     "bookmark_count": String(bookmarkCount),
                     "scope_required_count": String(scopeRequiredCount),
                     "source_mode": sourceMode,
                     "fallback_used": "false"
-                ])
-                submissionDataList.append(
-                    JobSubmissionData(
-                        id: job.id,
-                        inputURLs: resolvedURLs,
-                        inputPaths: inputPaths,
-                        hasSecurityScope: true,
-                        maskImageData: job.maskImageData ?? batch.maskImageData,
-                        customPrompt: job.customPrompt
+                ]))
+                    submissionDataList.append(
+                        JobSubmissionData(
+                            id: job.id,
+                            batchId: batch.id,
+                            projectId: batch.projectId,
+                            inputURLs: resolvedInputs.inputURLs,
+                            inputPaths: inputPaths,
+                            hasSecurityScope: !resolvedInputs.scopedInputIndices.isEmpty,
+                            maskImageData: job.maskImageData ?? batch.maskImageData,
+                            customPrompt: job.customPrompt,
+                            inputForensics: inputForensics
+                        )
                     )
-                )
-                continue
+                    continue
+                }
             }
 
-            DebugLog.debug("batch.input", "Prepared submission with managed plain-path inputs", metadata: [
+            for (index, path) in inputPaths.enumerated() {
+                let url = URL(fileURLWithPath: path)
+                let probe = probeInputFile(url: url)
+                if inputForensics.indices.contains(index) {
+                    inputForensics[index].probe = probe
+                }
+                logInputProbe(
+                    probe,
+                    metadata: forensicMetadata(
+                        batchId: batch.id,
+                        projectId: batch.projectId,
+                        taskId: job.id,
+                        jobId: job.id,
+                        inputIndex: index,
+                        path: path
+                    )
+                )
+            }
+
+            DebugLog.debug("batch.input", "Prepared submission with managed plain-path inputs", metadata: mergedMetadata(baseMeta, [
                 "job_id": job.id.uuidString,
                 "input_count": String(inputCount),
                 "bookmark_count": String(bookmarkCount),
                 "scope_required_count": String(scopeRequiredCount),
                 "source_mode": sourceMode,
                 "fallback_used": "false"
-            ])
+            ]))
             submissionDataList.append(
                 JobSubmissionData(
                     id: job.id,
+                    batchId: batch.id,
+                    projectId: batch.projectId,
                     inputURLs: inputPaths.map { URL(fileURLWithPath: $0) },
                     inputPaths: inputPaths,
                     hasSecurityScope: false,
                     maskImageData: job.maskImageData ?? batch.maskImageData,
-                    customPrompt: job.customPrompt
+                    customPrompt: job.customPrompt,
+                    inputForensics: inputForensics
                 )
             )
         }
@@ -709,7 +1013,7 @@ final class BatchOrchestrator {
                     inFlight -= 1
                 }
                 group.addTask {
-                    await self.performSubmission(data: data, settings: batchSettings)
+                    await self.performSubmission(data: data, settings: batchSettings, resolvedOutputDirectory: resolvedOutput.directoryURL)
                 }
                 inFlight += 1
             }
@@ -734,7 +1038,7 @@ final class BatchOrchestrator {
         
         // 3. Poll all successfully submitted jobs concurrently
         statusMessage = "Polling batch jobs..."
-        let validJobs = batch.tasks.filter { $0.externalJobName != nil && $0.phase != .failed && $0.status == "processing" }
+        let validJobs = batch.tasks.filter { $0.externalJobName != nil && $0.phase != .failed && $0.status == .processing }
         let validJobsData: [(UUID, String)] = validJobs.compactMap {
             guard let name = $0.externalJobName else { return nil }
             return ($0.id, name)
@@ -748,7 +1052,7 @@ final class BatchOrchestrator {
             }
             let worker = Task { [weak self] in
                 guard let self else { return }
-                await self.performPoll(jobId: id, jobName: name, settings: batchSettings, recovering: false)
+                await self.performPoll(jobId: id, jobName: name, settings: batchSettings, recovering: false, resolvedOutputDirectory: resolvedOutput.directoryURL)
             }
             pollTasks[id] = worker
             workers.append((jobId: id, task: worker))
@@ -779,19 +1083,25 @@ final class BatchOrchestrator {
     
     // MARK: - Task Workers
     
-    private func performSubmission(data: JobSubmissionData, settings: BatchSettings) async {
+    private func performSubmission(data: JobSubmissionData, settings: BatchSettings, resolvedOutputDirectory: URL) async {
         let inputCount = data.inputPaths.count
-        let scopeRequiredCount = data.inputPaths.filter { AppPaths.requiresSecurityScope(path: $0) }.count
+        let scopeRequiredCount = data.inputPaths.filter { securityScopedPathing.requiresSecurityScope(path: $0) }.count
         let bookmarkCount = activeBatches.lazy
             .flatMap({ $0.tasks })
             .first(where: { $0.id == data.id })?
             .inputBookmarks?
             .count ?? 0
         let sourceMode = inputCount == 0 ? "text_to_image" : (scopeRequiredCount == 0 ? "managed_paths" : "external_paths")
+        let baseMeta = forensicMetadata(
+            batchId: data.batchId,
+            projectId: data.projectId ?? settings.projectId,
+            taskId: data.id,
+            jobId: data.id
+        )
 
         await MainActor.run {
             if let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == data.id }) {
-                job.status = "processing"
+                job.status = .processing
                 job.phase = .submitting
                 job.startedAt = Date()
             }
@@ -814,14 +1124,24 @@ final class BatchOrchestrator {
         if let maskImageData = data.maskImageData {
             guard data.inputURLs.count == 1 else {
                 if data.hasSecurityScope {
-                    data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+                    stopInputSecurityScopeAccess(data: data)
                 }
                 await handleError(jobId: data.id, data: data, settings: settings, error: RegionEditPipelineError.requiresSingleInput)
                 return
             }
 
             do {
-                let sourceImageData = try Data(contentsOf: data.inputURLs[0])
+                // Fix #6: move synchronous file I/O off the main actor.
+                let inputURL = data.inputURLs[0]
+                let sourceImageData = try await Task.detached(priority: .userInitiated) {
+                    try Data(contentsOf: inputURL)
+                }.value
+                
+                // Cache for post-poll compositing
+                if let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == data.id }) {
+                    job.cachedSourceImageData = sourceImageData
+                }
+                
                 let preparation = try await MainActor.run {
                     try RegionEditProcessor.prepareCrop(
                         sourceImageData: sourceImageData,
@@ -843,12 +1163,15 @@ final class BatchOrchestrator {
                 let cropURL = FileManager.default.temporaryDirectory
                     .appendingPathComponent("region-edit-\(data.id.uuidString)")
                     .appendingPathExtension("png")
-                try preparation.croppedImageData.write(to: cropURL, options: .atomic)
+                let croppedData = preparation.croppedImageData
+                try await Task.detached(priority: .userInitiated) {
+                    try croppedData.write(to: cropURL, options: .atomic)
+                }.value
                 requestInputURLs = [cropURL]
                 tempCropURL = cropURL
             } catch {
                 if data.hasSecurityScope {
-                    data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+                    stopInputSecurityScopeAccess(data: data)
                 }
                 await handleError(jobId: data.id, data: data, settings: settings, error: error)
                 return
@@ -869,7 +1192,7 @@ final class BatchOrchestrator {
         do {
             if settings.useBatchTier {
                 let jobInfo = try await service.startBatchJob(request: request)
-                DebugLog.info("batch.submit", "Batch-tier job submitted", metadata: [
+                DebugLog.info("batch.submit", "Batch-tier job submitted", metadata: mergedMetadata(baseMeta, [
                     "job_id": data.id.uuidString,
                     "remote_job": jobInfo.jobName,
                     "input_count": String(inputCount),
@@ -877,10 +1200,10 @@ final class BatchOrchestrator {
                     "scope_required_count": String(scopeRequiredCount),
                     "source_mode": sourceMode,
                     "fallback_used": "false"
-                ])
+                ]))
                 // Stop security-scoped access now that the service has read the file data
                 if data.hasSecurityScope {
-                    data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+                    stopInputSecurityScopeAccess(data: data)
                 }
                 await MainActor.run {
                      if let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == data.id }) {
@@ -909,7 +1232,7 @@ final class BatchOrchestrator {
                 saveActiveBatches()
             } else {
                 let response = try await service.editImage(request)
-                DebugLog.info("batch.submit", "Standard job completed inline", metadata: [
+                DebugLog.info("batch.submit", "Standard job completed inline", metadata: mergedMetadata(baseMeta, [
                     "job_id": data.id.uuidString,
                     "bytes": String(response.imageData.count),
                     "mime_type": response.mimeType,
@@ -918,38 +1241,54 @@ final class BatchOrchestrator {
                     "scope_required_count": String(scopeRequiredCount),
                     "source_mode": sourceMode,
                     "fallback_used": "false"
-                ])
+                ]))
                 // Stop security-scoped access now that the service has read the file data
                 if data.hasSecurityScope {
-                    data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+                    stopInputSecurityScopeAccess(data: data)
                 }
                 await handleSuccess(
                     jobId: data.id,
                     data: data,
                     settings: settings,
                     response: response,
-                    jobName: nil
+                    jobName: nil,
+                    resolvedOutputDirectory: resolvedOutputDirectory
                 )
             }
         } catch {
-            DebugLog.error("batch.submit", "Submission failed", metadata: [
+            let classification = classifyFailure(error)
+            let payloadEstimate = estimateInlinePayloadBytes(
+                for: requestInputURLs,
+                prompt: mergedPrompt,
+                systemPrompt: settings.systemPrompt
+            )
+            DebugLog.error("batch.submit", "Submission failed", metadata: mergedMetadata(baseMeta, [
                 "job_id": data.id.uuidString,
                 "error": String(describing: error),
+                "classified_as": classification.rawValue,
                 "input_count": String(inputCount),
                 "bookmark_count": String(bookmarkCount),
                 "scope_required_count": String(scopeRequiredCount),
+                "payload_estimate_bytes": payloadEstimate.map(String.init) ?? "nil",
+                "payload_limit_bytes": String(NanoBananaService.maxInlineBatchPayloadBytes),
                 "source_mode": sourceMode,
                 "fallback_used": "false"
-            ])
+            ]))
             // Always stop security-scoped access on error too
             if data.hasSecurityScope {
-                data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+                stopInputSecurityScopeAccess(data: data)
             }
+            await writeFailureSnapshot(
+                for: error,
+                data: data,
+                settings: settings,
+                payloadEstimateBytes: payloadEstimate
+            )
             await handleError(jobId: data.id, data: data, settings: settings, error: error)
         }
     }
     
-    private func performPoll(jobId: UUID, jobName: String, settings: BatchSettings, recovering: Bool) async {
+    private func performPoll(jobId: UUID, jobName: String, settings: BatchSettings, recovering: Bool, resolvedOutputDirectory: URL) async {
         do {
             let response: ImageEditResponse
             if recovering {
@@ -971,10 +1310,11 @@ final class BatchOrchestrator {
                 data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false, maskImageData: nil, customPrompt: nil),
                 settings: settings,
                 response: response,
-                jobName: jobName
+                jobName: jobName,
+                resolvedOutputDirectory: resolvedOutputDirectory
             )
         } catch is CancellationError {
-            if isPauseRequested {
+            if shouldPauseProcessing {
                 markPollJobInterrupted(jobId: jobId)
                 return
             }
@@ -990,7 +1330,7 @@ final class BatchOrchestrator {
         } catch {
             let nsError = error as NSError
             if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
-                if isPauseRequested {
+                if shouldPauseProcessing {
                     markPollJobInterrupted(jobId: jobId)
                     return
                 }
@@ -1014,73 +1354,14 @@ final class BatchOrchestrator {
         }
     }
     
-    private func handleSuccess(jobId: UUID, data: JobSubmissionData, settings: BatchSettings, response: ImageEditResponse, jobName: String?) async {
+    private func handleSuccess(jobId: UUID, data: JobSubmissionData, settings: BatchSettings, response: ImageEditResponse, jobName: String?, resolvedOutputDirectory: URL) async {
         guard let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == jobId }) else { return }
-        
-        var requiresStopAccess = false
-        var directoryURL: URL!
-        if let bookmark = settings.outputDirectoryBookmark {
-            guard let resolved = AppPaths.resolveBookmarkAccess(bookmark) else {
-                DebugLog.error("batch.output", "Output bookmark resolution failed before write", metadata: [
-                    "job_id": jobId.uuidString,
-                    "path": settings.outputDirectory,
-                    "bookmark_resolve_failed": "true"
-                ])
-                await handleError(
-                    jobId: jobId,
-                    data: data,
-                    settings: settings,
-                    error: OutputDirectoryAccessError.bookmarkAccessFailed(path: settings.outputDirectory)
-                )
-                return
-            }
-            directoryURL = resolved.url
-            requiresStopAccess = true
-            
-            if let refreshedBookmark = resolved.refreshedBookmarkData,
-               let batch = activeBatches.first(where: { $0.tasks.contains(where: { $0.id == jobId }) }) {
-                batch.outputDirectoryBookmark = refreshedBookmark
-                DebugLog.info("batch.output", "Refreshed output directory bookmark", metadata: [
-                    "job_id": jobId.uuidString,
-                    "batch_id": batch.id.uuidString
-                ])
-                if let projectId = settings.projectId {
-                    onOutputDirectoryBookmarkRefreshed?(projectId, refreshedBookmark)
-                    DebugLog.info("batch.output", "Dispatched refreshed output bookmark for persistence", metadata: [
-                        "job_id": jobId.uuidString,
-                        "project_id": projectId.uuidString,
-                        "bookmark_refresh_persisted": "callback_dispatched"
-                    ])
-                } else {
-                    DebugLog.warning("batch.output", "Output bookmark refreshed but project ID is missing", metadata: [
-                        "job_id": jobId.uuidString,
-                        "bookmark_refresh_persisted": "false"
-                    ])
-                }
-            }
-        } else {
-            if strictPermissionEnforcement && AppPaths.requiresSecurityScope(path: settings.outputDirectory) {
-                DebugLog.error("batch.output", "Missing output bookmark for external path; failing before write", metadata: [
-                    "job_id": jobId.uuidString,
-                    "path": settings.outputDirectory,
-                    "bookmark_missing": "true"
-                ])
-                await handleError(
-                    jobId: jobId,
-                    data: data,
-                    settings: settings,
-                    error: OutputDirectoryAccessError.missingBookmark(path: settings.outputDirectory)
-                )
-                return
-            }
-            directoryURL = URL(fileURLWithPath: settings.outputDirectory)
-        }
-        
-        defer {
-            if requiresStopAccess {
-                directoryURL.stopAccessingSecurityScopedResource()
-            }
-        }
+        let baseMeta = forensicMetadata(
+            batchId: data.batchId ?? batchID(for: jobId),
+            projectId: settings.projectId,
+            taskId: jobId,
+            jobId: jobId
+        )
         
         var attemptedOutputPath = settings.outputDirectory
 
@@ -1094,28 +1375,33 @@ final class BatchOrchestrator {
 
             let outputURL = generateOutputURL(
                 for: job,
-                inDirectory: directoryURL,
+                inDirectory: resolvedOutputDirectory,
                 mimeType: finalOutput.mimeType
             )
             attemptedOutputPath = outputURL.path
 
-            DebugLog.debug("batch.output", "Writing output image", metadata: [
+            DebugLog.debug("batch.output", "Writing output image", metadata: mergedMetadata(baseMeta, [
                 "job_id": jobId.uuidString,
                 "path": outputURL.path,
+                "path_hash": securityScopedPathing.pathHash(for: outputURL.path),
+                "path_basename": securityScopedPathing.pathBasename(for: outputURL.path),
                 "bytes": String(finalOutput.data.count),
                 "mime_type": finalOutput.mimeType,
                 "region_edit": String(job.maskImageData != nil)
-            ])
+            ]))
             try finalOutput.data.write(to: outputURL)
-            DebugLog.info("batch.output", "Output image write succeeded", metadata: [
+            DebugLog.info("batch.output", "Output image write succeeded", metadata: mergedMetadata(baseMeta, [
                 "job_id": jobId.uuidString,
                 "path": outputURL.path
-            ])
+            ]))
             
-            job.status = "completed"
+            job.status = .completed
             job.phase = .completed
             job.outputPath = outputURL.path
             job.completedAt = Date()
+            
+            // Clear cached source image data to free memory
+            job.cachedSourceImageData = nil
             
             let effectiveImageSize = job.regionEditProcessingImageSize ?? settings.imageSize
             let cost = settings.cost(inputCount: job.inputPaths.count, imageSizeOverride: effectiveImageSize)
@@ -1132,7 +1418,9 @@ final class BatchOrchestrator {
                 // Do NOT use job.inputURLs here — that computed property calls
                 // startAccessingSecurityScopedResource() on an already-stopped resource.
                 let sourceBookmarks = job.inputBookmarks ?? []
-                let outputBookmark = AppPaths.bookmark(for: outputURL)
+                let outputBookmark = securityScopedPathing.bookmark(for: outputURL, metadata: mergedMetadata(baseMeta, [
+                    "event": "security.bookmark.create.output"
+                ]))
                 
                 let historyEntry = HistoryEntry(
                     projectId: projectId,
@@ -1165,26 +1453,33 @@ final class BatchOrchestrator {
             saveActiveBatches()
             updateProgress()
         } catch {
-            DebugLog.error("batch.output", "Output image write failed", metadata: [
+            DebugLog.error("batch.output", "Output image write failed", metadata: mergedMetadata(baseMeta, [
                 "job_id": jobId.uuidString,
                 "path": attemptedOutputPath,
                 "error": String(describing: error)
-            ])
+            ]))
             await handleError(jobId: jobId, data: data, settings: settings, error: error)
         }
     }
     
     private func handleError(jobId: UUID, data: JobSubmissionData, settings: BatchSettings, error: Error) async {
         guard let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == jobId }) else { return }
+        let classification = classifyFailure(error)
         
-        job.status = "failed"
+        job.status = .failed
         job.phase = .failed
         job.error = error.localizedDescription
-        DebugLog.error("batch.error", "Job marked failed", metadata: [
+        DebugLog.error("batch.error", "Job marked failed", metadata: mergedMetadata(forensicMetadata(
+            batchId: data.batchId ?? batchID(for: jobId),
+            projectId: settings.projectId,
+            taskId: jobId,
+            jobId: jobId
+        ), [
             "job_id": jobId.uuidString,
             "project_id": settings.projectId?.uuidString ?? "nil",
-            "error": error.localizedDescription
-        ])
+            "error": error.localizedDescription,
+            "classified_as": classification.rawValue
+        ]))
         
         if let projectId = settings.projectId {
             let historyEntry = HistoryEntry(
@@ -1217,6 +1512,315 @@ final class BatchOrchestrator {
         updateProgress()
     }
 
+    private func mergedMetadata(_ lhs: [String: String], _ rhs: [String: String]) -> [String: String] {
+        lhs.merging(rhs) { _, new in new }
+    }
+
+    private func batchID(for jobId: UUID) -> UUID? {
+        activeBatches.first(where: { $0.tasks.contains(where: { $0.id == jobId }) })?.id
+    }
+
+    private func forensicMetadata(
+        batchId: UUID?,
+        projectId: UUID?,
+        taskId: UUID,
+        jobId: UUID,
+        inputIndex: Int? = nil,
+        path: String? = nil
+    ) -> [String: String] {
+        var metadata: [String: String] = [
+            "launch_id": securityScopedPathing.launchID,
+            "session_id": sessionID,
+            "job_id": jobId.uuidString,
+            "task_id": taskId.uuidString
+        ]
+        if let batchId {
+            metadata["batch_id"] = batchId.uuidString
+        }
+        if let projectId {
+            metadata["project_id"] = projectId.uuidString
+        }
+        if let inputIndex {
+            metadata["input_index"] = String(inputIndex)
+        }
+        if let path {
+            metadata["path"] = path
+            metadata["path_hash"] = securityScopedPathing.pathHash(for: path)
+            metadata["path_basename"] = securityScopedPathing.pathBasename(for: path)
+        }
+        return metadata
+    }
+
+    private func stopInputSecurityScopeAccess(data: JobSubmissionData) {
+        var stoppedPaths = Set<String>()
+        for (index, url) in data.inputURLs.enumerated() {
+            let path = data.inputPaths.indices.contains(index) ? data.inputPaths[index] : url.path
+            guard securityScopedPathing.requiresSecurityScope(path: path) else { continue }
+            let normalizedPath = URL(fileURLWithPath: path).standardizedFileURL.path
+            guard stoppedPaths.insert(normalizedPath).inserted else { continue }
+            securityScopedPathing.stopAccessing(
+                url,
+                metadata: forensicMetadata(
+                    batchId: data.batchId ?? batchID(for: data.id),
+                    projectId: data.projectId,
+                    taskId: data.id,
+                    jobId: data.id,
+                    inputIndex: index,
+                    path: path
+                )
+            )
+        }
+    }
+
+    private func firstMissingScopeRequiredPath(inputPaths: [String], inputBookmarks: [Data]?) -> String? {
+        let requiredPaths = inputPaths.filter { securityScopedPathing.requiresSecurityScope(path: $0) }
+        guard !requiredPaths.isEmpty else { return nil }
+        guard let inputBookmarks, !inputBookmarks.isEmpty else { return requiredPaths.first }
+
+        var resolvedPaths = Set<String>()
+        for (bookmarkIndex, bookmarkData) in inputBookmarks.enumerated() {
+            if let resolvedPath = securityScopedPathing.resolveBookmarkToPath(bookmarkData) {
+                let normalized = URL(fileURLWithPath: resolvedPath).standardizedFileURL.path
+                resolvedPaths.insert(normalized)
+                continue
+            }
+
+            if inputPaths.indices.contains(bookmarkIndex),
+               securityScopedPathing.requiresSecurityScope(path: inputPaths[bookmarkIndex]) {
+                return inputPaths[bookmarkIndex]
+            }
+        }
+
+        return requiredPaths.first { requiredPath in
+            let normalized = URL(fileURLWithPath: requiredPath).standardizedFileURL.path
+            return resolvedPaths.contains(normalized) == false
+        }
+    }
+
+    private func probeInputFile(url: URL) -> InputProbeData {
+        let path = url.path
+        let fileManager = FileManager.default
+        let exists = fileManager.fileExists(atPath: path)
+        let readable = fileManager.isReadableFile(atPath: path)
+        guard exists else {
+            return InputProbeData(
+                exists: false,
+                readable: readable,
+                sizeBytes: nil,
+                modifiedAtISO8601: nil,
+                inode: nil,
+                volumeUUID: nil,
+                iCloudStatus: "unknown"
+            )
+        }
+
+        let attributes = try? fileManager.attributesOfItem(atPath: path)
+        let sizeBytes = (attributes?[.size] as? NSNumber)?.intValue
+        let modified = (attributes?[.modificationDate] as? Date).map { forensicDateFormatter.string(from: $0) }
+        let inode = (attributes?[.systemFileNumber] as? NSNumber).map { UInt64(truncating: $0) }
+        let resourceValues = try? url.resourceValues(forKeys: [
+            .volumeUUIDStringKey,
+            .isUbiquitousItemKey,
+            .ubiquitousItemDownloadingStatusKey
+        ])
+        let iCloudStatus: String
+        if resourceValues?.isUbiquitousItem == true {
+            iCloudStatus = resourceValues?.ubiquitousItemDownloadingStatus?.rawValue ?? "unknown"
+        } else if resourceValues?.isUbiquitousItem == false {
+            iCloudStatus = "not_ubiquitous"
+        } else {
+            iCloudStatus = "unknown"
+        }
+
+        return InputProbeData(
+            exists: exists,
+            readable: readable,
+            sizeBytes: sizeBytes,
+            modifiedAtISO8601: modified,
+            inode: inode,
+            volumeUUID: resourceValues?.volumeUUIDString,
+            iCloudStatus: iCloudStatus
+        )
+    }
+
+    private func logInputProbe(_ probe: InputProbeData, metadata: [String: String]) {
+        DebugLog.debug("security.input", "Input file probe", metadata: mergedMetadata(metadata, [
+            "event": "security.input.probe",
+            "exists": String(probe.exists),
+            "readable": String(probe.readable),
+            "size_bytes": probe.sizeBytes.map(String.init) ?? "nil",
+            "modified_at": probe.modifiedAtISO8601 ?? "nil",
+            "inode": probe.inode.map(String.init) ?? "nil",
+            "volume_uuid": probe.volumeUUID ?? "nil",
+            "icloud_status": probe.iCloudStatus
+        ]))
+    }
+
+    private func classifyFailure(_ error: Error) -> FailureClassification {
+        let message = error.localizedDescription.lowercased()
+        let nsError = error as NSError
+        let nsCode = nsError.code
+        let nsDomain = nsError.domain
+
+        if message.contains("exceeds the 20mb limit") || message.contains("payload") {
+            return .payloadLimitExceeded
+        }
+        if nsDomain == NSCocoaErrorDomain && nsCode == 257 {
+            return .permissionDenied
+        }
+        if nsDomain == NSCocoaErrorDomain && nsCode == 256 {
+            return .bookmarkResolveFailed
+        }
+        if nsDomain == NSPOSIXErrorDomain && (nsCode == 1 || nsCode == 13) {
+            return .permissionDenied
+        }
+        if nsDomain == NSCocoaErrorDomain && nsCode == NSFileNoSuchFileError {
+            return .fileMissing
+        }
+        if message.contains("stale bookmark") {
+            return .bookmarkStale
+        }
+        if message.contains("cannot access the source image") || message.contains("permission") || message.contains("don't have permission") {
+            return .permissionDenied
+        }
+        if message.contains("could not be loaded") || message.contains("unreadable") {
+            return .fileUnreadable
+        }
+        return .unknown
+    }
+
+    private func estimateInlinePayloadBytes(for urls: [URL], prompt: String, systemPrompt: String?) -> Int? {
+        guard !urls.isEmpty else { return nil }
+        var rawBytes = 0
+        for url in urls {
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  let size = attributes[.size] as? NSNumber else {
+                return nil
+            }
+            rawBytes += size.intValue
+        }
+        return NanoBananaService.estimateInlineBatchPayloadBytes(
+            rawImageBytes: rawBytes,
+            prompt: prompt,
+            systemInstruction: systemPrompt
+        )
+    }
+
+    private func writeFailureSnapshot(
+        for error: Error,
+        data: JobSubmissionData,
+        settings: BatchSettings,
+        payloadEstimateBytes: Int? = nil
+    ) async {
+        let classification = classifyFailure(error)
+        let nsError = error as NSError
+        let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+        let submitMode = settings.useBatchTier ? "batch" : "inline"
+
+        let inputForensics: [InputForensicRecord]
+        if data.inputForensics.isEmpty {
+            inputForensics = data.inputPaths.enumerated().map { index, path in
+                let probe = probeInputFile(url: URL(fileURLWithPath: path))
+                return InputForensicRecord(
+                    inputIndex: index,
+                    path: path,
+                    pathHash: securityScopedPathing.pathHash(for: path),
+                    pathBasename: securityScopedPathing.pathBasename(for: path),
+                    bookmarkPresent: false,
+                    bookmarkResolveOK: nil,
+                    bookmarkIsStale: nil,
+                    scopeStartOK: nil,
+                    probe: probe
+                )
+            }
+        } else {
+            inputForensics = data.inputForensics
+        }
+
+        let snapshotInputs: [FailureSnapshotInput] = inputForensics.sorted(by: { $0.inputIndex < $1.inputIndex }).map { record in
+            let probeState = record.probe.map {
+                FailureSnapshotInput.ProbeState(
+                    exists: $0.exists,
+                    readable: $0.readable,
+                    sizeBytes: $0.sizeBytes,
+                    modifiedAtISO8601: $0.modifiedAtISO8601,
+                    inode: $0.inode,
+                    volumeUUID: $0.volumeUUID,
+                    iCloudStatus: $0.iCloudStatus
+                )
+            }
+            return FailureSnapshotInput(
+                inputIndex: record.inputIndex,
+                pathHash: record.pathHash,
+                pathBasename: record.pathBasename,
+                bookmark: FailureSnapshotInput.BookmarkState(
+                    present: record.bookmarkPresent,
+                    resolveOK: record.bookmarkResolveOK,
+                    isStale: record.bookmarkIsStale
+                ),
+                scope: FailureSnapshotInput.ScopeState(
+                    startOK: record.scopeStartOK,
+                    stopCalled: data.hasSecurityScope
+                ),
+                probe: probeState
+            )
+        }
+
+        let snapshot = FailureSnapshot(
+            schemaVersion: 1,
+            createdAt: Date(),
+            launchId: securityScopedPathing.launchID,
+            sessionId: sessionID,
+            projectId: (data.projectId ?? settings.projectId)?.uuidString ?? "nil",
+            batchId: data.batchId?.uuidString ?? (batchID(for: data.id)?.uuidString ?? "nil"),
+            taskId: data.id.uuidString,
+            jobId: data.id.uuidString,
+            model: settings.modelName,
+            batchTier: settings.useBatchTier,
+            submitMode: submitMode,
+            payloadEstimateBytes: payloadEstimateBytes,
+            payloadLimitBytes: NanoBananaService.maxInlineBatchPayloadBytes,
+            error: FailureSnapshot.SnapshotError(
+                classifiedAs: classification,
+                message: error.localizedDescription,
+                errorDomain: nsError.domain,
+                errorCode: nsError.code,
+                underlyingErrorDomain: underlying?.domain,
+                underlyingErrorCode: underlying?.code
+            ),
+            inputs: snapshotInputs
+        )
+
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(snapshot)
+            let timestamp = forensicDateFormatter
+                .string(from: Date())
+                .replacingOccurrences(of: ":", with: "-")
+            let fileURL = AppPaths.failureSnapshotsDirectoryURL
+                .appendingPathComponent("\(snapshot.jobId)-\(timestamp).json")
+            try data.write(to: fileURL, options: .atomic)
+            DebugLog.info("batch.diagnostics", "Wrote failure snapshot", metadata: [
+                "event": "batch.failure_snapshot.written",
+                "launch_id": securityScopedPathing.launchID,
+                "session_id": sessionID,
+                "job_id": snapshot.jobId,
+                "path": fileURL.path,
+                "bytes": String(data.count)
+            ])
+        } catch {
+            DebugLog.error("batch.diagnostics", "Failed to write failure snapshot", metadata: [
+                "event": "batch.failure_snapshot.failed",
+                "launch_id": securityScopedPathing.launchID,
+                "session_id": sessionID,
+                "job_id": data.id.uuidString,
+                "error": String(describing: error)
+            ])
+        }
+    }
+
     private func compositeRegionEditOutput(job: ImageTask, response: ImageEditResponse) async throws -> (data: Data, mimeType: String) {
         guard job.inputPaths.count == 1 else {
             throw RegionEditPipelineError.requiresSingleInput
@@ -1241,19 +1845,32 @@ final class BatchOrchestrator {
     }
 
     private func readSingleSourceImageData(for job: ImageTask) throws -> Data {
+        // Prefer cached data (captured during submission while scope was active)
+        if let cached = job.cachedSourceImageData {
+            return cached
+        }
+        
         guard let sourcePath = job.inputPaths.first else {
             throw RegionEditPipelineError.missingSourceImage
         }
 
         if let bookmark = job.inputBookmarks?.first {
-            guard let resolved = AppPaths.resolveBookmarkAccess(bookmark) else {
+            let bookmarkMeta = forensicMetadata(
+                batchId: batchID(for: job.id),
+                projectId: job.projectId,
+                taskId: job.id,
+                jobId: job.id,
+                inputIndex: 0,
+                path: sourcePath
+            )
+            guard let resolved = securityScopedPathing.resolveBookmarkAccess(bookmark, metadata: bookmarkMeta) else {
                 throw RegionEditPipelineError.sourceBookmarkAccessFailed(path: sourcePath)
             }
-            defer { resolved.url.stopAccessingSecurityScopedResource() }
+            defer { securityScopedPathing.stopAccessing(resolved.url, metadata: bookmarkMeta) }
             return try Data(contentsOf: resolved.url)
         }
 
-        if strictPermissionEnforcement && AppPaths.requiresSecurityScope(path: sourcePath) {
+        if strictPermissionEnforcement && securityScopedPathing.requiresSecurityScope(path: sourcePath) {
             throw RegionEditPipelineError.sourceBookmarkAccessFailed(path: sourcePath)
         }
 
@@ -1339,7 +1956,7 @@ final class BatchOrchestrator {
     private func updateProgress() {
         let allTasks = activeBatches.flatMap { $0.tasks }
         let total = allTasks.count
-        let completed = allTasks.filter { $0.status == "completed" || $0.status == "failed" }.count
+        let completed = allTasks.filter { $0.status == .completed || $0.status == .failed }.count
         
         if total > 0 {
             currentProgress = Double(completed) / Double(total)
@@ -1386,12 +2003,12 @@ final class BatchOrchestrator {
         var didMutate = false
 
         for batch in activeBatches {
-            let outputRequiresScope = strictPermissionEnforcement && AppPaths.requiresSecurityScope(path: batch.outputDirectory)
+            let outputRequiresScope = strictPermissionEnforcement && securityScopedPathing.requiresSecurityScope(path: batch.outputDirectory)
             let outputMissingBookmark = outputRequiresScope && batch.outputDirectoryBookmark == nil
 
             for task in batch.tasks {
                 // Leave terminal tasks untouched.
-                if task.status == "completed" || task.status == "cancelled" || task.status == "failed" {
+                if task.status == .completed || task.status == .cancelled || task.status == .failed {
                     valid += 1
                     continue
                 }
@@ -1399,10 +2016,10 @@ final class BatchOrchestrator {
                 var validationError: Error?
 
                 if !task.inputPaths.isEmpty {
-                    let scopeRequiredCount = task.inputPaths.filter { AppPaths.requiresSecurityScope(path: $0) }.count
-                    let bookmarkCount = task.inputBookmarks?.count ?? 0
-                    if strictPermissionEnforcement && scopeRequiredCount > 0 && bookmarkCount != task.inputPaths.count {
-                        let missingPath = task.inputPaths.first(where: { AppPaths.requiresSecurityScope(path: $0) }) ?? (task.inputPaths.first ?? "unknown")
+                    if strictPermissionEnforcement, let missingPath = firstMissingScopeRequiredPath(
+                        inputPaths: task.inputPaths,
+                        inputBookmarks: task.inputBookmarks
+                    ) {
                         validationError = InputFileAccessError.missingBookmark(path: missingPath)
                         invalidInput += 1
                     }
@@ -1414,7 +2031,7 @@ final class BatchOrchestrator {
                 }
 
                 if let validationError {
-                    task.status = "failed"
+                    task.status = .failed
                     task.phase = .failed
                     task.error = validationError.localizedDescription
                     autoFailed += 1
@@ -1424,12 +2041,12 @@ final class BatchOrchestrator {
                 }
             }
 
-            if batch.tasks.contains(where: { $0.status == "processing" || $0.status == "pending" || $0.status == "submitting" }) {
-                batch.status = "processing"
-            } else if batch.tasks.contains(where: { $0.status == "failed" }) {
-                batch.status = "failed"
-            } else if batch.tasks.allSatisfy({ $0.status == "completed" || $0.status == "cancelled" }) {
-                batch.status = "completed"
+            if batch.tasks.contains(where: { $0.status == .processing || $0.status == .pending || $0.status == .submitting }) {
+                batch.status = .processing
+            } else if batch.tasks.contains(where: { $0.status == .failed }) {
+                batch.status = .failed
+            } else if batch.tasks.allSatisfy({ $0.status == .completed || $0.status == .cancelled }) {
+                batch.status = .completed
             }
         }
 
@@ -1476,7 +2093,7 @@ final class BatchOrchestrator {
             let decoded = try decodePersistedActiveBatches(from: data)
             activeBatches = decoded.batches
             
-            if activeBatches.contains(where: { $0.status == "paused" }) {
+            if activeBatches.contains(where: { $0.status == .paused }) {
                 statusMessage = "Paused"
             } else if !processingJobs.isEmpty || !pendingJobs.isEmpty {
                 statusMessage = "Resumed sessions"
@@ -1543,9 +2160,13 @@ final class BatchOrchestrator {
              return
         }
         
-        let task = ImageTask(inputPaths: entry.sourceImagePaths, projectId: entry.projectId)
+        let task = ImageTask(
+            inputPaths: entry.sourceImagePaths,
+            projectId: entry.projectId,
+            inputBookmarks: entry.sourceImageBookmarks
+        )
         task.externalJobName = jobName
-        task.status = "processing"
+        task.status = .processing
         task.phase = .polling
         task.submittedAt = entry.timestamp 
         
@@ -1566,7 +2187,11 @@ final class BatchOrchestrator {
             aspectRatio: entry.aspectRatio,
             imageSize: entry.imageSize,
             outputDirectory: outputDir,
-            outputDirectoryBookmark: entry.outputImageBookmark,
+            // Fix #7: entry.outputImageBookmark is a file-level bookmark, not a directory
+            // bookmark. Passing it here would cause spurious permission failures when trying
+            // to write new output. Pass nil so the user gets a clear "re-select output folder"
+            // error rather than a cryptic sandbox failure.
+            outputDirectoryBookmark: nil,
             useBatchTier: entry.usedBatchTier,
             projectId: entry.projectId
         )

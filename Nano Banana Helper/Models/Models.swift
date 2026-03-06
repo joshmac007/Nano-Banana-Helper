@@ -25,14 +25,26 @@ class Project: Codable, Identifiable, Hashable {
     var isArchived: Bool = false
     var projectNotes: String?
     
+    @ObservationIgnored // Runtime cache only; don't trigger observation updates directly
+    private var _cachedOutputPath: String?
+    
     var outputURL: URL {
+        if let cached = _cachedOutputPath {
+            return URL(fileURLWithPath: cached)
+        }
         // Resolve the bookmark briefly to capture the path, then stop access immediately.
         // Display-only: we only need the path string for labels and FileManager checks.
         if let bookmark = outputDirectoryBookmark,
            let path = AppPaths.resolveBookmarkToPath(bookmark) {
+            _cachedOutputPath = path
             return URL(fileURLWithPath: path)
         }
         return URL(fileURLWithPath: outputDirectory)
+    }
+    
+    /// Call this when the output directory changes (folder re-selection, bookmark refresh)
+    func invalidateOutputPathCache() {
+        _cachedOutputPath = nil
     }
     
     static func == (lhs: Project, rhs: Project) -> Bool {
@@ -345,6 +357,32 @@ class LogManager {
     }
 }
 
+// MARK: - Task Status
+
+/// Type-safe status for batch jobs and image tasks.
+/// Raw string values match the persisted JSON format for backward compatibility.
+enum BatchTaskStatus: String, Codable, Equatable {
+    case pending     = "pending"
+    case processing  = "processing"
+    case submitting  = "submitting"
+    case paused      = "paused"
+    case completed   = "completed"
+    case failed      = "failed"
+    case cancelled   = "cancelled"
+
+    var displayName: String {
+        switch self {
+        case .pending:     return "Pending"
+        case .processing:  return "Processing"
+        case .submitting:  return "Submitting"
+        case .paused:      return "Paused"
+        case .completed:   return "Completed"
+        case .failed:      return "Failed"
+        case .cancelled:   return "Cancelled"
+        }
+    }
+}
+
 // MARK: - Batch Job
 
 /// A batch editing job containing multiple image tasks
@@ -361,7 +399,7 @@ class BatchJob: Identifiable, Codable {
     var outputDirectory: String
     var outputDirectoryBookmark: Data?
     var useBatchTier: Bool
-    var status: String
+    var status: BatchTaskStatus
     var tasks: [ImageTask]
     var maskImageData: Data?
 
@@ -382,7 +420,7 @@ class BatchJob: Identifiable, Codable {
         outputDirectory = try container.decode(String.self, forKey: .outputDirectory)
         outputDirectoryBookmark = try container.decodeIfPresent(Data.self, forKey: .outputDirectoryBookmark)
         useBatchTier = try container.decode(Bool.self, forKey: .useBatchTier)
-        status = try container.decode(String.self, forKey: .status)
+        status = try container.decodeIfPresent(BatchTaskStatus.self, forKey: .status) ?? .pending
         tasks = try container.decode([ImageTask].self, forKey: .tasks)
         maskImageData = try container.decodeIfPresent(Data.self, forKey: .maskImageData)
     }
@@ -428,14 +466,14 @@ class BatchJob: Identifiable, Codable {
         self.outputDirectory = outputDirectory
         self.outputDirectoryBookmark = outputDirectoryBookmark
         self.useBatchTier = useBatchTier
-        self.status = "pending"
+        self.status = .pending
         self.tasks = []
         self.maskImageData = maskImageData
     }
     
-    var pendingCount: Int { tasks.filter { $0.status == "pending" }.count }
-    var completedCount: Int { tasks.filter { $0.status == "completed" }.count }
-    var failedCount: Int { tasks.filter { $0.status == "failed" }.count }
+    var pendingCount: Int { tasks.filter { $0.status == .pending }.count }
+    var completedCount: Int { tasks.filter { $0.status == .completed }.count }
+    var failedCount: Int { tasks.filter { $0.status == .failed }.count }
     var progress: Double {
         guard !tasks.isEmpty else { return 0 }
         return Double(completedCount + failedCount) / Double(tasks.count)
@@ -499,7 +537,7 @@ class ImageTask: Identifiable, Codable {
     let inputPaths: [String] // Changed to array for multimodal support
     var inputBookmarks: [Data]? // Security-scoped bookmarks for file picker selections
     var outputPath: String?
-    var status: String
+    var status: BatchTaskStatus
     var phase: JobPhase
     var pollCount: Int
     var error: String?
@@ -512,6 +550,9 @@ class ImageTask: Identifiable, Codable {
     var regionEditCropRect: CGRect? // Top-left pixel coordinates for local composite pipeline
     var regionEditProcessingImageSize: String? // Actual Gemini request size used for region edits (1K/2K/4K)
     var customPrompt: String? // Added for overriding
+    
+    @ObservationIgnored
+    var cachedSourceImageData: Data? // Transient: not persisted. Used to hold source image while polling.
 
     enum CodingKeys: String, CodingKey {
         case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount, error, startedAt, submittedAt, completedAt, externalJobName, projectId, maskImageData, regionEditCropRect, regionEditProcessingImageSize, customPrompt
@@ -523,7 +564,7 @@ class ImageTask: Identifiable, Codable {
         inputPaths = try container.decode([String].self, forKey: .inputPaths)
         inputBookmarks = try container.decodeIfPresent([Data].self, forKey: .inputBookmarks)
         outputPath = try container.decodeIfPresent(String.self, forKey: .outputPath)
-        status = try container.decode(String.self, forKey: .status)
+        status = try container.decodeIfPresent(BatchTaskStatus.self, forKey: .status) ?? .pending
         phase = try container.decodeIfPresent(JobPhase.self, forKey: .phase) ?? .pending
         pollCount = try container.decodeIfPresent(Int.self, forKey: .pollCount) ?? 0
         error = try container.decodeIfPresent(String.self, forKey: .error)
@@ -563,7 +604,7 @@ class ImageTask: Identifiable, Codable {
         self.id = UUID()
         self.inputPaths = inputPaths
         self.inputBookmarks = inputBookmarks
-        self.status = "pending"
+        self.status = .pending
         self.phase = .pending
         self.pollCount = 0
         self.projectId = projectId
@@ -577,7 +618,7 @@ class ImageTask: Identifiable, Codable {
         self.id = UUID()
         self.inputPaths = [inputPath]
         self.inputBookmarks = inputBookmark.map { [$0] }
-        self.status = "pending"
+        self.status = .pending
         self.phase = .pending
         self.pollCount = 0
         self.projectId = projectId
@@ -601,8 +642,8 @@ class ImageTask: Identifiable, Codable {
             return "Text to Image"
         }
         if inputPaths.count > 1 {
-            let label = status == "completed" ? "output" : "inputs"
-            let count = status == "completed" ? "1" : "\(inputPaths.count)"
+            let label = status == .completed ? "output" : "inputs"
+            let count = status == .completed ? "1" : "\(inputPaths.count)"
             return "Multimodal (\(count) \(label))"
         }
         // Use the path string directly — no bookmark resolution needed for a display name.

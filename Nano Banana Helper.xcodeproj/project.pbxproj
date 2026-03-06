@@ -14,19 +14,11 @@
 			remoteGlobalIDString = C6558F792F312C4400E0F566;
 			remoteInfo = "Nano Banana Helper";
 		};
-		C6558F922F312C4600E0F566 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = C6558F722F312C4400E0F566 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = C6558F792F312C4400E0F566;
-			remoteInfo = "Nano Banana Helper";
-		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		C6558F7A2F312C4400E0F566 /* Nano Banana Helper.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Nano Banana Helper.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		C6558F872F312C4600E0F566 /* Nano Banana HelperTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Nano Banana HelperTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
-		C6558F912F312C4600E0F566 /* Nano Banana HelperUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Nano Banana HelperUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -38,11 +30,6 @@
 		C6558F8A2F312C4600E0F566 /* Nano Banana HelperTests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = "Nano Banana HelperTests";
-			sourceTree = "<group>";
-		};
-		C6558F942F312C4600E0F566 /* Nano Banana HelperUITests */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = "Nano Banana HelperUITests";
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -62,13 +49,6 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		C6558F8E2F312C4600E0F566 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -77,7 +57,6 @@
 			children = (
 				C6558F7C2F312C4400E0F566 /* Nano Banana Helper */,
 				C6558F8A2F312C4600E0F566 /* Nano Banana HelperTests */,
-				C6558F942F312C4600E0F566 /* Nano Banana HelperUITests */,
 				C6558F7B2F312C4400E0F566 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -87,7 +66,6 @@
 			children = (
 				C6558F7A2F312C4400E0F566 /* Nano Banana Helper.app */,
 				C6558F872F312C4600E0F566 /* Nano Banana HelperTests.xctest */,
-				C6558F912F312C4600E0F566 /* Nano Banana HelperUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -140,29 +118,6 @@
 			productReference = C6558F872F312C4600E0F566 /* Nano Banana HelperTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
-		C6558F902F312C4600E0F566 /* Nano Banana HelperUITests */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = C6558FA12F312C4600E0F566 /* Build configuration list for PBXNativeTarget "Nano Banana HelperUITests" */;
-			buildPhases = (
-				C6558F8D2F312C4600E0F566 /* Sources */,
-				C6558F8E2F312C4600E0F566 /* Frameworks */,
-				C6558F8F2F312C4600E0F566 /* Resources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-				C6558F932F312C4600E0F566 /* PBXTargetDependency */,
-			);
-			fileSystemSynchronizedGroups = (
-				C6558F942F312C4600E0F566 /* Nano Banana HelperUITests */,
-			);
-			name = "Nano Banana HelperUITests";
-			packageProductDependencies = (
-			);
-			productName = "Nano Banana HelperUITests";
-			productReference = C6558F912F312C4600E0F566 /* Nano Banana HelperUITests.xctest */;
-			productType = "com.apple.product-type.bundle.ui-testing";
-		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -177,10 +132,6 @@
 						CreatedOnToolsVersion = 26.2;
 					};
 					C6558F862F312C4600E0F566 = {
-						CreatedOnToolsVersion = 26.2;
-						TestTargetID = C6558F792F312C4400E0F566;
-					};
-					C6558F902F312C4600E0F566 = {
 						CreatedOnToolsVersion = 26.2;
 						TestTargetID = C6558F792F312C4400E0F566;
 					};
@@ -202,7 +153,6 @@
 			targets = (
 				C6558F792F312C4400E0F566 /* Nano Banana Helper */,
 				C6558F862F312C4600E0F566 /* Nano Banana HelperTests */,
-				C6558F902F312C4600E0F566 /* Nano Banana HelperUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -216,13 +166,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		C6558F852F312C4600E0F566 /* Resources */ = {
-			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		C6558F8F2F312C4600E0F566 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -246,13 +189,6 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		C6558F8D2F312C4600E0F566 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -260,11 +196,6 @@
 			isa = PBXTargetDependency;
 			target = C6558F792F312C4400E0F566 /* Nano Banana Helper */;
 			targetProxy = C6558F882F312C4600E0F566 /* PBXContainerItemProxy */;
-		};
-		C6558F932F312C4600E0F566 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = C6558F792F312C4400E0F566 /* Nano Banana Helper */;
-			targetProxy = C6558F922F312C4600E0F566 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -322,12 +253,12 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
-				SDKROOT = iphoneos;
+				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -380,12 +311,12 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = NO;
-				SDKROOT = iphoneos;
+				SDKROOT = macosx;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				VALIDATE_PRODUCT = YES;
 			};
@@ -512,10 +443,11 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = NF98Y2937M;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "Josh-McSwain.Nano-Banana-HelperTests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_EMIT_LOC_STRINGS = NO;
@@ -534,10 +466,11 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = NF98Y2937M;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "Josh-McSwain.Nano-Banana-HelperTests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_EMIT_LOC_STRINGS = NO;
@@ -545,46 +478,6 @@
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Nano Banana Helper.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Nano Banana Helper";
-			};
-			name = Release;
-		};
-		C6558FA22F312C4600E0F566 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = NF98Y2937M;
-				GENERATE_INFOPLIST_FILE = YES;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "Josh-McSwain.Nano-Banana-HelperUITests";
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				STRING_CATALOG_GENERATE_SYMBOLS = NO;
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_EMIT_LOC_STRINGS = NO;
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = "Nano Banana Helper";
-			};
-			name = Debug;
-		};
-		C6558FA32F312C4600E0F566 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = NF98Y2937M;
-				GENERATE_INFOPLIST_FILE = YES;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "Josh-McSwain.Nano-Banana-HelperUITests";
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				STRING_CATALOG_GENERATE_SYMBOLS = NO;
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_EMIT_LOC_STRINGS = NO;
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = "Nano Banana Helper";
 			};
 			name = Release;
 		};
@@ -614,15 +507,6 @@
 			buildConfigurations = (
 				C6558F9F2F312C4600E0F566 /* Debug */,
 				C6558FA02F312C4600E0F566 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
-		C6558FA12F312C4600E0F566 /* Build configuration list for PBXNativeTarget "Nano Banana HelperUITests" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				C6558FA22F312C4600E0F566 /* Debug */,
-				C6558FA32F312C4600E0F566 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

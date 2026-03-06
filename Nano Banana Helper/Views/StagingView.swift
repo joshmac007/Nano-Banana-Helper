@@ -180,21 +180,8 @@ struct StagedImageCell: View {
     let onDelete: () -> Void
     let onEdit: () -> Void
     
-    // Load synchronously — AsyncImage uses URLSession which can't access
-    // security-scoped sandbox URLs after stopAccessingSecurityScopedResource.
-    private var thumbnail: NSImage? {
-        // Try direct load first (works for drag-and-drop and accessible paths)
-        if let img = NSImage(contentsOfFile: url.path) { return img }
-        
-        // Try resolving via bookmark if stored in BatchStagingManager
-        if let data = bookmark {
-            return AppPaths.withResolvedBookmark(data) { resolvedURL in
-                return NSImage(contentsOfFile: resolvedURL.path)
-            }?.flatMap { $0 }
-        }
-        
-        return nil
-    }
+    @State private var thumbnail: NSImage?
+    @State private var isLoadingThumbnail = true
     
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -206,7 +193,17 @@ struct StagedImageCell: View {
                         .aspectRatio(contentMode: .fit)
                 } else {
                     Color.secondary.opacity(0.2)
-                        .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
+                        .overlay(
+                            Group {
+                                if isLoadingThumbnail {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else {
+                                    Image(systemName: "photo")
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        )
                 }
             }
             .frame(height: 150)
@@ -264,6 +261,25 @@ struct StagedImageCell: View {
         )
         .cornerRadius(8)
         .shadow(radius: 2)
+        .task(id: url) {
+            isLoadingThumbnail = true
+            defer { isLoadingThumbnail = false }
+            
+            // Try direct load first
+            if let img = NSImage(contentsOfFile: url.path) {
+                thumbnail = img
+                return
+            }
+            
+            // Try resolving via bookmark
+            if let data = bookmark {
+                if let resolvedImg = AppPaths.withResolvedBookmark(data, { resolvedURL in
+                    return NSImage(contentsOfFile: resolvedURL.path)
+                }) {
+                    thumbnail = resolvedImg
+                }
+            }
+        }
     }
 }
 

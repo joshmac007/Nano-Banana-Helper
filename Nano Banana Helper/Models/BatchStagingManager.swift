@@ -41,6 +41,9 @@ class BatchStagingManager {
     // Saved mask edits keyed by URL
     var stagedMaskEdits: [URL: StagedMaskEdit] = [:]
     
+    // Cached file sizes for oversized payload estimation
+    private var cachedFileSizes: [URL: Int] = [:]
+    
     // Batch Configuration (Synced with Inspector)
     var prompt: String = ""
     var systemPrompt: String = "" // New System Prompt
@@ -139,6 +142,12 @@ class BatchStagingManager {
         }
         return nil
     }
+
+    private let securityScopedPathing: any SecurityScopedPathing
+
+    init(securityScopedPathing: any SecurityScopedPathing = LiveSecurityScopedPathing()) {
+        self.securityScopedPathing = securityScopedPathing
+    }
     
     // Actions
     func addFiles(_ urls: [URL], bookmarks: [URL: Data] = [:]) {
@@ -157,6 +166,11 @@ class BatchStagingManager {
         for (url, bookmark) in normalizedBookmarks {
             stagedBookmarks[url] = bookmark
         }
+        
+        // Cache file sizes to avoid reading disk / resolving bookmarks on every UI render
+        for url in newFiles {
+            cachedFileSizes[url] = computeFileSizeBytes(for: url)
+        }
     }
 
     /// Adds files and captures security-scoped bookmarks where available.
@@ -170,18 +184,36 @@ class BatchStagingManager {
         var accepted: [URL] = []
         var rejected: [RejectedFile] = []
 
-        for url in normalizedURLs {
+        for (index, url) in normalizedURLs.enumerated() {
+            DebugLog.debug("security.input", "Input selected for staging", metadata: [
+                "event": "security.input.selected",
+                "input_index": String(index),
+                "path": url.path,
+                "path_hash": securityScopedPathing.pathHash(for: url.path),
+                "path_basename": securityScopedPathing.pathBasename(for: url.path),
+                "launch_id": securityScopedPathing.launchID
+            ])
             if bookmarks[url] == nil {
-            let didStart = url.startAccessingSecurityScopedResource()
-            if let bookmark = AppPaths.bookmark(for: url) {
-                bookmarks[url] = bookmark
+                let didStart = securityScopedPathing.startAccessing(url, metadata: [
+                    "event": "security.scope.start.attempt.staging",
+                    "input_index": String(index)
+                ])
+                if let bookmark = securityScopedPathing.bookmark(for: url, metadata: [
+                    "event": "security.bookmark.create.staging",
+                    "input_index": String(index)
+                ]) {
+                    bookmarks[url] = bookmark
+                }
+                if didStart {
+                    securityScopedPathing.stopAccessing(url, metadata: [
+                        "input_index": String(index),
+                        "event": "security.scope.stop.staging",
+                        "launch_id": securityScopedPathing.launchID
+                    ])
+                }
             }
-            if didStart {
-                url.stopAccessingSecurityScopedResource()
-            }
-        }
 
-            if AppPaths.requiresSecurityScope(path: url.path), bookmarks[url] == nil {
+            if securityScopedPathing.requiresSecurityScope(path: url.path), bookmarks[url] == nil {
                 let reason = "Sandbox bookmark could not be created. Re-select this file to grant access."
                 rejected.append(RejectedFile(url: url, reason: reason))
                 DebugLog.error("staging.permissions", "Rejected staged file due to missing bookmark", metadata: [
@@ -204,12 +236,14 @@ class BatchStagingManager {
         stagedFiles.removeAll { $0 == normalized }
         stagedBookmarks.removeValue(forKey: normalized)
         stagedMaskEdits.removeValue(forKey: normalized)
+        cachedFileSizes.removeValue(forKey: normalized)
     }
     
     func clearAll() {
         stagedFiles.removeAll()
         stagedBookmarks.removeAll()
         stagedMaskEdits.removeAll()
+        cachedFileSizes.removeAll()
         // Do NOT clear system prompt on batch clear, it's persistent configuration
     }
     
@@ -331,10 +365,17 @@ class BatchStagingManager {
 
     private func fileSizeBytes(for url: URL) -> Int {
         let normalizedURL = url.standardizedFileURL
+        if let cached = cachedFileSizes[normalizedURL] {
+            return cached
+        }
+        return computeFileSizeBytes(for: normalizedURL)
+    }
+
+    private func computeFileSizeBytes(for normalizedURL: URL) -> Int {
         let path = normalizedURL.path
 
-        if let bookmark = stagedBookmarks[normalizedURL], AppPaths.requiresSecurityScope(path: path) {
-            return AppPaths.withResolvedBookmark(bookmark) { scopedURL in
+        if let bookmark = stagedBookmarks[normalizedURL], securityScopedPathing.requiresSecurityScope(path: path) {
+            return securityScopedPathing.withResolvedBookmark(bookmark) { scopedURL in
                 fileSizeBytes(atPath: scopedURL.path)
             } ?? fileSizeBytes(atPath: path)
         }

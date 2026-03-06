@@ -219,10 +219,28 @@ struct HistoryView: View {
     }
 }
 
+enum HistoryAssetResolver {
+    static func loadImage(
+        path: String,
+        bookmark: Data?,
+        pathing: any SecurityScopedPathing = LiveSecurityScopedPathing()
+    ) -> NSImage? {
+        let url = URL(fileURLWithPath: path)
+        if let image = NSImage(contentsOf: url) {
+            return image
+        }
+
+        guard let bookmark else { return nil }
+        return pathing.withResolvedBookmark(bookmark) { scopedURL in
+            NSImage(contentsOf: scopedURL)
+        } ?? nil
+    }
+}
 
 struct HistoryRowView: View {
     let entry: HistoryEntry
     let projectName: String
+    var securityScopedPathing: any SecurityScopedPathing = LiveSecurityScopedPathing()
     var isActive: Bool = false
     var onReuse: ((HistoryEntry) -> Void)?
     var onResumePolling: ((HistoryEntry) -> Void)?
@@ -470,13 +488,20 @@ struct HistoryRowView: View {
     }
     
     private func loadThumbnails() async {
-        // Load first source
-        if let firstURL = entry.sourceURLs.first {
-             sourceImage = NSImage(contentsOf: firstURL)
+        if let firstSourcePath = entry.sourceImagePaths.first {
+            let sourceBookmark = entry.sourceImageBookmarks?.first
+            sourceImage = HistoryAssetResolver.loadImage(
+                path: firstSourcePath,
+                bookmark: sourceBookmark,
+                pathing: securityScopedPathing
+            )
         }
-        
-        // Load output
-        outputImage = NSImage(contentsOf: entry.outputURL)
+
+        outputImage = HistoryAssetResolver.loadImage(
+            path: entry.outputImagePath,
+            bookmark: entry.outputImageBookmark,
+            pathing: securityScopedPathing
+        )
     }
     
     private func formatCurrency(_ value: Double) -> String {

@@ -1,11 +1,15 @@
 import Foundation
+import CryptoKit
 
 /// Centralized management of application storage paths and data migration
 struct AppPaths {
     struct ResolvedSecurityScopedBookmark {
         let url: URL
         let refreshedBookmarkData: Data?
+        let wasStale: Bool
     }
+
+    nonisolated static let launchID: String = UUID().uuidString
 
     /// The primary application support directory for the current app version
     nonisolated static let appSupportURL: URL = {
@@ -62,6 +66,13 @@ struct AppPaths {
     /// Rotated debug log file (previous)
     nonisolated static var debugLogArchiveURL: URL {
         debugLogsDirectoryURL.appendingPathComponent("debug.previous.log")
+    }
+
+    /// Directory for per-incident forensic snapshots.
+    nonisolated static var failureSnapshotsDirectoryURL: URL {
+        let url = debugLogsDirectoryURL.appendingPathComponent("failures", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
     }
     
     /// Subdirectory for individual project data
@@ -139,24 +150,93 @@ struct AppPaths {
     }
     
     // MARK: - Security Scoped Bookmarks
-    
+
+    /// Thread-safe tracker for security scope start/stop balance.
+    /// A negative ref count means we called stopAccessing more times than startAccessing,
+    /// which revokes sandbox access and causes the permission bug.
+    enum ScopeRefCountTracker {
+        private static var counts: [String: Int] = [:]
+        private static let lock = NSLock()
+
+        static func trackStart(path: String) {
+            let key = URL(fileURLWithPath: path).standardizedFileURL.path
+            lock.lock()
+            counts[key, default: 0] += 1
+            let count = counts[key]!
+            lock.unlock()
+            DebugLog.debug("security.refcount", "SCOPE START", metadata: [
+                "path_hash": pathHash(for: path),
+                "ref_count": String(count)
+            ])
+        }
+
+        static func trackStop(path: String) {
+            let key = URL(fileURLWithPath: path).standardizedFileURL.path
+            lock.lock()
+            counts[key, default: 0] -= 1
+            let count = counts[key]!
+            lock.unlock()
+            if count < 0 {
+                DebugLog.error("security.refcount", "⚠️ NEGATIVE REF COUNT — OVER-RELEASE DETECTED", metadata: [
+                    "path_hash": pathHash(for: path),
+                    "ref_count": String(count),
+                    "launch_id": launchID
+                ])
+            } else {
+                DebugLog.debug("security.refcount", "SCOPE STOP", metadata: [
+                    "path_hash": pathHash(for: path),
+                    "ref_count": String(count)
+                ])
+            }
+        }
+
+        static func currentCount(for path: String) -> Int {
+            let key = URL(fileURLWithPath: path).standardizedFileURL.path
+            lock.lock()
+            let count = counts[key, default: 0]
+            lock.unlock()
+            return count
+        }
+    }
+
+    static func pathHash(for path: String) -> String {
+        let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
+        let digest = SHA256.hash(data: Data(normalized.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func pathBasename(for path: String) -> String {
+        URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    static func scopeMetadata(path: String) -> [String: String] {
+        [
+            "path": path,
+            "path_basename": pathBasename(for: path),
+            "path_hash": pathHash(for: path),
+            "launch_id": launchID
+        ]
+    }
+
     /// Create a security scoped bookmark for a URL
-    static func bookmark(for url: URL) -> Data? {
+    static func bookmark(for url: URL, metadata: [String: String] = [:]) -> Data? {
+        let baseMeta = mergeMetadata(scopeMetadata(path: url.path), metadata)
+        DebugLog.debug("security.bookmark", "Bookmark create attempt", metadata: mergeMetadata(baseMeta, [
+            "event": "security.bookmark.create.attempt"
+        ]))
         do {
             let data = try url.bookmarkData(
                 options: .withSecurityScope,
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )
-            DebugLog.debug("security.bookmark", "Created security-scoped bookmark", metadata: [
-                "path": url.path
-            ])
+            DebugLog.debug("security.bookmark", "Bookmark create succeeded", metadata: mergeMetadata(baseMeta, [
+                "event": "security.bookmark.create.success",
+                "bookmark_bytes": String(data.count)
+            ]))
             return data
         } catch {
-            DebugLog.error("security.bookmark", "Failed to create bookmark", metadata: [
-                "path": url.path,
-                "error": String(describing: error)
-            ])
+            DebugLog.error("security.bookmark", "Bookmark create failed", metadata: mergeMetadata(baseMeta, errorMetadata(error, event: "security.bookmark.create.failed")))
             print("Failed to create bookmark for \(url.path): \(error)")
             return nil
         }
@@ -172,7 +252,14 @@ struct AppPaths {
 
     /// Resolve a bookmark, start accessing it, and return any refreshed bookmark data when stale.
     /// - Important: Caller must stop accessing `url` when done.
-    static func resolveBookmarkAccess(_ data: Data) -> ResolvedSecurityScopedBookmark? {
+    static func resolveBookmarkAccess(_ data: Data, metadata: [String: String] = [:]) -> ResolvedSecurityScopedBookmark? {
+        let baseMeta = mergeMetadata(metadata, [
+            "bookmark_bytes": String(data.count),
+            "launch_id": launchID
+        ])
+        DebugLog.debug("security.bookmark", "Bookmark resolve attempt", metadata: mergeMetadata(baseMeta, [
+            "event": "security.bookmark.resolve.attempt"
+        ]))
         do {
             var isStale = false
             let url = try URL(
@@ -181,12 +268,17 @@ struct AppPaths {
                 relativeTo: nil,
                 bookmarkDataIsStale: &isStale
             )
-            
+            var contextualMeta = mergeMetadata(scopeMetadata(path: url.path), baseMeta)
+            contextualMeta["bookmark_is_stale"] = String(isStale)
+            DebugLog.debug("security.bookmark", "Bookmark resolve succeeded", metadata: mergeMetadata(contextualMeta, [
+                "event": "security.bookmark.resolve.success"
+            ]))
+
             var refreshedBookmarkData: Data?
             if isStale {
-                DebugLog.info("security.bookmark", "Bookmark is stale; attempting refresh", metadata: [
-                    "path": url.path
-                ])
+                DebugLog.info("security.bookmark", "Bookmark stale refresh attempt", metadata: mergeMetadata(contextualMeta, [
+                    "event": "security.bookmark.refresh.attempt"
+                ]))
                 // Attempt to refresh the stale bookmark immediately.
                 // If we can't, return nil to force the user to re-select the file —
                 // a stale bookmark stored on disk will fail silently on next launch.
@@ -196,39 +288,73 @@ struct AppPaths {
                         includingResourceValuesForKeys: nil,
                         relativeTo: nil
                     )
-                    DebugLog.info("security.bookmark", "Stale bookmark refreshed", metadata: [
-                        "path": url.path
-                    ])
+                    DebugLog.info("security.bookmark", "Bookmark stale refresh succeeded", metadata: mergeMetadata(contextualMeta, [
+                        "event": "security.bookmark.refresh.success",
+                        "refreshed_bookmark_bytes": String(refreshedBookmarkData?.count ?? 0)
+                    ]))
                     print("⚠️ Stale bookmark refreshed for \(url.path) — caller should persist the updated bookmark")
                 } catch {
-                    DebugLog.error("security.bookmark", "Could not refresh stale bookmark", metadata: [
-                        "path": url.path,
-                        "error": String(describing: error)
-                    ])
+                    DebugLog.error("security.bookmark", "Bookmark stale refresh failed", metadata: mergeMetadata(contextualMeta, errorMetadata(error, event: "security.bookmark.refresh.failed")))
                     print("❌ Could not refresh stale bookmark for \(url.path): \(error). User must re-select the file.")
                     return nil
                 }
             }
-            
+
+            DebugLog.debug("security.bookmark", "Scope start attempt", metadata: mergeMetadata(contextualMeta, [
+                "event": "security.scope.start.attempt"
+            ]))
             if url.startAccessingSecurityScopedResource() {
+                DebugLog.debug("security.bookmark", "Scope start succeeded", metadata: mergeMetadata(contextualMeta, [
+                    "event": "security.scope.start.success"
+                ]))
+                ScopeRefCountTracker.trackStart(path: url.path)
                 return ResolvedSecurityScopedBookmark(
                     url: url,
-                    refreshedBookmarkData: refreshedBookmarkData
+                    refreshedBookmarkData: refreshedBookmarkData,
+                    wasStale: isStale
                 )
             } else {
-                DebugLog.error("security.bookmark", "startAccessingSecurityScopedResource failed", metadata: [
-                    "path": url.path
-                ])
+                DebugLog.error("security.bookmark", "Scope start failed", metadata: mergeMetadata(contextualMeta, [
+                    "event": "security.scope.start.failed"
+                ]))
                 print("Failed to access security scoped resource: \(url.path)")
                 return nil
             }
         } catch {
-            DebugLog.error("security.bookmark", "Failed to resolve bookmark", metadata: [
-                "error": String(describing: error)
-            ])
+            DebugLog.error("security.bookmark", "Bookmark resolve failed", metadata: mergeMetadata(baseMeta, errorMetadata(error, event: "security.bookmark.resolve.failed")))
             print("Failed to resolve bookmark: \(error)")
             return nil
         }
+    }
+
+    static func startAccessingSecurityScope(url: URL, metadata: [String: String] = [:]) -> Bool {
+        let baseMeta = mergeMetadata(scopeMetadata(path: url.path), metadata)
+        DebugLog.debug("security.bookmark", "Scope start attempt", metadata: mergeMetadata(baseMeta, [
+            "event": "security.scope.start.attempt"
+        ]))
+        
+        let didStart = url.startAccessingSecurityScopedResource()
+        
+        if didStart {
+            DebugLog.debug("security.bookmark", "Scope start succeeded", metadata: mergeMetadata(baseMeta, [
+                "event": "security.scope.start.success"
+            ]))
+            ScopeRefCountTracker.trackStart(path: url.path)
+        } else {
+            DebugLog.error("security.bookmark", "Scope start failed", metadata: mergeMetadata(baseMeta, [
+                "event": "security.scope.start.failed"
+            ]))
+        }
+        return didStart
+    }
+
+    static func stopAccessingSecurityScope(url: URL, metadata: [String: String] = [:]) {
+        ScopeRefCountTracker.trackStop(path: url.path)
+        url.stopAccessingSecurityScopedResource()
+        DebugLog.debug("security.bookmark", "Scope stop", metadata: mergeMetadata(scopeMetadata(path: url.path), mergeMetadata(metadata, [
+            "event": "security.scope.stop",
+            "launch_id": launchID
+        ])))
     }
     
     /// Resolves a bookmark, executes a closure with the scoped URL, then immediately stops access.
@@ -236,7 +362,12 @@ struct AppPaths {
     @discardableResult
     static func withResolvedBookmark<T>(_ data: Data, _ body: (URL) throws -> T) rethrows -> T? {
         guard let url = resolveBookmark(data) else { return nil }
-        defer { url.stopAccessingSecurityScopedResource() }
+        defer {
+            stopAccessingSecurityScope(url: url, metadata: [
+                "event": "security.scope.stop.with_resolved_bookmark",
+                "launch_id": launchID
+            ])
+        }
         return try body(url)
     }
     
@@ -249,6 +380,25 @@ struct AppPaths {
             result = url.path
         }
         return result
+    }
+
+    private static func mergeMetadata(_ lhs: [String: String], _ rhs: [String: String]) -> [String: String] {
+        lhs.merging(rhs) { _, new in new }
+    }
+
+    private static func errorMetadata(_ error: Error, event: String) -> [String: String] {
+        let nsError = error as NSError
+        var metadata: [String: String] = [
+            "event": event,
+            "error": String(describing: error),
+            "error_domain": nsError.domain,
+            "error_code": String(nsError.code)
+        ]
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            metadata["underlying_error_domain"] = underlying.domain
+            metadata["underlying_error_code"] = String(underlying.code)
+        }
+        return metadata
     }
 }
 

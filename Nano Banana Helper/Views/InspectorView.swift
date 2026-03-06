@@ -34,6 +34,9 @@ struct InspectorView: View {
             
             ScrollView {
                 VStack(spacing: 24) {
+                    let canStart = stagingManager.canStartBatch
+                    let payloadWarning = stagingManager.batchPayloadPreflightWarning
+                    
                     // Start Button (Primary Call to Action)
                     Button(action: startBatch) {
                         Text("Start Batch")
@@ -44,10 +47,10 @@ struct InspectorView: View {
                     .controlSize(.large)
                     .padding(.horizontal)
                     .padding(.top)
-                    .disabled(!stagingManager.canStartBatch)
+                    .disabled(!canStart)
 
-                    if let payloadWarning = stagingManager.batchPayloadPreflightWarning {
-                        Label(payloadWarning, systemImage: "exclamationmark.triangle.fill")
+                    if let warning = payloadWarning {
+                        Label(warning, systemImage: "exclamationmark.triangle.fill")
                             .font(.system(size: 10, weight: .medium))
                             .padding(.horizontal, 6)
                             .padding(.vertical, 4)
@@ -61,6 +64,7 @@ struct InspectorView: View {
                         OutputLocationView(project: project) { newURL, newBookmark in
                             project.outputDirectory = newURL.path
                             project.outputDirectoryBookmark = newBookmark
+                            project.invalidateOutputPathCache()
                             projectManager.saveProjects()
                         }
                         .padding(.horizontal)
@@ -559,8 +563,10 @@ struct OutputLocationView: View {
         
         // Prefer validating the persisted bookmark when present. A plain path check can
         // appear reachable even when sandbox access has expired.
+        // FIX: Use resolveBookmarkToPath instead of resolveBookmarkAccess to avoid 
+        // interrupting an active scope held by BatchOrchestrator.
         if let bookmark = project.outputDirectoryBookmark {
-            guard let resolved = AppPaths.resolveBookmarkAccess(bookmark) else {
+            guard let resolvedPath = AppPaths.resolveBookmarkToPath(bookmark) else {
                 isAccessible = false
                 DebugLog.warning("ui.output_location", "Output bookmark no longer resolves", metadata: [
                     "project_id": project.id.uuidString,
@@ -568,13 +574,9 @@ struct OutputLocationView: View {
                 ])
                 return
             }
-            let scopedURL = resolved.url
-            defer { scopedURL.stopAccessingSecurityScopedResource() }
-            if let refreshedBookmark = resolved.refreshedBookmarkData {
-                onUpdate(scopedURL, refreshedBookmark)
-            }
-            isAccessible = FileManager.default.isWritableFile(atPath: scopedURL.path) ||
-                ((try? scopedURL.checkResourceIsReachable()) ?? false)
+            
+            isAccessible = FileManager.default.isWritableFile(atPath: resolvedPath) ||
+                ((try? URL(fileURLWithPath: resolvedPath).checkResourceIsReachable()) ?? false)
             return
         }
         

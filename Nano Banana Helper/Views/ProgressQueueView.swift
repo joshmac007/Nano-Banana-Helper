@@ -246,19 +246,19 @@ struct TaskRowView: View {
                         .lineLimit(1)
                     
                     if task.inputPaths.count > 1 {
-                        Text(task.status == "completed" ? "1" : "\(task.inputPaths.count)")
+                        Text(task.status == .completed ? "1" : "\(task.inputPaths.count)")
                             .font(.system(size: 9, weight: .bold))
                             .foregroundStyle(.white)
                             .padding(.horizontal, 4)
                             .padding(.vertical, 1)
-                            .background(task.status == "completed" ? Color.green : Color.accentColor)
+                            .background(task.status == .completed ? Color.green : Color.accentColor)
                             .clipShape(Capsule())
-                            .help(task.status == "completed" ? "Generated 1 image from multimodal input" : "Multimodal input with \(task.inputPaths.count) images")
+                            .help(task.status == .completed ? "Generated 1 image from multimodal input" : "Multimodal input with \(task.inputPaths.count) images")
                     }
                 }
                 
                 // Phase-based status for processing jobs
-                if task.status == "processing" {
+                if task.status == .processing {
                     HStack(spacing: 4) {
                         Text(task.phase.displayName)
                             .font(.caption)
@@ -292,7 +292,7 @@ struct TaskRowView: View {
             Spacer()
             
             // Open output buttons for completed tasks
-            if task.status == "completed", let outputURL = task.outputURL {
+            if task.status == .completed, let outputURL = task.outputURL {
                 HStack(spacing: 12) {
                     Button(action: { NSWorkspace.shared.open(outputURL.deletingLastPathComponent()) }) {
                         Image(systemName: "folder")

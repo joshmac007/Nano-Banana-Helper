@@ -3,6 +3,7 @@ import AppKit
 
 struct HistoryView: View {
     let entries: [HistoryEntry]
+    let initialProjectId: UUID?
     var projects: [Project] = []
 
     var activeJobIDs: Set<String> = [] // IDs of jobs currently in memory
@@ -30,6 +31,7 @@ struct HistoryView: View {
         onRegrantAccess: ((HistoryEntry) -> Void)? = nil
     ) {
         self.entries = entries
+        self.initialProjectId = initialProjectId
         self.projects = projects
         self.activeJobIDs = activeJobIDs
         self.onDelete = onDelete
@@ -110,51 +112,7 @@ struct HistoryView: View {
                 }
             } else {
                 List(filteredEntries, selection: $selectedEntry) { entry in
-                    let projectName = projects.first { $0.id == entry.projectId }?.name ?? "Unknown"
-                    let isActive = entry.externalJobName.map { activeJobIDs.contains($0) } ?? false
-                    
-                    HistoryRowView(
-                        entry: entry, 
-                        projectName: projectName,
-                        isActive: isActive,
-                        onReuse: onReuse, 
-                        onResumePolling: onResumePolling,
-                        onRescue: { 
-                            entryToRescue = entry
-                            rescueJobID = ""
-                            showingRescueDialog = true
-                        }
-                    )
-                    .contextMenu {
-                        Button("Show in Finder") {
-                            NSWorkspace.shared.activateFileViewerSelecting([entry.outputURL])
-                        }
-                        Button("Reuse Settings") {
-                            onReuse?(entry)
-                        }
-                        if entry.status == "failed" {
-                            if isPermissionFailure(entry) {
-                                Button("Regrant Access & Retry") {
-                                    onRegrantAccess?(entry)
-                                }
-                            }
-                            if entry.externalJobName != nil {
-                                Button("Resume Polling (No Cost)") {
-                                    onResumePolling?(entry)
-                                }
-                            } else {
-                                Button("Rescue with Job ID...") {
-                                    entryToRescue = entry
-                                    rescueJobID = ""
-                                    showingRescueDialog = true
-                                }
-                            }
-                        }
-                        Divider()
-                        Button("Delete", role: .destructive) {
-                            onDelete?(entry)
-                        }
-                    }
+                    historyRow(for: entry)
                 }
                 .listStyle(.inset)
             }
@@ -210,12 +168,78 @@ struct HistoryView: View {
             .padding()
             .frame(width: 400)
         }
+        .onChange(of: initialProjectId) { _, newValue in
+            selectedProjectId = newValue
+        }
     }
 
     private func isPermissionFailure(_ entry: HistoryEntry) -> Bool {
         guard let error = entry.error?.lowercased() else { return false }
         let tokens = ["permission", "cannot access", "sandbox", "operation not permitted", "bookmark", "output folder"]
         return tokens.contains { error.contains($0) }
+    }
+
+    @ViewBuilder
+    private func historyRow(for entry: HistoryEntry) -> some View {
+        HistoryRowView(
+            entry: entry,
+            projectName: projectName(for: entry),
+            isActive: isActive(entry),
+            onReuse: onReuse,
+            onResumePolling: onResumePolling,
+            onRescue: {
+                beginRescue(for: entry)
+            }
+        )
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button(role: .destructive) {
+                onDelete?(entry)
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+        }
+        .contextMenu {
+            Button("Show in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([entry.outputURL])
+            }
+            Button("Reuse Settings") {
+                onReuse?(entry)
+            }
+            if entry.status == "failed" {
+                if isPermissionFailure(entry) {
+                    Button("Regrant Access & Retry") {
+                        onRegrantAccess?(entry)
+                    }
+                }
+                if entry.externalJobName != nil {
+                    Button("Resume Polling (No Cost)") {
+                        onResumePolling?(entry)
+                    }
+                } else {
+                    Button("Rescue with Job ID...") {
+                        beginRescue(for: entry)
+                    }
+                }
+            }
+            Divider()
+            Button("Delete", role: .destructive) {
+                onDelete?(entry)
+            }
+        }
+    }
+
+    private func projectName(for entry: HistoryEntry) -> String {
+        projects.first { $0.id == entry.projectId }?.name ?? "Unknown"
+    }
+
+    private func isActive(_ entry: HistoryEntry) -> Bool {
+        entry.externalJobName.map { activeJobIDs.contains($0) } ?? false
+    }
+
+    private func beginRescue(for entry: HistoryEntry) {
+        entryToRescue = entry
+        rescueJobID = ""
+        showingRescueDialog = true
     }
 }
 

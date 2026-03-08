@@ -264,21 +264,14 @@ struct StagedImageCell: View {
         .task(id: url) {
             isLoadingThumbnail = true
             defer { isLoadingThumbnail = false }
-            
-            // Try direct load first
-            if let img = NSImage(contentsOfFile: url.path) {
-                thumbnail = img
-                return
-            }
-            
-            // Try resolving via bookmark
-            if let data = bookmark {
-                if let resolvedImg = AppPaths.withResolvedBookmark(data, { resolvedURL in
-                    return NSImage(contentsOfFile: resolvedURL.path)
-                }) {
-                    thumbnail = resolvedImg
-                }
-            }
+
+            thumbnail = await Task.detached(priority: .utility) {
+                PreviewImageLoader.loadImage(
+                    path: url.path,
+                    bookmark: bookmark,
+                    maxPixelSize: 320
+                )
+            }.value
         }
     }
 }

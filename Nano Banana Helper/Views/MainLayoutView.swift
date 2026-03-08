@@ -88,7 +88,12 @@ struct MainLayoutView: View {
              }
              
              orchestrator.onCostIncurred = { cost, resolution, modelName, projectId in
-                 projectManager.costSummary.record(cost: cost, resolution: resolution, modelName: modelName, projectId: projectId)
+                 if let project = projectManager.projects.first(where: { $0.id == projectId }) {
+                     projectManager.recordCost(cost, resolution: resolution, modelName: modelName, for: project)
+                 } else {
+                     projectManager.costSummary.record(cost: cost, resolution: resolution, modelName: modelName, projectId: projectId)
+                     projectManager.saveCostSummary()
+                 }
              }
 
              orchestrator.onOutputDirectoryBookmarkRefreshed = { projectId, bookmark in

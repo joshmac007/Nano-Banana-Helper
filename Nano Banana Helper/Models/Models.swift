@@ -157,20 +157,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.maskImageData = nil
     }
     
-    // Backward compatibility for single source path
-    var sourceImagePath: String { sourceImagePaths.first ?? "" }
-    
     // Security Scoped Bookmarks
     var sourceImageBookmarks: [Data]?
     var outputImageBookmark: Data?
-    
-    var sourceURLs: [URL] {
-        // Display-only: use plain path-based URLs. Security scope is not needed
-        // for NSImage thumbnail loading or Finder reveals.
-        return sourceImagePaths.map { URL(fileURLWithPath: $0) }
-    }
-    
-    var sourceURL: URL { sourceURLs.first ?? URL(fileURLWithPath: "") }
     
     var outputURL: URL {
         // Display-only: use plain path-based URL. Security scope is not needed
@@ -635,7 +624,6 @@ class ImageTask: Identifiable, Codable {
     /// For security-scoped access during batch processing, use `inputBookmarks` via
     /// `AppPaths.withResolvedBookmark` or `AppPaths.resolveBookmark` (with paired stop call).
     var inputURLs: [URL] { inputPaths.map { URL(fileURLWithPath: $0) } }
-    var inputURL: URL { URL(fileURLWithPath: inputPath) }
     var outputURL: URL? { outputPath.map { URL(fileURLWithPath: $0) } }
     var filename: String { 
         if inputPaths.isEmpty {

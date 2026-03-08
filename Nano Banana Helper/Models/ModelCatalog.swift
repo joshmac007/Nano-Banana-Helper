@@ -66,7 +66,7 @@ enum ModelCatalog {
     nonisolated static let all: [ModelDefinition] = [
         ModelDefinition(
             id: proImageId,
-            displayName: "Gemini 3 Pro Image",
+            displayName: "Nano Banana Pro",
             capabilities: ModelCapabilities(
                 allowedAspectRatios: proRatios,
                 allowedImageSizes: proSizes,
@@ -84,7 +84,7 @@ enum ModelCatalog {
         ),
         ModelDefinition(
             id: flash31ImageId,
-            displayName: "Gemini 3.1 Flash Image",
+            displayName: "Nano Banana 2 (Flash)",
             capabilities: ModelCapabilities(
                 allowedAspectRatios: flashRatios,
                 allowedImageSizes: flashSizes,

@@ -108,6 +108,100 @@ struct Nano_Banana_HelperTests {
         #expect(entry.modelName == ModelCatalog.defaultModelId)
     }
 
+    @Test func deletingGlobalHistoryEntryOnlyRemovesTargetedProjectRow() throws {
+        let fileManager = FileManager.default
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = .iso8601
+
+        func makeEntry(id: UUID, projectId: UUID, timestamp: String, prompt: String, outputName: String) throws -> HistoryEntry {
+            let json = """
+            {
+              "id": "\(id.uuidString)",
+              "projectId": "\(projectId.uuidString)",
+              "timestamp": "\(timestamp)",
+              "sourceImagePaths": ["/tmp/in.png"],
+              "outputImagePath": "/tmp/\(outputName)",
+              "prompt": "\(prompt)",
+              "modelName": "\(ModelCatalog.defaultModelId)",
+              "aspectRatio": "16:9",
+              "imageSize": "1K",
+              "usedBatchTier": false,
+              "cost": 0.1,
+              "status": "completed"
+            }
+            """
+            return try decoder.decode(HistoryEntry.self, from: Data(json.utf8))
+        }
+
+        func historyURL(for projectId: UUID) -> URL {
+            AppPaths.projectsDirectoryURL
+                .appendingPathComponent(projectId.uuidString)
+                .appendingPathComponent("history.json")
+        }
+
+        let firstProjectId = UUID()
+        let secondProjectId = UUID()
+        let firstProjectDirectory = AppPaths.projectsDirectoryURL.appendingPathComponent(firstProjectId.uuidString)
+        let secondProjectDirectory = AppPaths.projectsDirectoryURL.appendingPathComponent(secondProjectId.uuidString)
+
+        defer {
+            try? fileManager.removeItem(at: firstProjectDirectory)
+            try? fileManager.removeItem(at: secondProjectDirectory)
+        }
+
+        let deletedEntry = try makeEntry(
+            id: UUID(),
+            projectId: firstProjectId,
+            timestamp: "2026-03-01T00:00:00Z",
+            prompt: "delete me",
+            outputName: "delete.png"
+        )
+        let retainedSameProjectEntry = try makeEntry(
+            id: UUID(),
+            projectId: firstProjectId,
+            timestamp: "2026-03-01T01:00:00Z",
+            prompt: "keep me",
+            outputName: "keep.png"
+        )
+        let otherProjectEntry = try makeEntry(
+            id: UUID(),
+            projectId: secondProjectId,
+            timestamp: "2026-03-01T02:00:00Z",
+            prompt: "other project",
+            outputName: "other.png"
+        )
+
+        try fileManager.createDirectory(at: firstProjectDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: secondProjectDirectory, withIntermediateDirectories: true)
+        try encoder.encode([deletedEntry, retainedSameProjectEntry]).write(to: historyURL(for: firstProjectId))
+        try encoder.encode([otherProjectEntry]).write(to: historyURL(for: secondProjectId))
+
+        let manager = HistoryManager()
+        manager.entries = []
+        manager.allGlobalEntries = [deletedEntry, retainedSameProjectEntry, otherProjectEntry]
+
+        manager.deleteEntry(deletedEntry)
+
+        let firstProjectHistory = try decoder.decode(
+            [HistoryEntry].self,
+            from: Data(contentsOf: historyURL(for: firstProjectId))
+        )
+        let secondProjectHistory = try decoder.decode(
+            [HistoryEntry].self,
+            from: Data(contentsOf: historyURL(for: secondProjectId))
+        )
+        let remainingGlobalIDs = manager.allGlobalEntries.map(\.id)
+
+        #expect(firstProjectHistory.count == 1)
+        #expect(firstProjectHistory.first?.id == retainedSameProjectEntry.id)
+        #expect(secondProjectHistory.count == 1)
+        #expect(secondProjectHistory.first?.id == otherProjectEntry.id)
+        #expect(remainingGlobalIDs == [retainedSameProjectEntry.id, otherProjectEntry.id])
+    }
+
     @Test func batchJobDecodeBackfillsModel() throws {
         let json = """
         {

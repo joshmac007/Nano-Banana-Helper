@@ -61,6 +61,7 @@ struct WorkbenchView: View {
                         activeJobIDs: Set(orchestrator.processingJobs.compactMap { $0.externalJobName }),
                         onDelete: { entry in
                             historyManager.deleteEntry(entry)
+                            projectManager.rebuildCostSummary(from: historyManager.allGlobalEntries)
                         },
                         onReuse: { entry in
                             reuseHistoryEntry(entry)

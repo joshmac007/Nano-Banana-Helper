@@ -244,13 +244,22 @@ class ProjectManager {
     func rebuildCostSummary(from entries: [HistoryEntry]) {
         // Reset summary
         costSummary = CostSummary()
+        for project in projects {
+            project.totalCost = 0
+            project.imageCount = 0
+        }
         
         // Re-accumulate from all history
         for entry in entries {
             costSummary.record(cost: entry.cost, resolution: entry.imageSize, modelName: entry.modelName, projectId: entry.projectId)
+            if let project = projects.first(where: { $0.id == entry.projectId }) {
+                project.totalCost += entry.cost
+                project.imageCount += 1
+            }
         }
         
         saveCostSummary()
+        saveProjects()
     }
     
     // MARK: - Export

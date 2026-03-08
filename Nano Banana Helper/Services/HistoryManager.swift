@@ -9,9 +9,7 @@ class HistoryManager {
     
     var entries: [HistoryEntry] = []
     var allGlobalEntries: [HistoryEntry] = []
-    
-    private var appSupportURL: URL { AppPaths.appSupportURL }
-    
+
     private func historyURL(for projectId: UUID) -> URL {
         AppPaths.projectsDirectoryURL
             .appendingPathComponent(projectId.uuidString)
@@ -25,22 +23,6 @@ class HistoryManager {
     }
     
     // MARK: - Load/Save
-    
-    func loadHistory(for projectId: UUID) {
-        let url = historyURL(for: projectId)
-        guard fileManager.fileExists(atPath: url.path) else {
-            entries = []
-            return
-        }
-        
-        do {
-            let data = try Data(contentsOf: url)
-            entries = try decoder.decode([HistoryEntry].self, from: data)
-        } catch {
-            print("Failed to load history: \(error)")
-            entries = []
-        }
-    }
     
     func loadGlobalHistory(allProjects: [Project]) {
         var allEntries: [HistoryEntry] = []
@@ -63,6 +45,10 @@ class HistoryManager {
     }
     
     func saveHistory(for projectId: UUID) {
+        saveHistory(entries, for: projectId)
+    }
+
+    private func saveHistory(_ projectEntries: [HistoryEntry], for projectId: UUID) {
         let url = historyURL(for: projectId)
         
         // Ensure directory exists
@@ -70,10 +56,23 @@ class HistoryManager {
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         
         do {
-            let data = try encoder.encode(entries)
+            let data = try encoder.encode(projectEntries)
             try data.write(to: url)
         } catch {
             print("Failed to save history: \(error)")
+        }
+    }
+
+    private func loadHistory(for projectId: UUID) -> [HistoryEntry] {
+        let url = historyURL(for: projectId)
+        guard fileManager.fileExists(atPath: url.path) else { return [] }
+
+        do {
+            let data = try Data(contentsOf: url)
+            return try decoder.decode([HistoryEntry].self, from: data)
+        } catch {
+            print("Failed to load history for project \(projectId): \(error)")
+            return []
         }
     }
     
@@ -89,7 +88,10 @@ class HistoryManager {
     func deleteEntry(_ entry: HistoryEntry) {
         entries.removeAll { $0.id == entry.id }
         allGlobalEntries.removeAll { $0.id == entry.id }
-        saveHistory(for: entry.projectId)
+
+        let remainingProjectEntries = loadHistory(for: entry.projectId)
+            .filter { $0.id != entry.id }
+        saveHistory(remainingProjectEntries, for: entry.projectId)
     }
     
     /// Updates an existing entry by matching externalJobName, or adds as new entry if not found
@@ -127,28 +129,4 @@ class HistoryManager {
         addEntry(newEntry)
     }
     
-    func clearHistory(for projectId: UUID) {
-        entries.removeAll { $0.projectId == projectId }
-        saveHistory(for: projectId)
-    }
-    
-    // MARK: - Filtering
-    
-    func entries(for projectId: UUID) -> [HistoryEntry] {
-        entries.filter { $0.projectId == projectId }
-    }
-    
-    func recentEntries(limit: Int = 20) -> [HistoryEntry] {
-        Array(entries.prefix(limit))
-    }
-    
-    // MARK: - Statistics
-    
-    func totalCost(for projectId: UUID) -> Double {
-        entries(for: projectId).reduce(0) { $0 + $1.cost }
-    }
-    
-    func imageCount(for projectId: UUID) -> Int {
-        entries(for: projectId).count
-    }
 }

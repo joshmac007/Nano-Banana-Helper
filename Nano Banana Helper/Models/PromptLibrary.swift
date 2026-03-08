@@ -77,13 +77,6 @@ class PromptLibrary {
         persist()
     }
     
-    func rename(_ prompt: SavedPrompt, to newName: String) {
-        if let index = prompts.firstIndex(where: { $0.id == prompt.id }) {
-            prompts[index].name = newName
-            persist()
-        }
-    }
-    
     func load() {
         guard fileManager.fileExists(atPath: storageURL.path) else { return }
         

@@ -156,6 +156,33 @@ struct BookmarkSystemTests {
         #expect(deadImage == nil)
     }
 
+    @Test func scopedFileAccessKeepsDirectoryBookmarkAliveForChildFileOperation() throws {
+        let directoryPath = "/external/results"
+        let childFilePath = "/external/results/output/image.png"
+        let directoryBookmark = Data([0x56])
+
+        let pathing = FakeSecurityScopedPathing()
+        pathing.bookmarkPathByData[directoryBookmark] = directoryPath
+
+        let value = try #require(
+            PreviewImageLoader.SecurityScopedFileAccess.withAccessibleURL(
+                path: childFilePath,
+                directoryBookmark: directoryBookmark,
+                directoryPath: directoryPath,
+                pathing: pathing
+            ) { accessibleURL in
+                #expect(accessibleURL.path == childFilePath)
+                #expect(pathing.startAccessCallCountByPath[FakeSecurityScopedPathing.normalize(directoryPath)] == 1)
+                #expect(pathing.stopAccessCallCountByPath[FakeSecurityScopedPathing.normalize(directoryPath)] == nil)
+                return "ok"
+            }
+        )
+
+        #expect(value == "ok")
+        #expect(pathing.startAccessCallCountByPath[FakeSecurityScopedPathing.normalize(directoryPath)] == 1)
+        #expect(pathing.stopAccessCallCountByPath[FakeSecurityScopedPathing.normalize(directoryPath)] == 1)
+    }
+
     private func makeTemporaryPNG() throws -> URL {
         let size = NSSize(width: 8, height: 8)
         let image = NSImage(size: size)
@@ -347,6 +374,12 @@ private final class FakeSecurityScopedPathing: SecurityScopedPathing {
         stopAccessCallCountByPath[key, default: 0] += 1
     }
 
+    func startAccessing(_ url: URL, metadata: [String : String]) -> Bool {
+        let key = Self.normalize(url.path)
+        startAccessCallCountByPath[key, default: 0] += 1
+        return true
+    }
+
     func withResolvedBookmark<T>(_ data: Data, _ body: (URL) throws -> T) rethrows -> T? {
         guard let path = bookmarkPathByData[data] else { return nil }
         startAccessCallCountByPath[Self.normalize(path), default: 0] += 1
@@ -363,7 +396,7 @@ private final class FakeSecurityScopedPathing: SecurityScopedPathing {
         return path
     }
 
-    private static func normalize(_ path: String) -> String {
+    static func normalize(_ path: String) -> String {
         URL(fileURLWithPath: path).standardizedFileURL.path
     }
 }

@@ -182,52 +182,6 @@ struct ProgressQueueView: View {
     private var allTasks: [ImageTask] {
         orchestrator.pendingJobs + orchestrator.processingJobs + orchestrator.completedJobs + orchestrator.failedJobs
     }
-    
-    private var progressColor: Color {
-        if orchestrator.isPaused { return .yellow }
-        if !orchestrator.failedJobs.isEmpty { return .orange }
-        return .accentColor
-    }
-    
-
-}
-
-struct StatusIndicator: View {
-    let isRunning: Bool
-    let isPaused: Bool
-    
-    var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 8, height: 8)
-                .overlay {
-                    if isRunning {
-                        Circle()
-                            .stroke(statusColor.opacity(0.5), lineWidth: 2)
-                            .scaleEffect(1.5)
-                            .opacity(0.5)
-                            .animation(.easeInOut(duration: 1).repeatForever(autoreverses: true), value: isRunning)
-                    }
-                }
-            
-            Text(statusText)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
-    
-    private var statusColor: Color {
-        if isPaused { return .yellow }
-        if isRunning { return .green }
-        return .gray
-    }
-    
-    private var statusText: String {
-        if isPaused { return "Paused" }
-        if isRunning { return "Running" }
-        return "Idle"
-    }
 }
 
 struct TaskRowView: View {

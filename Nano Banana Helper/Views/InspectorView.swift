@@ -307,9 +307,7 @@ struct InspectorView: View {
                         modelName: stagingManager.selectedModelName,
                         stagedInputCount: stagingManager.stagedFiles.count,
                         generationCount: stagingManager.generationCount,
-                        inputCount: stagingManager.estimatedInputCountForCost,
-                        outputCount: stagingManager.estimatedOutputCountForCost,
-                        imageSize: stagingManager.imageSize,
+                        preview: stagingManager.costPreview,
                         isBatchTier: stagingManager.isBatchTier,
                         isMultiInput: stagingManager.isMultiInput
                     )
@@ -420,20 +418,14 @@ struct InspectorView: View {
             useBatchTier: stagingManager.isBatchTier,
             projectId: project.id
         )
-        let preflightEstimate = PricingEngine.estimate(
-            modelName: stagingManager.selectedModelName,
-            imageSize: stagingManager.imageSize,
-            isBatchTier: stagingManager.isBatchTier,
-            inputCount: stagingManager.estimatedInputCountForCost,
-            outputCount: stagingManager.estimatedOutputCountForCost
-        )
+        let preflightEstimate = stagingManager.costPreview
         DebugLog.info("ui.inspector", "Starting batch", metadata: [
             "model": stagingManager.selectedModelName,
             "aspect_ratio": stagingManager.aspectRatio,
-            "image_size": stagingManager.imageSize,
+            "image_size": stagingManager.costPreview.sizeDescription,
             "batch_tier": String(stagingManager.isBatchTier),
             "generation_count": String(stagingManager.generationCount),
-            "estimated_outputs": String(stagingManager.estimatedOutputCountForCost),
+            "estimated_outputs": String(preflightEstimate.outputCount),
             "estimated_cost": String(preflightEstimate.total)
         ])
         batch.tasks = stagingManager.buildTasksForCurrentConfiguration()

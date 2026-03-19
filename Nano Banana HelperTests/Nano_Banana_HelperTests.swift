@@ -7,6 +7,9 @@
 
 import Testing
 import Foundation
+import AppKit
+import CoreGraphics
+import ImageIO
 @testable import Nano_Banana_Helper
 
 struct Nano_Banana_HelperTests {
@@ -411,6 +414,238 @@ struct Nano_Banana_HelperTests {
         #expect(manager.canStartBatch)
     }
 
+    @Test func historyEntryRoundTripsRegionEditMetadata() throws {
+        let cropRect = CGRect(x: 12, y: 24, width: 48, height: 64)
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/in.png"],
+            outputImagePath: "/tmp/out.png",
+            prompt: "merged prompt",
+            globalPrompt: "global prompt",
+            customPrompt: "region prompt",
+            modelName: ModelCatalog.defaultModelId,
+            aspectRatio: "16:9",
+            imageSize: "1K",
+            usedBatchTier: false,
+            cost: 0.1,
+            sourceImageBookmarks: [Data([0x01])],
+            outputImageBookmark: Data([0x02]),
+            maskImageData: Data([0x03]),
+            regionEditCropRect: cropRect,
+            regionEditProcessingImageSize: "1K"
+        )
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(HistoryEntry.self, from: encoder.encode(entry))
+
+        #expect(decoded.globalPrompt == "global prompt")
+        #expect(decoded.customPrompt == "region prompt")
+        #expect(decoded.maskImageData == Data([0x03]))
+        #expect(decoded.regionEditCropRect == cropRect)
+        #expect(decoded.regionEditProcessingImageSize == "1K")
+    }
+
+    @Test func mergedTaskPromptAppendsRegionClauseExactlyOnce() async throws {
+        let orchestrator = await MainActor.run { BatchOrchestrator() }
+        let prompt = await MainActor.run {
+            orchestrator.mergedTaskPrompt(
+                globalPrompt: "global",
+                customPrompt: "region",
+                isRegionEdit: true
+            )
+        }
+
+        #expect(prompt.contains("Global instructions:\nglobal"))
+        #expect(prompt.contains("Region edit instructions:\nregion"))
+        #expect(prompt.components(separatedBy: "Only change the intended region in this cropped image.").count == 2)
+    }
+
+    @Test func regionEditRequestPayloadOmitsAspectRatioAndSendsSingleImagePart() async throws {
+        let imageURL = try makeTempImageFile(width: 128, height: 128, background: .gray)
+        defer { cleanupFiles([imageURL]) }
+
+        let service = NanoBananaService()
+        let request = ImageEditRequest(
+            inputImageURLs: [imageURL],
+            prompt: "test",
+            systemInstruction: "system",
+            modelName: ModelCatalog.defaultModelId,
+            aspectRatio: "16:9",
+            imageSize: "1K",
+            useBatchTier: false,
+            mode: .regionEdit
+        )
+        let payload = try await service.buildRequestPayload(request: request)
+
+        let imageConfig = ((payload["generationConfig"] as? [String: Any])?["imageConfig"] as? [String: Any]) ?? [:]
+        let parts = (((payload["contents"] as? [[String: Any]])?.first)?["parts"] as? [[String: Any]]) ?? []
+
+        #expect(imageConfig["imageSize"] as? String == "1K")
+        #expect(imageConfig["aspectRatio"] == nil)
+        #expect(parts.count == 2)
+        #expect(parts.dropFirst().count == 1)
+        #expect((parts.dropFirst().first?["inlineData"] as? [String: Any])?["data"] as? String != nil)
+    }
+
+    @Test func regionEditProcessorRejectsEmptyMask() throws {
+        let sourceData = try makePNG(width: 256, height: 256, background: .darkGray)
+        let emptyMaskData = try makeMaskPNG(width: 256, height: 256, rects: [])
+
+        #expect(throws: RegionEditProcessorError.self) {
+            try RegionEditProcessor.prepareCrop(
+                sourceImageData: sourceData,
+                maskImageData: emptyMaskData,
+                marginFraction: 0,
+                minimumMarginPixels: 0
+            )
+        }
+    }
+
+    @Test func regionEditProcessorFindsSingleRegionBounds() throws {
+        let sourceData = try makePNG(width: 256, height: 256, background: .darkGray)
+        let rect = CGRect(x: 40, y: 50, width: 60, height: 70)
+        let maskData = try makeMaskPNG(width: 256, height: 256, rects: [rect])
+
+        let preparation = try RegionEditProcessor.prepareCrop(
+            sourceImageData: sourceData,
+            maskImageData: maskData,
+            marginFraction: 0,
+            minimumMarginPixels: 0
+        )
+
+        #expect(preparation.cropRect == rect.integral)
+    }
+
+    @Test func regionEditProcessorFindsUnionOfMultipleIslands() throws {
+        let sourceData = try makePNG(width: 256, height: 256, background: .darkGray)
+        let first = CGRect(x: 10, y: 20, width: 30, height: 40)
+        let second = CGRect(x: 120, y: 140, width: 50, height: 30)
+        let maskData = try makeMaskPNG(width: 256, height: 256, rects: [first, second])
+
+        let preparation = try RegionEditProcessor.prepareCrop(
+            sourceImageData: sourceData,
+            maskImageData: maskData,
+            marginFraction: 0,
+            minimumMarginPixels: 0
+        )
+
+        #expect(preparation.cropRect == first.union(second).integral)
+    }
+
+    @Test func regionEditProcessorExpandsAndClampsCropNearEdges() throws {
+        let sourceData = try makePNG(width: 200, height: 200, background: .darkGray)
+        let rect = CGRect(x: 5, y: 6, width: 20, height: 18)
+        let maskData = try makeMaskPNG(width: 200, height: 200, rects: [rect])
+
+        let preparation = try RegionEditProcessor.prepareCrop(
+            sourceImageData: sourceData,
+            maskImageData: maskData,
+            marginFraction: 0.5,
+            minimumMarginPixels: 20
+        )
+
+        #expect(preparation.cropRect.minX == 0)
+        #expect(preparation.cropRect.minY == 0)
+        #expect(preparation.cropRect.maxX <= 200)
+        #expect(preparation.cropRect.maxY <= 200)
+    }
+
+    @Test func regionEditCompositePreservesOriginalDimensions() throws {
+        let sourceData = try makePNG(width: 256, height: 256, background: .darkGray)
+        let maskRect = CGRect(x: 80, y: 80, width: 64, height: 64)
+        let maskData = try makeMaskPNG(width: 256, height: 256, rects: [maskRect])
+        let editedCropData = try makePNG(width: 64, height: 64, background: .red)
+
+        let composite = try RegionEditProcessor.compositeEditedCrop(
+            originalImageData: sourceData,
+            editedCropImageData: editedCropData,
+            maskImageData: maskData,
+            cropRect: maskRect
+        )
+
+        #expect(ImageMaskEditorSupport.sourcePixelSize(from: composite.imageData) == CGSize(width: 256, height: 256))
+    }
+
+    @Test func normalizedGeometryIsStableAcrossPreviewSizes() throws {
+        let point = CGPoint(x: 50, y: 40)
+        let firstRect = CGRect(x: 0, y: 0, width: 100, height: 80)
+        let secondRect = CGRect(x: 0, y: 0, width: 500, height: 400)
+
+        let firstNormalized = ImageMaskEditorSupport.normalizePoint(point, in: firstRect)
+        let secondNormalized = ImageMaskEditorSupport.normalizePoint(CGPoint(x: 250, y: 200), in: secondRect)
+
+        #expect(firstNormalized == CGPoint(x: 0.5, y: 0.5))
+        #expect(secondNormalized == firstNormalized)
+    }
+
+    @Test func renderedMaskUsesSourcePixelDimensions() async throws {
+        let path = BatchStagingManager.DrawingPath(
+            points: [CGPoint(x: 0.25, y: 0.25), CGPoint(x: 0.75, y: 0.75)],
+            size: 0.1,
+            isEraser: false
+        )
+
+        let pngData = await MainActor.run {
+            ImageMaskEditorSupport.renderMaskPNG(
+                sourcePixelSize: CGSize(width: 640, height: 320),
+                priorMaskData: nil,
+                drawingPaths: [path]
+            )
+        }
+
+        #expect(pngData != nil)
+        #expect(ImageMaskEditorSupport.sourcePixelSize(from: pngData ?? Data()) == CGSize(width: 640, height: 320))
+    }
+
+    @Test func regionEditCostPreviewUsesChosenProcessingSize() throws {
+        let manager = BatchStagingManager()
+        manager.selectedModelName = ModelCatalog.defaultModelId
+        manager.imageSize = "4K"
+        manager.generationCount = 1
+
+        let imageURL = try makeTempImageFile(width: 1600, height: 1600, background: .darkGray)
+        defer { cleanupFiles([imageURL]) }
+
+        manager.stagedFiles = [imageURL]
+        manager.stagedMaskEdits[imageURL] = BatchStagingManager.StagedMaskEdit(
+            maskData: try makeMaskPNG(width: 1600, height: 1600, rects: [CGRect(x: 700, y: 700, width: 100, height: 100)]),
+            prompt: "replace",
+            paths: []
+        )
+
+        let preview = manager.costPreview
+        let expected = PricingEngine.estimate(
+            modelName: ModelCatalog.defaultModelId,
+            imageSize: "1K",
+            isBatchTier: false,
+            inputCount: 1,
+            outputCount: 1
+        )
+
+        #expect(preview.lineItems.count == 1)
+        #expect(preview.lineItems.first?.imageSize == "1K")
+        #expect(abs(preview.total - expected.total) < 0.000001)
+    }
+
+    @Test func multiInputRegionEditsRemainBlocked() throws {
+        let manager = BatchStagingManager()
+        let url = URL(fileURLWithPath: "/tmp/one.png").standardizedFileURL
+        manager.stagedFiles = [url]
+        manager.isMultiInput = true
+        manager.stagedMaskEdits[url] = BatchStagingManager.StagedMaskEdit(
+            maskData: Data([0x01]),
+            prompt: "region",
+            paths: []
+        )
+
+        #expect(manager.hasAnyRegionEdits)
+        #expect(manager.startBlockReason?.contains("Region Edit is only available in standard batch mode") == true)
+        #expect(!manager.canStartBatch)
+    }
+
     private func makeTempFiles(count: Int, bytesPerFile: Int) throws -> [URL] {
         let directory = FileManager.default.temporaryDirectory
         let data = Data(repeating: 0xFF, count: bytesPerFile)
@@ -428,6 +663,66 @@ struct Nano_Banana_HelperTests {
         for url in urls {
             try? FileManager.default.removeItem(at: url)
         }
+    }
+
+    private func makeTempImageFile(width: Int, height: Int, background: NSColor) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nanobanana-image-\(UUID().uuidString).png")
+        try makePNG(width: width, height: height, background: background).write(to: url, options: .atomic)
+        return url.standardizedFileURL
+    }
+
+    private func makeMaskPNG(width: Int, height: Int, rects: [CGRect]) throws -> Data {
+        try makePNG(width: width, height: height, background: .black, rects: rects, rectColor: .white)
+    }
+
+    private func makePNG(
+        width: Int,
+        height: Int,
+        background: NSColor,
+        rects: [CGRect] = [],
+        rectColor: NSColor = .white
+    ) throws -> Data {
+        let bytesPerRow = width * 4
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+
+        context.setFillColor(background.cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+        context.setFillColor(rectColor.cgColor)
+        for rect in rects {
+            let flippedRect = CGRect(
+                x: rect.minX,
+                y: CGFloat(height) - rect.maxY,
+                width: rect.width,
+                height: rect.height
+            )
+            context.fill(flippedRect)
+        }
+
+        guard let cgImage = context.makeImage() else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        CGImageDestinationAddImage(destination, cgImage, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        return data as Data
     }
 
 }

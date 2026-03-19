@@ -156,6 +156,17 @@ enum RegionEditProcessor {
         return (try encodePNG(compositeCG), "image/png")
     }
 
+    static func chooseProcessingImageSize(cropRect: CGRect, userSelectedMax: String, modelName: String) -> String {
+        let maxDimension = max(cropRect.width, cropRect.height)
+        let allowedSizes = allowedImageSizes(upTo: userSelectedMax, modelName: modelName)
+        for candidate in allowedSizes {
+            if maxDimension <= pixelDimension(forImageSize: candidate) {
+                return candidate
+            }
+        }
+        return allowedSizes.last ?? userSelectedMax
+    }
+
     // MARK: - Geometry
 
     /// Returns bounds of painted pixels in top-left image coordinates.
@@ -225,6 +236,30 @@ enum RegionEditProcessor {
     private static func clampTopLeftRect(_ rect: CGRect, within imageSize: CGSize) -> CGRect {
         let bounds = CGRect(origin: .zero, size: imageSize)
         return rect.intersection(bounds)
+    }
+
+    private static func allowedImageSizes(upTo userSelectedMax: String, modelName: String) -> [String] {
+        let orderedSizes = ["0.5K", "1K", "2K", "4K"]
+        let supported = Set(ModelCatalog.supportedImageSizes(for: modelName))
+        let cappedIndex = orderedSizes.firstIndex(of: userSelectedMax) ?? (orderedSizes.count - 1)
+        return orderedSizes
+            .prefix(cappedIndex + 1)
+            .filter { supported.contains($0) }
+    }
+
+    static func pixelDimension(forImageSize imageSize: String) -> CGFloat {
+        switch imageSize {
+        case "0.5K":
+            return 512
+        case "4K":
+            return 4096
+        case "2K":
+            return 2048
+        case "1K":
+            return 1024
+        default:
+            return 1024
+        }
     }
 
     /// Converts a top-left pixel rect to Core Image's bottom-left coordinate space.

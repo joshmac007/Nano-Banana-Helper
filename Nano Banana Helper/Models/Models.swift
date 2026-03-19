@@ -116,6 +116,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     let sourceImagePaths: [String] // Changed to array for multimodal support
     let outputImagePath: String
     let prompt: String
+    let globalPrompt: String?
+    let customPrompt: String?
     let modelName: String
     let aspectRatio: String
     let imageSize: String
@@ -125,37 +127,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     let error: String?
     let externalJobName: String?
     let maskImageData: Data?
-    
-    init(
-        projectId: UUID,
-        sourceImagePaths: [String],
-        outputImagePath: String,
-        prompt: String,
-        modelName: String = ModelCatalog.defaultModelId,
-        aspectRatio: String,
-        imageSize: String,
-        usedBatchTier: Bool,
-        cost: Double,
-        status: String = "completed",
-        error: String? = nil,
-        externalJobName: String? = nil
-    ) {
-        self.id = UUID()
-        self.projectId = projectId
-        self.timestamp = Date()
-        self.sourceImagePaths = sourceImagePaths
-        self.outputImagePath = outputImagePath
-        self.prompt = prompt
-        self.modelName = modelName
-        self.aspectRatio = aspectRatio
-        self.imageSize = imageSize
-        self.usedBatchTier = usedBatchTier
-        self.cost = cost
-        self.status = status
-        self.error = error
-        self.externalJobName = externalJobName
-        self.maskImageData = nil
-    }
+    let regionEditCropRect: CGRect?
+    let regionEditProcessingImageSize: String?
     
     // Security Scoped Bookmarks
     var sourceImageBookmarks: [Data]?
@@ -169,10 +142,10 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     
     enum CodingKeys: String, CodingKey {
         case id, projectId, timestamp, sourceImagePaths, outputImagePath
-        case prompt, modelName, aspectRatio, imageSize, usedBatchTier, cost
+        case prompt, globalPrompt, customPrompt, modelName, aspectRatio, imageSize, usedBatchTier, cost
         case status, error, externalJobName
         case sourceImageBookmarks, outputImageBookmark
-        case maskImageData
+        case maskImageData, regionEditCropRect, regionEditProcessingImageSize
     }
     
     init(
@@ -180,6 +153,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         sourceImagePaths: [String],
         outputImagePath: String,
         prompt: String,
+        globalPrompt: String? = nil,
+        customPrompt: String? = nil,
         modelName: String = ModelCatalog.defaultModelId,
         aspectRatio: String,
         imageSize: String,
@@ -190,7 +165,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         externalJobName: String? = nil,
         sourceImageBookmarks: [Data]? = nil,
         outputImageBookmark: Data? = nil,
-        maskImageData: Data? = nil
+        maskImageData: Data? = nil,
+        regionEditCropRect: CGRect? = nil,
+        regionEditProcessingImageSize: String? = nil
     ) {
         self.id = UUID()
         self.projectId = projectId
@@ -198,6 +175,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.sourceImagePaths = sourceImagePaths
         self.outputImagePath = outputImagePath
         self.prompt = prompt
+        self.globalPrompt = globalPrompt
+        self.customPrompt = customPrompt
         self.modelName = modelName
         self.aspectRatio = aspectRatio
         self.imageSize = imageSize
@@ -209,6 +188,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.sourceImageBookmarks = sourceImageBookmarks
         self.outputImageBookmark = outputImageBookmark
         self.maskImageData = maskImageData
+        self.regionEditCropRect = regionEditCropRect
+        self.regionEditProcessingImageSize = regionEditProcessingImageSize
     }
     
     init(from decoder: Decoder) throws {
@@ -219,6 +200,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         sourceImagePaths = try container.decode([String].self, forKey: .sourceImagePaths)
         outputImagePath = try container.decode(String.self, forKey: .outputImagePath)
         prompt = try container.decode(String.self, forKey: .prompt)
+        globalPrompt = try container.decodeIfPresent(String.self, forKey: .globalPrompt)
+        customPrompt = try container.decodeIfPresent(String.self, forKey: .customPrompt)
         modelName = try container.decodeIfPresent(String.self, forKey: .modelName) ?? ModelCatalog.defaultModelId
         aspectRatio = try container.decode(String.self, forKey: .aspectRatio)
         imageSize = try container.decode(String.self, forKey: .imageSize)
@@ -230,6 +213,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         sourceImageBookmarks = try container.decodeIfPresent([Data].self, forKey: .sourceImageBookmarks)
         outputImageBookmark = try container.decodeIfPresent(Data.self, forKey: .outputImageBookmark)
         maskImageData = try container.decodeIfPresent(Data.self, forKey: .maskImageData)
+        regionEditCropRect = try container.decodeIfPresent(CGRect.self, forKey: .regionEditCropRect)
+        regionEditProcessingImageSize = try container.decodeIfPresent(String.self, forKey: .regionEditProcessingImageSize)
     }
     
     func encode(to encoder: Encoder) throws {
@@ -240,6 +225,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         try container.encode(sourceImagePaths, forKey: .sourceImagePaths)
         try container.encode(outputImagePath, forKey: .outputImagePath)
         try container.encode(prompt, forKey: .prompt)
+        try container.encodeIfPresent(globalPrompt, forKey: .globalPrompt)
+        try container.encodeIfPresent(customPrompt, forKey: .customPrompt)
         try container.encode(modelName, forKey: .modelName)
         try container.encode(aspectRatio, forKey: .aspectRatio)
         try container.encode(imageSize, forKey: .imageSize)
@@ -251,6 +238,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         try container.encodeIfPresent(sourceImageBookmarks, forKey: .sourceImageBookmarks)
         try container.encodeIfPresent(outputImageBookmark, forKey: .outputImageBookmark)
         try container.encodeIfPresent(maskImageData, forKey: .maskImageData)
+        try container.encodeIfPresent(regionEditCropRect, forKey: .regionEditCropRect)
+        try container.encodeIfPresent(regionEditProcessingImageSize, forKey: .regionEditProcessingImageSize)
     }
 }
 

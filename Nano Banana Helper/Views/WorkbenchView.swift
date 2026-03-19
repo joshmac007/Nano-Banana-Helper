@@ -91,7 +91,7 @@ struct WorkbenchView: View {
     }
 
     private func reuseHistoryEntry(_ entry: HistoryEntry) {
-        stagingManager.prompt = entry.prompt
+        stagingManager.prompt = entry.globalPrompt ?? entry.prompt
         stagingManager.selectedModelName = entry.modelName
         stagingManager.aspectRatio = entry.aspectRatio
         stagingManager.imageSize = entry.imageSize
@@ -111,7 +111,12 @@ struct WorkbenchView: View {
                     reusableBookmarks[url] = sourceBookmarks[index]
                 }
                 if let maskData = entry.maskImageData {
-                    stagingManager.saveMaskEdit(for: url, maskData: maskData, prompt: entry.prompt, paths: [])
+                    stagingManager.saveMaskEdit(
+                        for: url,
+                        maskData: maskData,
+                        prompt: entry.customPrompt ?? entry.prompt,
+                        paths: []
+                    )
                 }
             }
         }

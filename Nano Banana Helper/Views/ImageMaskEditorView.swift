@@ -1,5 +1,141 @@
 import SwiftUI
 import AppKit
+import ImageIO
+
+enum ImageMaskEditorSupport {
+    static func sourcePixelSize(from data: Data) -> CGSize? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            return nil
+        }
+        return CGSize(width: image.width, height: image.height)
+    }
+
+    static func fittedImageRect(imageSize: CGSize, in containerSize: CGSize) -> CGRect {
+        guard
+            containerSize.width > 0,
+            containerSize.height > 0,
+            imageSize.width > 0,
+            imageSize.height > 0
+        else {
+            return CGRect(origin: .zero, size: containerSize)
+        }
+
+        let imageAspect = imageSize.width / imageSize.height
+        let containerAspect = containerSize.width / containerSize.height
+
+        if imageAspect > containerAspect {
+            let width = containerSize.width
+            let height = width / imageAspect
+            return CGRect(
+                x: 0,
+                y: (containerSize.height - height) / 2,
+                width: width,
+                height: height
+            )
+        } else {
+            let height = containerSize.height
+            let width = height * imageAspect
+            return CGRect(
+                x: (containerSize.width - width) / 2,
+                y: 0,
+                width: width,
+                height: height
+            )
+        }
+    }
+
+    static func normalizePoint(_ point: CGPoint, in imageRect: CGRect) -> CGPoint? {
+        guard imageRect.width > 0, imageRect.height > 0 else { return nil }
+        guard imageRect.contains(point) else { return nil }
+        let x = (point.x - imageRect.minX) / imageRect.width
+        let y = (point.y - imageRect.minY) / imageRect.height
+        guard (0...1).contains(x), (0...1).contains(y) else { return nil }
+        return CGPoint(x: x, y: y)
+    }
+
+    static func denormalizePoint(_ point: CGPoint, in imageRect: CGRect) -> CGPoint {
+        CGPoint(
+            x: imageRect.minX + (point.x * imageRect.width),
+            y: imageRect.minY + (point.y * imageRect.height)
+        )
+    }
+
+    static func normalizedBrushSize(brushSize: Double, canvasSize: CGSize) -> CGFloat {
+        let base = max(1, min(canvasSize.width, canvasSize.height))
+        return CGFloat(brushSize) / base
+    }
+
+    static func lineWidth(for path: BatchStagingManager.DrawingPath, in canvasSize: CGSize) -> CGFloat {
+        let base = max(1, min(canvasSize.width, canvasSize.height))
+        let candidate = path.size * base
+        if path.size > 1 { return path.size }
+        return max(1, candidate)
+    }
+
+    static func draw(
+        path: BatchStagingManager.DrawingPath,
+        imageRect: CGRect,
+        using context: GraphicsContext,
+        alpha: Double
+    ) {
+        guard let firstPoint = path.points.first else { return }
+        let usesNormalizedPoints = path.points.allSatisfy { (0...1).contains($0.x) && (0...1).contains($0.y) }
+        var cgPath = Path()
+        let startPoint = usesNormalizedPoints ? denormalizePoint(firstPoint, in: imageRect) : firstPoint
+        cgPath.move(to: startPoint)
+        for point in path.points.dropFirst() {
+            let drawPoint = usesNormalizedPoints ? denormalizePoint(point, in: imageRect) : point
+            cgPath.addLine(to: drawPoint)
+        }
+        var copyContext = context
+        copyContext.blendMode = path.isEraser ? .destinationOut : .normal
+        copyContext.stroke(
+            cgPath,
+            with: .color(.white.opacity(alpha)),
+            style: StrokeStyle(
+                lineWidth: lineWidth(for: path, in: imageRect.size),
+                lineCap: .round,
+                lineJoin: .round
+            )
+        )
+    }
+
+    @MainActor
+    static func renderMaskPNG(
+        sourcePixelSize: CGSize,
+        priorMaskData: Data?,
+        drawingPaths: [BatchStagingManager.DrawingPath]
+    ) -> Data? {
+        let priorMask = priorMaskData.flatMap(NSImage.init(data:))
+        let maskView = ZStack {
+            Color.black
+            Canvas { context, size in
+                let fullImageRect = CGRect(origin: .zero, size: size)
+                if let priorMask {
+                    var drawContext = context
+                    drawContext.blendMode = .screen
+                    drawContext.draw(Image(nsImage: priorMask), in: fullImageRect)
+                }
+
+                for path in drawingPaths {
+                    draw(path: path, imageRect: fullImageRect, using: context, alpha: 1.0)
+                }
+            }
+        }
+        .frame(width: sourcePixelSize.width, height: sourcePixelSize.height)
+
+        let renderer = ImageRenderer(content: maskView)
+        renderer.proposedSize = .init(width: sourcePixelSize.width, height: sourcePixelSize.height)
+
+        guard let nsImage = renderer.nsImage,
+              let tiffData = nsImage.tiffRepresentation,
+              let bitmapImage = NSBitmapImageRep(data: tiffData) else {
+            return nil
+        }
+        return bitmapImage.representation(using: .png, properties: [:])
+    }
+}
 
 struct ImageMaskEditorView: View {
     @Environment(\.dismiss) private var dismiss
@@ -15,6 +151,7 @@ struct ImageMaskEditorView: View {
     @State private var loadedMaskImage: NSImage?
     @State private var drawingPaths: [BatchStagingManager.DrawingPath] = []
     @State private var currentPath: BatchStagingManager.DrawingPath?
+    @State private var sourcePixelSize: CGSize = .zero
     
     @State private var brushSize: Double = 30
     @State private var isEraserActive: Bool = false
@@ -187,59 +324,35 @@ struct ImageMaskEditorView: View {
         if let initialData = initialMaskData {
             self.loadedMaskImage = NSImage(data: initialData)
         }
-        
-        // Try direct load first (works for drag-and-drop and accessible paths)
-        if let image = NSImage(contentsOfFile: inputImageURL.path) {
-            self.baseImage = image
-            return
+
+        guard let imageData = loadSourceImageData() else { return }
+        self.baseImage = NSImage(data: imageData)
+        self.sourcePixelSize = ImageMaskEditorSupport.sourcePixelSize(from: imageData) ?? baseImage?.size ?? .zero
+    }
+
+    private func loadSourceImageData() -> Data? {
+        if let data = try? Data(contentsOf: inputImageURL) {
+            return data
         }
-        
-        // Try resolving via bookmark
-        if let data = inputBookmark {
-            let image = AppPaths.withResolvedBookmark(data) { resolvedURL in
-                return NSImage(contentsOfFile: resolvedURL.path)
-            }?.flatMap { $0 }
-            
-            if let img = image {
-                self.baseImage = img
-            }
-        }
+
+        guard let bookmark = inputBookmark else { return nil }
+        return AppPaths.withResolvedBookmark(bookmark) { resolvedURL in
+            try? Data(contentsOf: resolvedURL)
+        } ?? nil
     }
     
     private func generateMaskAndSave() {
-        guard let baseImage = baseImage else { return }
+        guard baseImage != nil else { return }
+        let pixelSize = sourcePixelSize.width > 0 && sourcePixelSize.height > 0 ? sourcePixelSize : (baseImage?.size ?? .zero)
+        guard pixelSize.width > 0, pixelSize.height > 0 else { return }
         isGenerating = true
-        
-        // Render the mask off-screen
-        // The mask needs to be the exact pixel dimensions of the original image
-        let imageSize = baseImage.size
-        
+
         Task { @MainActor in
-            let maskView = ZStack {
-                Color.black
-                Canvas { context, size in
-                    let fullImageRect = CGRect(origin: .zero, size: size)
-                    if let priorMask = loadedMaskImage {
-                        var drawContext = context
-                        drawContext.blendMode = .screen
-                        drawContext.draw(Image(nsImage: priorMask), in: fullImageRect)
-                    }
-                    
-                    for path in drawingPaths {
-                        draw(path: path, in: size, imageRect: fullImageRect, using: context, alpha: 1.0)
-                    }
-                }
-            }
-            .frame(width: imageSize.width, height: imageSize.height) // Render at true image resolution
-            
-            let renderer = ImageRenderer(content: maskView)
-            renderer.proposedSize = .init(width: imageSize.width, height: imageSize.height)
-            
-            if let nsImage = renderer.nsImage,
-               let tiffData = nsImage.tiffRepresentation,
-               let bitmapImage = NSBitmapImageRep(data: tiffData),
-               let pngData = bitmapImage.representation(using: .png, properties: [:]) {
-                
+            if let pngData = ImageMaskEditorSupport.renderMaskPNG(
+                sourcePixelSize: pixelSize,
+                priorMaskData: initialMaskData,
+                drawingPaths: drawingPaths
+            ) {
                 onSaveMask(pngData, prompt, drawingPaths)
                 dismiss()
             } else {
@@ -250,67 +363,26 @@ struct ImageMaskEditorView: View {
     }
 
     private func fittedImageRect(in containerSize: CGSize) -> CGRect {
-        guard
-            let baseImage = baseImage,
-            containerSize.width > 0,
-            containerSize.height > 0,
-            baseImage.size.width > 0,
-            baseImage.size.height > 0
-        else {
-            return CGRect(origin: .zero, size: containerSize)
-        }
-
-        let imageAspect = baseImage.size.width / baseImage.size.height
-        let containerAspect = containerSize.width / containerSize.height
-
-        if imageAspect > containerAspect {
-            let width = containerSize.width
-            let height = width / imageAspect
-            return CGRect(
-                x: 0,
-                y: (containerSize.height - height) / 2,
-                width: width,
-                height: height
-            )
-        } else {
-            let height = containerSize.height
-            let width = height * imageAspect
-            return CGRect(
-                x: (containerSize.width - width) / 2,
-                y: 0,
-                width: width,
-                height: height
-            )
-        }
+        let imageSize = sourcePixelSize.width > 0 && sourcePixelSize.height > 0
+            ? sourcePixelSize
+            : (baseImage?.size ?? .zero)
+        return ImageMaskEditorSupport.fittedImageRect(imageSize: imageSize, in: containerSize)
     }
 
     private func normalizePoint(_ point: CGPoint, in imageRect: CGRect) -> CGPoint? {
-        guard imageRect.width > 0, imageRect.height > 0 else { return nil }
-        guard imageRect.contains(point) else { return nil }
-        let x = (point.x - imageRect.minX) / imageRect.width
-        let y = (point.y - imageRect.minY) / imageRect.height
-        guard (0...1).contains(x), (0...1).contains(y) else { return nil }
-        return CGPoint(x: x, y: y)
+        ImageMaskEditorSupport.normalizePoint(point, in: imageRect)
     }
 
     private func denormalizePoint(_ point: CGPoint, in imageRect: CGRect) -> CGPoint {
-        CGPoint(
-            x: imageRect.minX + (point.x * imageRect.width),
-            y: imageRect.minY + (point.y * imageRect.height)
-        )
+        ImageMaskEditorSupport.denormalizePoint(point, in: imageRect)
     }
 
     private func normalizedBrushSize(for canvasSize: CGSize) -> CGFloat {
-        let base = max(1, min(canvasSize.width, canvasSize.height))
-        return CGFloat(brushSize) / base
+        ImageMaskEditorSupport.normalizedBrushSize(brushSize: brushSize, canvasSize: canvasSize)
     }
 
     private func lineWidth(for path: BatchStagingManager.DrawingPath, in canvasSize: CGSize) -> CGFloat {
-        let base = max(1, min(canvasSize.width, canvasSize.height))
-        let candidate = path.size * base
-        // Backward-compat fallback: older in-memory paths may have absolute pixel widths.
-        if path.size > 1 { return path.size }
-        return max(1, candidate)
+        ImageMaskEditorSupport.lineWidth(for: path, in: canvasSize)
     }
 
     private func draw(
@@ -320,25 +392,6 @@ struct ImageMaskEditorView: View {
         using context: GraphicsContext,
         alpha: Double
     ) {
-        guard let firstPoint = path.points.first else { return }
-        let usesNormalizedPoints = path.points.allSatisfy { (0...1).contains($0.x) && (0...1).contains($0.y) }
-        var cgPath = Path()
-        let startPoint = usesNormalizedPoints ? denormalizePoint(firstPoint, in: imageRect) : firstPoint
-        cgPath.move(to: startPoint)
-        for point in path.points.dropFirst() {
-            let drawPoint = usesNormalizedPoints ? denormalizePoint(point, in: imageRect) : point
-            cgPath.addLine(to: drawPoint)
-        }
-        var copyContext = context
-        copyContext.blendMode = path.isEraser ? .destinationOut : .normal
-        copyContext.stroke(
-            cgPath,
-            with: .color(.white.opacity(alpha)),
-            style: StrokeStyle(
-                lineWidth: lineWidth(for: path, in: imageRect.size),
-                lineCap: .round,
-                lineJoin: .round
-            )
-        )
+        ImageMaskEditorSupport.draw(path: path, imageRect: imageRect, using: context, alpha: alpha)
     }
 }

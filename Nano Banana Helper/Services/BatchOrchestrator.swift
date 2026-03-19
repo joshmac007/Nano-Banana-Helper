@@ -422,15 +422,25 @@ final class BatchOrchestrator {
                     projectId: projectId,
                     sourceImagePaths: job.inputPaths,
                     outputImagePath: "",
-                    prompt: batch.prompt,
+                    prompt: mergedTaskPrompt(
+                        globalPrompt: batch.prompt,
+                        customPrompt: job.customPrompt,
+                        isRegionEdit: job.maskImageData != nil
+                    ),
+                    globalPrompt: batch.prompt,
+                    customPrompt: job.customPrompt,
                     modelName: batch.modelName,
                     aspectRatio: batch.aspectRatio,
-                    imageSize: batch.imageSize,
+                    imageSize: job.regionEditProcessingImageSize ?? batch.imageSize,
                     usedBatchTier: batch.useBatchTier,
                     cost: 0,
                     status: "cancelled",
                     error: "Cancelled by user",
-                    externalJobName: job.externalJobName
+                    externalJobName: job.externalJobName,
+                    sourceImageBookmarks: job.inputBookmarks?.isEmpty == false ? job.inputBookmarks : nil,
+                    maskImageData: job.maskImageData,
+                    regionEditCropRect: job.regionEditCropRect,
+                    regionEditProcessingImageSize: job.regionEditProcessingImageSize
                 )
                 if let jobName = job.externalJobName {
                     onHistoryEntryUpdated?(jobName, entry)
@@ -1151,7 +1161,7 @@ final class BatchOrchestrator {
 
                 if let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == data.id }) {
                     job.regionEditCropRect = preparation.cropRect
-                    let chosenSize = chooseRegionEditProcessingImageSize(
+                    let chosenSize = RegionEditProcessor.chooseProcessingImageSize(
                         cropRect: preparation.cropRect,
                         userSelectedMax: settings.imageSize,
                         modelName: settings.modelName
@@ -1180,13 +1190,13 @@ final class BatchOrchestrator {
 
         let request = ImageEditRequest(
             inputImageURLs: requestInputURLs,
-            maskImageData: data.maskImageData,
             prompt: mergedPrompt,
             systemInstruction: settings.systemPrompt,
             modelName: settings.modelName,
             aspectRatio: settings.aspectRatio,
             imageSize: requestImageSize,
-            useBatchTier: settings.useBatchTier
+            useBatchTier: settings.useBatchTier,
+            mode: data.maskImageData != nil ? .regionEdit : .standard
         )
         
         do {
@@ -1217,13 +1227,19 @@ final class BatchOrchestrator {
                                 sourceImagePaths: job.inputPaths,
                                 outputImagePath: "",
                                 prompt: mergedPrompt,
+                                globalPrompt: settings.prompt,
+                                customPrompt: job.customPrompt,
                                 modelName: settings.modelName,
                                 aspectRatio: settings.aspectRatio,
                                 imageSize: job.regionEditProcessingImageSize ?? settings.imageSize,
                                 usedBatchTier: settings.useBatchTier,
                                 cost: 0,
                                 status: "processing",
-                                externalJobName: jobInfo.jobName
+                                externalJobName: jobInfo.jobName,
+                                sourceImageBookmarks: job.inputBookmarks?.isEmpty == false ? job.inputBookmarks : nil,
+                                maskImageData: job.maskImageData,
+                                regionEditCropRect: job.regionEditCropRect,
+                                regionEditProcessingImageSize: job.regionEditProcessingImageSize
                             )
                             onImageCompleted?(entry)
                         }
@@ -1431,6 +1447,8 @@ final class BatchOrchestrator {
                         customPrompt: job.customPrompt,
                         isRegionEdit: (job.maskImageData ?? data.maskImageData) != nil
                     ),
+                    globalPrompt: settings.prompt,
+                    customPrompt: job.customPrompt,
                     modelName: settings.modelName,
                     aspectRatio: settings.aspectRatio,
                     imageSize: effectiveImageSize,
@@ -1439,7 +1457,10 @@ final class BatchOrchestrator {
                     status: "completed",
                     externalJobName: jobName,
                     sourceImageBookmarks: sourceBookmarks.isEmpty ? nil : sourceBookmarks,
-                    outputImageBookmark: outputBookmark
+                    outputImageBookmark: outputBookmark,
+                    maskImageData: job.maskImageData,
+                    regionEditCropRect: job.regionEditCropRect,
+                    regionEditProcessingImageSize: job.regionEditProcessingImageSize
                 )
                 
                 if let jobName = jobName {
@@ -1491,6 +1512,8 @@ final class BatchOrchestrator {
                     customPrompt: job.customPrompt,
                     isRegionEdit: (job.maskImageData ?? data.maskImageData) != nil
                 ),
+                globalPrompt: settings.prompt,
+                customPrompt: job.customPrompt,
                 modelName: settings.modelName,
                 aspectRatio: settings.aspectRatio,
                 imageSize: job.regionEditProcessingImageSize ?? settings.imageSize,
@@ -1498,7 +1521,11 @@ final class BatchOrchestrator {
                 cost: 0,
                 status: "failed",
                 error: error.localizedDescription,
-                externalJobName: job.externalJobName
+                externalJobName: job.externalJobName,
+                sourceImageBookmarks: job.inputBookmarks?.isEmpty == false ? job.inputBookmarks : nil,
+                maskImageData: job.maskImageData,
+                regionEditCropRect: job.regionEditCropRect,
+                regionEditProcessingImageSize: job.regionEditProcessingImageSize
             )
             
             if let jobName = job.externalJobName {
@@ -1881,7 +1908,7 @@ final class BatchOrchestrator {
         return try Data(contentsOf: sourceURL)
     }
 
-    private func mergedTaskPrompt(globalPrompt: String, customPrompt: String?, isRegionEdit: Bool) -> String {
+    func mergedTaskPrompt(globalPrompt: String, customPrompt: String?, isRegionEdit: Bool) -> String {
         let global = globalPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let custom = (customPrompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -1899,41 +1926,6 @@ final class BatchOrchestrator {
             return regionEditPromptClause
         }
         return "\(base)\n\n\(regionEditPromptClause)"
-    }
-
-    private func chooseRegionEditProcessingImageSize(cropRect: CGRect, userSelectedMax: String, modelName: String) -> String {
-        let maxDimension = max(cropRect.width, cropRect.height)
-        let allowedSizes = allowedImageSizes(upTo: userSelectedMax, modelName: modelName)
-        for candidate in allowedSizes {
-            if maxDimension <= pixelDimension(forImageSize: candidate) {
-                return candidate
-            }
-        }
-        return allowedSizes.last ?? userSelectedMax
-    }
-
-    private func allowedImageSizes(upTo userSelectedMax: String, modelName: String) -> [String] {
-        let orderedSizes = ["0.5K", "1K", "2K", "4K"]
-        let supported = Set(ModelCatalog.supportedImageSizes(for: modelName))
-        let cappedIndex = orderedSizes.firstIndex(of: userSelectedMax) ?? (orderedSizes.count - 1)
-        return orderedSizes
-            .prefix(cappedIndex + 1)
-            .filter { supported.contains($0) }
-    }
-
-    private func pixelDimension(forImageSize imageSize: String) -> CGFloat {
-        switch imageSize {
-        case "0.5K":
-            return 512
-        case "4K":
-            return 4096
-        case "2K":
-            return 2048
-        case "1K":
-            return 1024
-        default:
-            return 1024
-        }
     }
 
     private func generateOutputURL(for task: ImageTask, inDirectory directoryURL: URL, mimeType: String) -> URL {
@@ -2165,6 +2157,10 @@ final class BatchOrchestrator {
             projectId: entry.projectId,
             inputBookmarks: entry.sourceImageBookmarks
         )
+        task.maskImageData = entry.maskImageData
+        task.regionEditCropRect = entry.regionEditCropRect
+        task.regionEditProcessingImageSize = entry.regionEditProcessingImageSize
+        task.customPrompt = entry.customPrompt
         task.externalJobName = jobName
         task.status = .processing
         task.phase = .polling
@@ -2182,7 +2178,7 @@ final class BatchOrchestrator {
         }
 
         let batch = BatchJob(
-            prompt: entry.prompt,
+            prompt: entry.globalPrompt ?? entry.prompt,
             modelName: entry.modelName,
             aspectRatio: entry.aspectRatio,
             imageSize: entry.imageSize,

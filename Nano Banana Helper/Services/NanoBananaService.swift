@@ -1,15 +1,20 @@
 import Foundation
 
+enum ImageEditRequestMode: Sendable {
+    case standard
+    case regionEdit
+}
+
 /// Request structure for image editing
 struct ImageEditRequest: Sendable {
     let inputImageURLs: [URL] // Changed to array
-    let maskImageData: Data? // Added for inpainting
     let prompt: String
     let systemInstruction: String?
     let modelName: String
     let aspectRatio: String
     let imageSize: String
     let useBatchTier: Bool
+    let mode: ImageEditRequestMode
 }
 
 /// Response structure from Gemini API
@@ -142,7 +147,7 @@ actor NanoBananaService {
         return try await createBatchJobRecord(payload, modelName: selectedModel, apiKey: apiKey)
     }
     
-    private func buildRequestPayload(request: ImageEditRequest) async throws -> [String: Any] {
+    func buildRequestPayload(request: ImageEditRequest) async throws -> [String: Any] {
         let activeModel = request.modelName.isEmpty ? await fallbackModelName : request.modelName
         try validateImageCount(request.inputImageURLs.count, forModel: activeModel)
         if !ModelCatalog.isAspectRatioSupported(request.aspectRatio, for: activeModel) {
@@ -190,7 +195,7 @@ actor NanoBananaService {
         let aspectRatio = ModelCatalog.sanitizeAspectRatio(request.aspectRatio, for: activeModel)
         let apiImageSize = try apiImageSizeValue(for: request.imageSize, modelName: activeModel)
         var imageConfig: [String: Any] = ["imageSize": apiImageSize]
-        if aspectRatio != "Auto" {
+        if request.mode != .regionEdit && aspectRatio != "Auto" {
             imageConfig["aspectRatio"] = aspectRatio
         }
         

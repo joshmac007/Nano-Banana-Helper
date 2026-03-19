@@ -17,6 +17,37 @@ class BatchStagingManager {
         var hasRejections: Bool { !rejectedURLsWithReason.isEmpty }
     }
 
+    struct CostPreviewLineItem: Sendable, Equatable {
+        let imageSize: String
+        let requestCount: Int
+        let inputCount: Int
+        let outputCount: Int
+        let total: Double
+        let inputCost: Double
+        let outputCost: Double
+    }
+
+    struct CostPreview: Sendable, Equatable {
+        let lineItems: [CostPreviewLineItem]
+
+        var total: Double { lineItems.reduce(0) { $0 + $1.total } }
+        var inputCount: Int { lineItems.reduce(0) { $0 + $1.inputCount } }
+        var outputCount: Int { lineItems.reduce(0) { $0 + $1.outputCount } }
+        var inputCost: Double { lineItems.reduce(0) { $0 + $1.inputCost } }
+        var outputCost: Double { lineItems.reduce(0) { $0 + $1.outputCost } }
+
+        var sizeDescription: String {
+            guard let first = lineItems.first else { return "1K" }
+            if lineItems.count == 1 {
+                return first.imageSize
+            }
+            let summary = lineItems
+                .map { "\($0.imageSize)x\($0.requestCount)" }
+                .joined(separator: ", ")
+            return "mixed sizes (\(summary))"
+        }
+    }
+
     // Staged Items
     var stagedFiles: [URL] = []
     
@@ -43,17 +74,23 @@ class BatchStagingManager {
     
     // Cached file sizes for oversized payload estimation
     private var cachedFileSizes: [URL: Int] = [:]
+    private var cachedRegionEditProcessingSizes: [URL: String] = [:]
     
     // Batch Configuration (Synced with Inspector)
     var prompt: String = ""
     var systemPrompt: String = "" // New System Prompt
     var selectedModelName: String = ModelCatalog.defaultModelId {
         didSet {
+            clearRegionEditCostPreviewCache()
             sanitizeSelectionsForCurrentModel()
         }
     }
     var aspectRatio: String = "Auto" // Changed to Auto
-    var imageSize: String = "4K"
+    var imageSize: String = "4K" {
+        didSet {
+            clearRegionEditCostPreviewCache()
+        }
+    }
     var isBatchTier: Bool = false
     var isMultiInput: Bool = false
     var generationCount: Int = 1 {
@@ -123,6 +160,10 @@ class BatchStagingManager {
         return hasValidInput && hasSufficientPrompts && startBlockReason == nil
     }
 
+    var costPreview: CostPreview {
+        CostPreview(lineItems: buildCostPreviewLineItems())
+    }
+
     var batchPayloadPreflightWarning: String? {
         guard isBatchTier else { return nil }
         guard let oversized = firstOversizedBatchPayloadEstimate else { return nil }
@@ -161,6 +202,7 @@ class BatchStagingManager {
             !stagedFiles.contains(url)
         }
         stagedFiles.append(contentsOf: newFiles)
+        clearRegionEditCostPreviewCache()
         
         // Store any provided bookmarks
         for (url, bookmark) in normalizedBookmarks {
@@ -237,6 +279,7 @@ class BatchStagingManager {
         stagedBookmarks.removeValue(forKey: normalized)
         stagedMaskEdits.removeValue(forKey: normalized)
         cachedFileSizes.removeValue(forKey: normalized)
+        cachedRegionEditProcessingSizes.removeValue(forKey: normalized)
     }
     
     func clearAll() {
@@ -244,6 +287,7 @@ class BatchStagingManager {
         stagedBookmarks.removeAll()
         stagedMaskEdits.removeAll()
         cachedFileSizes.removeAll()
+        cachedRegionEditProcessingSizes.removeAll()
         // Do NOT clear system prompt on batch clear, it's persistent configuration
     }
     
@@ -306,6 +350,7 @@ class BatchStagingManager {
             isMultiInput = false
         }
         stagedMaskEdits[url.standardizedFileURL] = StagedMaskEdit(maskData: maskData, prompt: prompt, paths: paths)
+        cachedRegionEditProcessingSizes.removeValue(forKey: url.standardizedFileURL)
     }
     
     func hasMaskEdit(for url: URL) -> Bool {
@@ -381,6 +426,121 @@ class BatchStagingManager {
         }
 
         return fileSizeBytes(atPath: path)
+    }
+
+    private func clearRegionEditCostPreviewCache() {
+        cachedRegionEditProcessingSizes.removeAll()
+    }
+
+    private func buildCostPreviewLineItems() -> [CostPreviewLineItem] {
+        if stagedFiles.isEmpty {
+            let estimate = PricingEngine.estimate(
+                modelName: selectedModelName,
+                imageSize: imageSize,
+                isBatchTier: isBatchTier,
+                inputCount: 0,
+                outputCount: generationCount
+            )
+            return [CostPreviewLineItem(
+                imageSize: imageSize,
+                requestCount: generationCount,
+                inputCount: 0,
+                outputCount: generationCount,
+                total: estimate.total,
+                inputCost: estimate.inputCost,
+                outputCost: estimate.outputCost
+            )]
+        }
+
+        if isMultiInput {
+            let inputCount = stagedFiles.count * generationCount
+            let estimate = PricingEngine.estimate(
+                modelName: selectedModelName,
+                imageSize: imageSize,
+                isBatchTier: isBatchTier,
+                inputCount: inputCount,
+                outputCount: generationCount
+            )
+            return [CostPreviewLineItem(
+                imageSize: imageSize,
+                requestCount: generationCount,
+                inputCount: inputCount,
+                outputCount: generationCount,
+                total: estimate.total,
+                inputCost: estimate.inputCost,
+                outputCost: estimate.outputCost
+            )]
+        }
+
+        var grouped: [String: (requests: Int, inputs: Int, outputs: Int)] = [:]
+        for url in stagedFiles {
+            let effectiveSize = estimatedProcessingImageSize(for: url)
+            var counts = grouped[effectiveSize, default: (0, 0, 0)]
+            counts.requests += generationCount
+            counts.inputs += generationCount
+            counts.outputs += generationCount
+            grouped[effectiveSize] = counts
+        }
+
+        return grouped
+            .map { imageSize, counts in
+                let estimate = PricingEngine.estimate(
+                    modelName: selectedModelName,
+                    imageSize: imageSize,
+                    isBatchTier: isBatchTier,
+                    inputCount: counts.inputs,
+                    outputCount: counts.outputs
+                )
+                return CostPreviewLineItem(
+                    imageSize: imageSize,
+                    requestCount: counts.requests,
+                    inputCount: counts.inputs,
+                    outputCount: counts.outputs,
+                    total: estimate.total,
+                    inputCost: estimate.inputCost,
+                    outputCost: estimate.outputCost
+                )
+            }
+            .sorted {
+                RegionEditProcessor.pixelDimension(forImageSize: $0.imageSize) <
+                    RegionEditProcessor.pixelDimension(forImageSize: $1.imageSize)
+            }
+    }
+
+    private func estimatedProcessingImageSize(for url: URL) -> String {
+        let normalizedURL = url.standardizedFileURL
+        guard let stagedEdit = stagedMaskEdits[normalizedURL] else {
+            return imageSize
+        }
+        if let cached = cachedRegionEditProcessingSizes[normalizedURL] {
+            return cached
+        }
+        guard let sourceImageData = sourceImageData(for: normalizedURL),
+              let preparation = try? RegionEditProcessor.prepareCrop(
+                sourceImageData: sourceImageData,
+                maskImageData: stagedEdit.maskData
+              ) else {
+            return imageSize
+        }
+        let chosenSize = RegionEditProcessor.chooseProcessingImageSize(
+            cropRect: preparation.cropRect,
+            userSelectedMax: imageSize,
+            modelName: selectedModelName
+        )
+        cachedRegionEditProcessingSizes[normalizedURL] = chosenSize
+        return chosenSize
+    }
+
+    private func sourceImageData(for normalizedURL: URL) -> Data? {
+        let path = normalizedURL.path
+
+        if let bookmark = stagedBookmarks[normalizedURL], securityScopedPathing.requiresSecurityScope(path: path) {
+            return securityScopedPathing.withResolvedBookmark(bookmark) { scopedURL in
+                try? Data(contentsOf: scopedURL)
+            } ?? (try? Data(contentsOf: normalizedURL))
+        }
+
+        return try? Data(contentsOf: normalizedURL)
     }
 
     private func fileSizeBytes(atPath path: String) -> Int {

@@ -50,7 +50,7 @@ actor NanoBananaService {
     
     private var modelName: String {
         get async {
-            await MainActor.run { AppConfig.load().modelName } ?? "gemini-3-pro-image-preview"
+            await MainActor.run { AppConfig.load().modelName } ?? "gemini-3.1-flash-image-preview"
         }
     }
     
@@ -83,6 +83,20 @@ actor NanoBananaService {
     
     func hasAPIKey() async -> Bool {
         await getAPIKey() != nil
+    }
+    
+    // MARK: - Model Name Management
+    
+    func setModelName(_ name: String) async {
+        await MainActor.run {
+            var config = AppConfig.load()
+            config.modelName = name.isEmpty ? nil : name
+            config.save()
+        }
+    }
+    
+    func getModelName() async -> String {
+        await MainActor.run { AppConfig.load().modelName } ?? "gemini-3.1-flash-image-preview"
     }
     
     // MARK: - Image Editing

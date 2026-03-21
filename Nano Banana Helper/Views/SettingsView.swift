@@ -8,6 +8,7 @@ struct SettingsView: View {
     @State private var hasExistingKey: Bool = false
     @State private var isLoaded: Bool = false
     @State private var selectedTab: SettingsTab = .api
+    @State private var selectedModel: String = "gemini-3.1-flash-image-preview"
     
     @Environment(ProjectManager.self) private var projectManager
     @Environment(PromptLibrary.self) private var promptLibrary
@@ -63,6 +64,7 @@ struct SettingsView: View {
         .onAppear {
             if !isLoaded {
                 checkExistingKey()
+                loadCurrentModel()
                 isLoaded = true
             }
         }
@@ -112,6 +114,26 @@ struct SettingsView: View {
                                     .frame(width: 20, height: 20)
                             }
                             .buttonStyle(.plain)
+                        }
+                    }
+                    
+                    // Model Selection Row
+                    HStack(alignment: .center) {
+                        Text("Image Model")
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                        
+                        Spacer()
+                        
+                        Picker("", selection: $selectedModel) {
+                            Text("Nano Banana 2 (Default)").tag("gemini-3.1-flash-image-preview")
+                            Text("Nano Banana (Stable)").tag("gemini-2.5-flash-image-preview")
+                            Text("Nano Banana Pro (Legacy)").tag("gemini-3-pro-image-preview")
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 200)
+                        .onChange(of: selectedModel) { _, newValue in
+                            saveModelSelection(newValue)
                         }
                     }
                     
@@ -331,6 +353,20 @@ struct SettingsView: View {
             }
         } else {
             showKey.toggle()
+        }
+    }
+    
+    private func loadCurrentModel() {
+        let service = NanoBananaService()
+        Task {
+            selectedModel = await service.getModelName()
+        }
+    }
+    
+    private func saveModelSelection(_ modelName: String) {
+        let service = NanoBananaService()
+        Task {
+            await service.setModelName(modelName)
         }
     }
 }

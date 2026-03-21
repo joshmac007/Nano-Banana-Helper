@@ -11,7 +11,7 @@ struct InspectorView: View {
     @State private var newPromptName = ""
     @State private var activePromptTab: PromptType = .user // Tab State
     
-    let sizes = ["1K", "2K", "4K"]
+    let sizes = ImageSize.allCases.map { $0.rawValue }
     
     var body: some View {
         VStack(spacing: 0) {

@@ -21,24 +21,7 @@ struct BatchSettings: Sendable {
     
     // Helper for cost calculation
     func cost(inputCount: Int) -> Double {
-        let inputRate = useBatchTier ? 0.0006 : 0.0011
-        let inputCost = inputRate * Double(max(1, inputCount))
-        
-        let outputCost: Double
-        if useBatchTier {
-            switch imageSize {
-            case "4K": outputCost = 0.12
-            case "2K", "1K": outputCost = 0.067
-            default: outputCost = 0.067
-            }
-        } else {
-            switch imageSize {
-            case "4K": outputCost = 0.24
-            case "2K", "1K": outputCost = 0.134
-            default: outputCost = 0.134
-            }
-        }
-        return inputCost + outputCost
+        ImageSize.calculateCost(imageSize: imageSize, inputCount: inputCount, isBatchTier: useBatchTier)
     }
 }
 

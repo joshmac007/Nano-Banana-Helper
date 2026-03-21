@@ -29,21 +29,10 @@ struct CostEstimatorView: View {
     private var inputCostPerImage: Double { isBatchTier ? 0.0006 : 0.0011 }
     
     private var outputCostPerImage: Double {
-        if isBatchTier {
-            // Batch Tier: 50% cheaper
-            switch imageSize {
-            case "4K": return 0.12
-            case "2K", "1K": return 0.067
-            default: return 0.067
-            }
-        } else {
-            // Standard Tier
-            switch imageSize {
-            case "4K": return 0.24
-            case "2K", "1K": return 0.134
-            default: return 0.134
-            }
+        guard let size = ImageSize(rawValue: imageSize) else {
+            return isBatchTier ? 0.067 : 0.134 // fallback to 1K pricing
         }
+        return size.cost(isBatchTier: isBatchTier)
     }
     
     /// Number of output images: 1 if Multi-Input, otherwise same as input count

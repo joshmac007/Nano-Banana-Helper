@@ -4,6 +4,7 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 
 ![MainScreen](https://github.com/joshmac007/Nano-Banana-Helper/blob/main/MainScreen.jpeg)
 
+![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)
 ![Swift 6.0](https://img.shields.io/badge/Swift-6.0-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -15,11 +16,12 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 - **Smart Staging**: Drag and drop support for individual images or entire directories.
 - **Multi-Input Mode**: Merge multiple input images into a single output using advanced prompt instructions.
 - **Cost Estimation**: Real-time cost calculation based on image size, count, and selected model tier.
+- **Model Selection**: Choose between Nano Banana 2 (fastest), Nano Banana (stable), or Nano Banana Pro (highest quality) in Settings.
 
 ### 🛠️ Advanced Tools
 - **Inspector Panel**: 
-  - Fine-tune aspect ratios (1:1, 16:9, 9:16, 4:3, 3:4).
-  - Select output resolution (1K, 2K, 4K).
+  - Fine-tune aspect ratios including panoramic (4:1, 8:1) and vertical (1:4, 1:8) formats.
+  - Select output resolution (512, 1K, 2K, 4K).
   - Toggle **Batch Tier** for 50% cost savings on non-urgent jobs.
 - **Prompt Library**: Save and reuse your most effective prompt templates.
 - **History Tracking**: Comprehensive log of all jobs with parameters, costs, and status. Resumable workflows from history.
@@ -42,26 +44,35 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 - Xcode 15.0+ (for building from source)
 - A Google Cloud Project with Vertex AI / Gemini API access
 
+## Supported Models
+
+| Model | Display Name | Best For |
+|-------|--------------|----------|
+| `gemini-3.1-flash-image-preview` | Nano Banana 2 | Speed, high-volume workflows (default) |
+| `gemini-2.5-flash-image-preview` | Nano Banana | Stable, reliable image generation |
+| `gemini-3-pro-image-preview` | Nano Banana Pro | Complex, multi-turn image editing |
+
 ## Installation
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/nano-banana-pro.git
-   cd nano-banana-pro
+   git clone https://github.com/froggeric/Nano-Banana-Helper.git
+   cd Nano-Banana-Helper
    ```
 
 2. **Open in Xcode**
-   Double-click `Package.swift` or run:
+   Double-click `Nano Banana Helper.xcodeproj` or run:
    ```bash
    xed .
    ```
 
 3. **Build and Run**
-   Select "NanoBananaProAssistant" scheme and target "My Mac". Press `Cmd+R` to build and run.
+   Select "Nano Banana Helper" scheme and target "My Mac". Press `Cmd+R` to build and run.
 
 ## Usage Guide
 
 1. **Setup API Key**: On first launch, go to **Settings** (`Cmd+,`) and enter your Gemini API Key.
+2. **Select Model** (optional): In Settings, choose your preferred image generation model.
 2. **Create a Project**: Use the "+" button in the gallery to start a new workspace.
 3. **Stage Images**: Drag images onto the "Drop Zone" in the Workbench.
 4. **Configure**: 

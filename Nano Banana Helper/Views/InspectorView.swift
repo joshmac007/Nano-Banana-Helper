@@ -11,16 +11,27 @@ struct InspectorView: View {
     @State private var newPromptName = ""
     @State private var activePromptTab: PromptType = .user // Tab State
     
-    let sizes = ["1K", "2K", "4K"]
+    let sizes = ImageSize.allCases.map { $0.rawValue }
     
     var body: some View {
         VStack(spacing: 0) {
-            // Header
+            // Header with Mode Toggle
             HStack {
                 Text("Configuration")
                     .font(.headline)
                     .foregroundStyle(.secondary)
+                
                 Spacer()
+                
+                // Mode Picker
+                Picker("", selection: $stagingManager.generationMode) {
+                    ForEach(GenerationMode.allCases) { mode in
+                        Label(mode.displayName, systemImage: mode.icon)
+                            .tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
             }
             .padding()
             
@@ -30,7 +41,7 @@ struct InspectorView: View {
                 VStack(spacing: 24) {
                     // Start Button (Primary Call to Action)
                     Button(action: startBatch) {
-                        Text("Start Batch")
+                        Text(buttonTitle)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 8)
                     }
@@ -38,7 +49,36 @@ struct InspectorView: View {
                     .controlSize(.large)
                     .padding(.horizontal)
                     .padding(.top)
-                    .disabled(stagingManager.isEmpty || stagingManager.prompt.isEmpty)
+                    .disabled(!stagingManager.isReadyForGeneration)
+                    
+                    // Variations Stepper (Text Mode Only)
+                    if stagingManager.generationMode == .text {
+                        HStack {
+                            Text("Variations")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(.secondary)
+                                .textCase(.uppercase)
+                            
+                            Spacer()
+                            
+                            HStack(spacing: 12) {
+                                Button(action: { stagingManager.textImageCount -= 1 }) {
+                                    Image(systemName: "minus.circle")
+                                }
+                                .disabled(stagingManager.textImageCount <= Constants.minTextImageVariations)
+                                
+                                Text("\(stagingManager.textImageCount)")
+                                    .font(.system(.body, design: .rounded))
+                                    .frame(minWidth: 24)
+                                
+                                Button(action: { stagingManager.textImageCount += 1 }) {
+                                    Image(systemName: "plus.circle")
+                                }
+                                .disabled(stagingManager.textImageCount >= Constants.maxTextImageVariations)
+                            }
+                        }
+                        .padding(.horizontal)
+                    }
                     
                     if let project = projectManager.currentProject {
                         OutputLocationView(project: project) { newURL, newBookmark in
@@ -206,30 +246,33 @@ struct InspectorView: View {
                                 .labelsHidden()
                         }
                         
-                        // Multi-Input Toggle
-                        HStack(alignment: .top) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Multi-Input Mode")
-                                    .font(.system(size: 11, weight: .bold)) // Standardized header
-                                    .foregroundStyle(.primary)
-                                    .textCase(.uppercase)
-                                Text("Merge all to 1 output.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                        // Multi-Input Toggle (Image mode only)
+                        if stagingManager.generationMode == .image {
+                            HStack(alignment: .top) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Multi-Input Mode")
+                                        .font(.system(size: 11, weight: .bold)) // Standardized header
+                                        .foregroundStyle(.primary)
+                                        .textCase(.uppercase)
+                                    Text("Merge all to 1 output.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Toggle("", isOn: $stagingManager.isMultiInput)
+                                    .toggleStyle(.switch)
+                                    .labelsHidden()
                             }
-                            Spacer()
-                            Toggle("", isOn: $stagingManager.isMultiInput)
-                                .toggleStyle(.switch)
-                                .labelsHidden()
                         }
                     }
                     .padding(.horizontal)
                     
                     CostEstimatorView(
-                        imageCount: stagingManager.count,
+                        imageCount: stagingManager.effectiveTaskCount,
                         imageSize: stagingManager.imageSize,
                         isBatchTier: stagingManager.isBatchTier,
-                        isMultiInput: stagingManager.isMultiInput
+                        isMultiInput: stagingManager.isMultiInput,
+                        generationMode: stagingManager.generationMode
                     )
                     .padding(.horizontal)
                 }
@@ -253,9 +296,28 @@ struct InspectorView: View {
         }
     }
     
+    private var buttonTitle: String {
+        switch stagingManager.generationMode {
+        case .image:
+            return "Start Batch"
+        case .text:
+            let count = stagingManager.textImageCount
+            return count == 1 ? "Generate Image" : "Generate \(count) Images"
+        }
+    }
+    
     private func startBatch() {
         guard let project = projectManager.currentProject else { return }
         
+        switch stagingManager.generationMode {
+        case .image:
+            startImageBatch(project: project)
+        case .text:
+            startTextBatch(project: project)
+        }
+    }
+    
+    private func startImageBatch(project: Project) {
         let batch = BatchJob(
             prompt: stagingManager.prompt,
             systemPrompt: stagingManager.systemPrompt,
@@ -293,6 +355,22 @@ struct InspectorView: View {
         withAnimation {
             stagingManager.clearAll()
         }
+    }
+    
+    private func startTextBatch(project: Project) {
+        orchestrator.enqueueTextGeneration(
+            prompt: stagingManager.prompt,
+            systemPrompt: stagingManager.systemPrompt,
+            aspectRatio: stagingManager.aspectRatio,
+            imageSize: stagingManager.imageSize,
+            outputDirectory: project.outputDirectory,
+            useBatchTier: stagingManager.isBatchTier,
+            imageCount: stagingManager.textImageCount,
+            projectId: project.id
+        )
+        
+        // Clear prompt after generation
+        stagingManager.prompt = ""
     }
 }
 

@@ -8,46 +8,15 @@ struct StagingView: View {
     
     var body: some View {
         ZStack {
-            // Empty State / Drop Zone
-            if stagingManager.isEmpty {
-                emptyStateView
-            } else {
-                // Grid View
-                ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 200), spacing: 16)], spacing: 16) {
-                        ForEach(stagingManager.stagedFiles, id: \.self) { url in
-                            StagedImageCell(url: url) {
-                                stagingManager.removeFile(url)
-                            }
-                        }
-                        
-                        // Add More Button
-                        Button(action: { showingFilePicker = true }) {
-                            VStack(spacing: 8) {
-                                Image(systemName: "plus")
-                                    .font(.largeTitle)
-                                Text("Add More")
-                                    .font(.caption)
-                            }
-                            .frame(height: 150)
-                            .frame(maxWidth: .infinity)
-                            .background(Color.secondary.opacity(0.1))
-                            .cornerRadius(12)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(style: Style.dashedBorder)
-                                    .foregroundStyle(.secondary)
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                    }
-                    .padding()
-                }
+            switch stagingManager.generationMode {
+            case .image:
+                imageView
+            case .text:
+                textView
             }
             
-            // Drop Target Overlay
-            if isTargeted {
+            // Drop Target Overlay (image mode only)
+            if stagingManager.generationMode == .image && isTargeted {
                 Color.accentColor.opacity(0.1)
                     .overlay(
                         RoundedRectangle(cornerRadius: 16)
@@ -57,6 +26,9 @@ struct StagingView: View {
             }
         }
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
+            // Only handle drops in image mode
+            guard stagingManager.generationMode == .image else { return false }
+            
             // Handle Drop
             Task {
                 var urls: [URL] = []
@@ -92,6 +64,101 @@ struct StagingView: View {
                 stagingManager.addFiles(urls, bookmarks: bookmarks)
             }
         }
+    }
+    
+    // MARK: - Image Mode View
+    @ViewBuilder
+    private var imageView: some View {
+        // Empty State / Drop Zone
+        if stagingManager.isEmpty {
+            emptyStateView
+        } else {
+            // Grid View
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 200), spacing: 16)], spacing: 16) {
+                    ForEach(stagingManager.stagedFiles, id: \.self) { url in
+                        StagedImageCell(url: url) {
+                            stagingManager.removeFile(url)
+                        }
+                    }
+                    
+                    // Add More Button
+                    Button(action: { showingFilePicker = true }) {
+                        VStack(spacing: 8) {
+                            Image(systemName: "plus")
+                                .font(.largeTitle)
+                            Text("Add More")
+                                .font(.caption)
+                        }
+                        .frame(height: 150)
+                        .frame(maxWidth: .infinity)
+                        .background(Color.secondary.opacity(0.1))
+                        .cornerRadius(12)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(style: Style.dashedBorder)
+                                .foregroundStyle(.secondary)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                }
+                .padding()
+            }
+        }
+    }
+    
+    // MARK: - Text Mode View
+    @ViewBuilder
+    private var textView: some View {
+        VStack(spacing: 24) {
+            Image(systemName: "text.bubble.fill")
+                .font(.system(size: 48))
+                .foregroundStyle(.blue)
+            
+            Text("Text-to-Image Mode")
+                .font(.title2)
+                .fontWeight(.medium)
+            
+            Text("Enter your prompt in the Inspector panel to generate images from text.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+            
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Be descriptive about style, mood, and composition", systemImage: "lightbulb")
+                Label("Include subject, setting, and artistic direction", systemImage: "paintbrush")
+                Label("Use System Prompt for consistent styling across generations", systemImage: "slider.horizontal.3")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding()
+            .background(Color.secondary.opacity(0.1))
+            .cornerRadius(8)
+            
+            if !stagingManager.prompt.isEmpty {
+                Divider()
+                
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Current Prompt Preview")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textCase(.uppercase)
+                    
+                    Text(stagingManager.prompt)
+                        .font(.body)
+                        .lineLimit(4)
+                        .padding()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.secondary.opacity(0.05))
+                        .cornerRadius(8)
+                }
+                .padding(.horizontal)
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
     
     private var emptyStateView: some View {

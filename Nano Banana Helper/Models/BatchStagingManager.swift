@@ -1,15 +1,42 @@
 import SwiftUI
 import Observation
 
+// MARK: - Generation Mode
+
+/// Mode of operation for batch processing
+enum GenerationMode: String, CaseIterable, Identifiable, Sendable {
+    case image = "Image"
+    case text = "Text"
+    
+    var id: String { rawValue }
+    var displayName: String { rawValue }
+    var icon: String {
+        switch self {
+        case .image: return "photo.on.rectangle.angled"
+        case .text: return "text.bubble"
+        }
+    }
+}
+
 @Observable
 class BatchStagingManager {
-    // Staged Items
+    // MARK: - Generation Mode
+    var generationMode: GenerationMode = .image
+    
+    /// Number of output images to generate in text mode (1-4).
+    /// Clamping is handled at the call site (InspectorView buttons have .disabled guards).
+    /// Property observers (willSet/didSet) cannot safely re-assign an @Observable property
+    /// — the macro-generated computed setter routes through ObservationRegistrar, which
+    /// re-enters the observer, causing infinite recursion.
+    var textImageCount: Int = 1
+    
+    // MARK: - Staged Items
     var stagedFiles: [URL] = []
     
     // Security-scoped bookmarks keyed by URL, for files selected via file picker
     var stagedBookmarks: [URL: Data] = [:]
     
-    // Batch Configuration (Synced with Inspector)
+    // MARK: - Batch Configuration (Synced with Inspector)
     var prompt: String = ""
     var systemPrompt: String = "" // New System Prompt
     var aspectRatio: String = "Auto" // Changed to Auto
@@ -17,11 +44,28 @@ class BatchStagingManager {
     var isBatchTier: Bool = false
     var isMultiInput: Bool = false
     
-    // Derived Properties
+    // MARK: - Derived Properties
     var isEmpty: Bool { stagedFiles.isEmpty }
     var count: Int { stagedFiles.count }
     
-    // Actions
+    /// Number of tasks that will be created (files for image mode, count for text mode)
+    var effectiveTaskCount: Int {
+        switch generationMode {
+        case .image: return stagedFiles.count
+        case .text: return textImageCount
+        }
+    }
+    
+    /// Whether the staging area is ready to start generation
+    var isReadyForGeneration: Bool {
+        guard !prompt.isEmpty else { return false }
+        switch generationMode {
+        case .image: return !stagedFiles.isEmpty
+        case .text: return true // No input files required
+        }
+    }
+    
+    // MARK: - Actions
     func addFiles(_ urls: [URL], bookmarks: [URL: Data] = [:]) {
         // Filter for images and duplicates if needed
         let newFiles = urls.filter { url in
@@ -40,9 +84,20 @@ class BatchStagingManager {
         stagedBookmarks.removeValue(forKey: url)
     }
     
+    /// Clear staged files and bookmarks, but preserve prompt and mode for UX continuity
     func clearAll() {
         stagedFiles.removeAll()
         stagedBookmarks.removeAll()
+        // Note: Preserve generationMode, textImageCount, and prompt for UX continuity
+    }
+    
+    /// Clear all state including mode (use when switching projects or explicit reset)
+    func resetAll() {
+        clearAll()
+        prompt = ""
+        systemPrompt = ""
+        generationMode = .image
+        textImageCount = 1
     }
     
     func bookmark(for url: URL) -> Data? {

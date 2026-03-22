@@ -35,12 +35,16 @@ struct AspectRatio: Identifiable, Hashable, Sendable {
         AspectRatio(id: "3:2", displayName: "3:2", category: .landscape, width: 3, height: 2),
         AspectRatio(id: "16:9", displayName: "16:9", category: .landscape, width: 16, height: 9),
         AspectRatio(id: "21:9", displayName: "21:9", category: .landscape, width: 21, height: 9),
+        AspectRatio(id: "4:1", displayName: "4:1", category: .landscape, width: 4, height: 1),  // New: panoramic landscape
+        AspectRatio(id: "8:1", displayName: "8:1", category: .landscape, width: 8, height: 1),  // New: ultra-wide landscape
         
         // Portrait
         AspectRatio(id: "4:5", displayName: "4:5", category: .portrait, width: 4, height: 5),
         AspectRatio(id: "3:4", displayName: "3:4", category: .portrait, width: 3, height: 4),
         AspectRatio(id: "2:3", displayName: "2:3", category: .portrait, width: 2, height: 3),
-        AspectRatio(id: "9:16", displayName: "9:16", category: .portrait, width: 9, height: 16)
+        AspectRatio(id: "9:16", displayName: "9:16", category: .portrait, width: 9, height: 16),
+        AspectRatio(id: "1:4", displayName: "1:4", category: .portrait, width: 1, height: 4),  // New: vertical strip
+        AspectRatio(id: "1:8", displayName: "1:8", category: .portrait, width: 1, height: 8)   // New: ultra-tall vertical
     ]
     
     nonisolated static var `default`: AspectRatio {

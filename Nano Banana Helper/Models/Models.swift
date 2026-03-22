@@ -322,9 +322,10 @@ class BatchJob: Identifiable, Codable {
     var useBatchTier: Bool
     var status: String
     var tasks: [ImageTask]
+    var isTextMode: Bool = false // For text-to-image generation
 
     enum CodingKeys: String, CodingKey {
-        case id, createdAt, projectId, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, useBatchTier, status, tasks
+        case id, createdAt, projectId, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, useBatchTier, status, tasks, isTextMode
     }
 
     required init(from decoder: Decoder) throws {
@@ -340,6 +341,7 @@ class BatchJob: Identifiable, Codable {
         useBatchTier = try container.decode(Bool.self, forKey: .useBatchTier)
         status = try container.decode(String.self, forKey: .status)
         tasks = try container.decode([ImageTask].self, forKey: .tasks)
+        isTextMode = try container.decodeIfPresent(Bool.self, forKey: .isTextMode) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -355,6 +357,7 @@ class BatchJob: Identifiable, Codable {
         try container.encode(useBatchTier, forKey: .useBatchTier)
         try container.encode(status, forKey: .status)
         try container.encode(tasks, forKey: .tasks)
+        try container.encode(isTextMode, forKey: .isTextMode)
     }
     
     init(
@@ -389,27 +392,14 @@ class BatchJob: Identifiable, Codable {
     
     /// Calculate cost for a specific task based on settings
     func cost(for task: ImageTask) -> Double {
-        let inputRate = useBatchTier ? 0.0006 : 0.0011
-        let inputCost = inputRate * Double(max(1, task.inputPaths.count))
-        
-        let outputCost: Double
-        if useBatchTier {
-            // Batch Tier: 50% cheaper
-            switch imageSize {
-            case "4K": outputCost = 0.12
-            case "2K", "1K": outputCost = 0.067
-            default: outputCost = 0.067
-            }
-        } else {
-            // Standard Tier
-            switch imageSize {
-            case "4K": outputCost = 0.24
-            case "2K", "1K": outputCost = 0.134
-            default: outputCost = 0.134
-            }
+        if isTextMode {
+            return ImageSize.calculateTextModeCost(
+                imageSize: imageSize,
+                outputCount: 1,
+                isBatchTier: useBatchTier
+            )
         }
-        
-        return inputCost + outputCost
+        return ImageSize.calculateCost(imageSize: imageSize, inputCount: task.inputPaths.count, isBatchTier: useBatchTier)
     }
 }
 
@@ -549,5 +539,60 @@ class ImageTask: Identifiable, Codable {
     var duration: TimeInterval? {
         guard let start = startedAt, let end = completedAt else { return nil }
         return end.timeIntervalSince(start)
+    }
+}
+
+// MARK: - Image Size Configuration
+
+/// Supported output image sizes with centralized pricing
+enum ImageSize: String, CaseIterable, Identifiable {
+    case size512 = "512"
+    case size1K = "1K"
+    case size2K = "2K"
+    case size4K = "4K"
+    
+    var id: String { rawValue }
+    
+    var displayName: String { rawValue }
+    
+    /// Output cost per image for standard tier
+    var standardCost: Double {
+        switch self {
+        case .size4K: return 0.24
+        case .size2K: return 0.134
+        case .size1K: return 0.067
+        case .size512: return 0.034
+        }
+    }
+    
+    /// Output cost per image for batch tier (50% off)
+    var batchCost: Double {
+        standardCost / 2
+    }
+    
+    /// Get cost for given tier
+    func cost(isBatchTier: Bool) -> Double {
+        isBatchTier ? batchCost : standardCost
+    }
+    
+    /// Calculate total cost including input images
+    static func calculateCost(imageSize: String, inputCount: Int, isBatchTier: Bool) -> Double {
+        let inputRate = isBatchTier ? 0.0006 : 0.0011
+        let inputCost = inputRate * Double(max(1, inputCount))
+        
+        guard let size = ImageSize(rawValue: imageSize) else {
+            return inputCost + (isBatchTier ? 0.067 : 0.134) // fallback to 1K pricing
+        }
+        
+        return inputCost + size.cost(isBatchTier: isBatchTier)
+    }
+    
+    /// Calculate cost for text-to-image generation (no input images)
+    static func calculateTextModeCost(imageSize: String, outputCount: Int, isBatchTier: Bool) -> Double {
+        guard let size = ImageSize(rawValue: imageSize) else {
+            // Fallback to 1K pricing
+            return Double(outputCount) * (isBatchTier ? 0.067 : 0.134)
+        }
+        return Double(outputCount) * size.cost(isBatchTier: isBatchTier)
     }
 }

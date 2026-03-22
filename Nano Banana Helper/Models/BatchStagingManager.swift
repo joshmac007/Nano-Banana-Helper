@@ -23,13 +23,12 @@ class BatchStagingManager {
     // MARK: - Generation Mode
     var generationMode: GenerationMode = .image
     
-    /// Number of output images to generate in text mode (1-4)
-    var textImageCount: Int = 1 {
-        didSet {
-            textImageCount = max(Constants.minTextImageVariations,
-                                 min(Constants.maxTextImageVariations, textImageCount))
-        }
-    }
+    /// Number of output images to generate in text mode (1-4).
+    /// Clamping is handled at the call site (InspectorView buttons have .disabled guards).
+    /// Property observers (willSet/didSet) cannot safely re-assign an @Observable property
+    /// — the macro-generated computed setter routes through ObservationRegistrar, which
+    /// re-enters the observer, causing infinite recursion.
+    var textImageCount: Int = 1
     
     // MARK: - Staged Items
     var stagedFiles: [URL] = []

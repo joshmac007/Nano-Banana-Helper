@@ -2,6 +2,16 @@
 
 All notable changes to Nano Banana Helper will be documented in this file.
 
+## [1.3.1] - 2026-03-22
+
+### Fixed
+- **Critical**: Resolved infinite recursion crash when adjusting image count in Text-to-Image mode
+  - Root cause: `@Observable` macro transforms stored properties into computed properties routed through `ObservationRegistrar.withMutation`. Re-assigning the observed property inside a property observer (`willSet` or `didSet`) re-enters the computed setter, causing stack overflow
+  - Fix: Removed the property observer entirely; the existing `.disabled()` button guards in InspectorView already prevent out-of-range values
+
+### Technical
+- Removed unsafe `willSet` observer from `BatchStagingManager.textImageCount`
+
 ## [1.3.0] - 2026-03-22
 
 ### Added
@@ -18,7 +28,7 @@ All notable changes to Nano Banana Helper will be documented in this file.
 
 ### Technical
 - Added `GenerationMode` enum with `Sendable` conformance
-- Added `textImageCount` property with min/max clamping
+- Added `textImageCount` property with UI range guards
 - Added `isReadyForGeneration` computed property for mode-aware validation
 - Added `ImageEditRequest.textOnly()` convenience method
 - Added `enqueueTextGeneration()` to `BatchOrchestrator`

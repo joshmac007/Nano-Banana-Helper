@@ -2,29 +2,27 @@ import Foundation
 
 // MARK: - PromptPreset
 
-/// A saved prompt template combining optional user and system prompts with tags.
+/// A saved prompt template combining optional user and system prompts.
 nonisolated struct PromptPreset: Codable, Identifiable, Hashable {
     let id: UUID
     var name: String
     var userPrompt: String
     var systemPrompt: String?  // nil = no system prompt
-    var tags: [String]          // from curated tag list
     let createdAt: Date
     var updatedAt: Date
 
-    init(name: String, userPrompt: String, systemPrompt: String? = nil, tags: [String] = []) {
+    init(name: String, userPrompt: String, systemPrompt: String? = nil) {
         self.id = UUID()
         self.name = name
         self.userPrompt = userPrompt
         self.systemPrompt = systemPrompt
-        self.tags = tags
         let now = Date()
         self.createdAt = now
         self.updatedAt = now
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, userPrompt, systemPrompt, tags, createdAt, updatedAt
+        case id, name, userPrompt, systemPrompt, createdAt, updatedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -33,20 +31,8 @@ nonisolated struct PromptPreset: Codable, Identifiable, Hashable {
         name = try container.decode(String.self, forKey: .name)
         userPrompt = try container.decode(String.self, forKey: .userPrompt)
         systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt)
-        tags = try container.decodeIfPresent([String].self, forKey: .tags) ?? []
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(name, forKey: .name)
-        try container.encode(userPrompt, forKey: .userPrompt)
-        try container.encodeIfPresent(systemPrompt, forKey: .systemPrompt)
-        try container.encodeIfPresent(tags.isEmpty ? nil : tags, forKey: .tags)
-        try container.encode(createdAt, forKey: .createdAt)
-        try container.encode(updatedAt, forKey: .updatedAt)
     }
 
     static func == (lhs: PromptPreset, rhs: PromptPreset) -> Bool {
@@ -60,16 +46,15 @@ nonisolated struct PromptPreset: Codable, Identifiable, Hashable {
 
 // MARK: - PromptLibraryStore (v2 persistence wrapper)
 
-/// Wrapper for v2 persistence format containing both presets and curated tags.
+/// Wrapper for v2 persistence format.
 nonisolated struct PromptLibraryStore: Codable {
-    let version: Int  // value: 2
-    var tags: [String]
+    let version: Int
     var presets: [PromptPreset]
 }
 
 // MARK: - PromptLibrary
 
-/// Manages saved prompt templates with tagging support.
+/// Manages saved prompt templates.
 @Observable
 class PromptLibrary {
     private let fileManager = FileManager.default
@@ -77,7 +62,6 @@ class PromptLibrary {
     private let decoder = JSONDecoder()
 
     var presets: [PromptPreset] = []
-    var tags: [String] = []
 
     private var storageURL: URL { AppPaths.promptsURL }
 
@@ -90,8 +74,8 @@ class PromptLibrary {
 
     // MARK: - CRUD
 
-    func save(name: String, userPrompt: String, systemPrompt: String? = nil, tags: [String] = []) {
-        let preset = PromptPreset(name: name, userPrompt: userPrompt, systemPrompt: systemPrompt, tags: tags)
+    func save(name: String, userPrompt: String, systemPrompt: String? = nil) {
+        let preset = PromptPreset(name: name, userPrompt: userPrompt, systemPrompt: systemPrompt)
         presets.insert(preset, at: 0)
         persist()
     }
@@ -121,8 +105,7 @@ class PromptLibrary {
         let copy = PromptPreset(
             name: preset.name + " (copy)",
             userPrompt: preset.userPrompt,
-            systemPrompt: preset.systemPrompt,
-            tags: preset.tags
+            systemPrompt: preset.systemPrompt
         )
         if let insertIndex = presets.firstIndex(where: { $0.id == preset.id }) {
             presets.insert(copy, at: insertIndex + 1)
@@ -132,38 +115,7 @@ class PromptLibrary {
         persist()
     }
 
-    // MARK: - Tag Management
-
-    func addTag(_ tag: String) {
-        guard !tags.contains(tag) else { return }
-        tags.append(tag)
-        persist()
-    }
-
-    func removeTag(_ tag: String) {
-        tags.removeAll { $0 == tag }
-        // Also remove from all presets
-        for index in presets.indices {
-            presets[index].tags.removeAll { $0 == tag }
-        }
-        persist()
-    }
-
-    func renameTag(_ oldName: String, to newName: String) {
-        guard let tagIndex = tags.firstIndex(of: oldName) else { return }
-        tags[tagIndex] = newName
-        // Also rename in all presets
-        for index in presets.indices {
-            presets[index].tags = presets[index].tags.map { $0 == oldName ? newName : $0 }
-        }
-        persist()
-    }
-
     // MARK: - Query
-
-    func presetsWithTag(_ tag: String) -> [PromptPreset] {
-        presets.filter { $0.tags.contains(tag) }
-    }
 
     func presets(matching query: String) -> [PromptPreset] {
         let lowercased = query.lowercased()
@@ -189,7 +141,6 @@ class PromptLibrary {
             // Try v2 format first
             if let store = try? decoder.decode(PromptLibraryStore.self, from: data) {
                 self.presets = store.presets
-                self.tags = store.tags
                 return
             }
 
@@ -239,7 +190,6 @@ class PromptLibrary {
         }
 
         self.presets = merged
-        self.tags = []
         persist()
         print("Migrated \(legacy.count) legacy prompts into \(merged.count) presets")
     }
@@ -249,7 +199,7 @@ class PromptLibrary {
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
 
         do {
-            let store = PromptLibraryStore(version: 2, tags: tags, presets: presets)
+            let store = PromptLibraryStore(version: 2, presets: presets)
             let data = try encoder.encode(store)
             try data.write(to: storageURL)
         } catch {

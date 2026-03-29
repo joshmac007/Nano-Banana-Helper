@@ -9,11 +9,6 @@ struct SettingsView: View {
     @State private var isLoaded: Bool = false
     @State private var selectedTab: SettingsTab = .api
     @State private var selectedModel: String = "gemini-3.1-flash-image-preview"
-    @State private var selectedPromptTag: String = "all"
-    @State private var showingAddTagAlert = false
-    @State private var showingRenameTagAlert = false
-    @State private var newTagName = ""
-    @State private var tagNameToRename: String? = nil
     @State private var editingPreset: PromptPreset? = nil
 
     @Environment(ProjectManager.self) private var projectManager
@@ -233,67 +228,18 @@ struct SettingsView: View {
     }
 
     private var promptsSection: some View {
-        HStack(spacing: 0) {
-            // Tag Sidebar
-            VStack(alignment: .leading, spacing: 0) {
-                List(selection: $selectedPromptTag) {
-                    Text("All Presets")
-                        .tag("all")
-                    Text("Untagged")
-                        .tag("untagged")
-                    Divider()
-                    ForEach(promptLibrary.tags, id: \.self) { tag in
-                        HStack {
-                            Text(tag)
-                                .lineLimit(1)
-                            Spacer()
-                            Text("\(promptLibrary.presets.filter { $0.tags.contains(tag) }.count)")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                        }
-                        .tag(tag)
-                        .contextMenu {
-                            Button("Rename") {
-                                showingRenameTagAlert = true
-                                tagNameToRename = tag
-                            }
-                            Button("Delete", role: .destructive) {
-                                promptLibrary.removeTag(tag)
-                                if selectedPromptTag == tag {
-                                    selectedPromptTag = "all"
-                                }
-                            }
-                        }
-                    }
-                }
-                .listStyle(.sidebar)
-                .frame(width: 150)
-
-                Divider()
-
-                // Add Tag Button
-                Button(action: { showingAddTagAlert = true }) {
-                    Label("Add Tag", systemImage: "plus")
-                        .font(.caption)
-                }
-                .buttonStyle(.borderless)
-                .padding(8)
-            }
-
-            Divider()
-
-            // Preset Cards
-            if filteredPresets.isEmpty {
+        Group {
+            if promptLibrary.presets.isEmpty {
                 ContentUnavailableView(
                     "No Presets",
                     systemImage: "bookmark.slash",
                     description: Text("Save prompt presets from the Inspector.")
                 )
-                .frame(maxWidth: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 12)], spacing: 12) {
-                        ForEach(filteredPresets) { preset in
+                        ForEach(promptLibrary.presets) { preset in
                             PresetCard(preset: preset, promptLibrary: promptLibrary)
                                 .contextMenu {
                                     Button("Edit") {
@@ -313,50 +259,17 @@ struct SettingsView: View {
                 }
             }
         }
-        .alert("Add Tag", isPresented: $showingAddTagAlert) {
-            TextField("Tag name", text: $newTagName)
-            Button("Cancel", role: .cancel) { newTagName = "" }
-            Button("Add") {
-                if !newTagName.trimmingCharacters(in: .whitespaces).isEmpty {
-                    promptLibrary.addTag(newTagName.trimmingCharacters(in: .whitespaces))
-                }
-                newTagName = ""
-            }
-            .disabled(newTagName.trimmingCharacters(in: .whitespaces).isEmpty)
-        }
-        .alert("Rename Tag", isPresented: $showingRenameTagAlert) {
-            TextField("New name", text: $newTagName)
-            Button("Cancel", role: .cancel) { newTagName = "" }
-            Button("Rename") {
-                if !newTagName.trimmingCharacters(in: .whitespaces).isEmpty, let oldName = tagNameToRename {
-                    promptLibrary.renameTag(oldName, to: newTagName.trimmingCharacters(in: .whitespaces))
-                }
-                newTagName = ""
-                tagNameToRename = nil
-            }
-            .disabled(newTagName.trimmingCharacters(in: .whitespaces).isEmpty)
-        }
         .sheet(item: $editingPreset) { preset in
             PresetEditSheet(preset: preset, promptLibrary: promptLibrary)
         }
     }
 
-    private var filteredPresets: [PromptPreset] {
-        switch selectedPromptTag {
-        case "all":
-            return promptLibrary.presets
-        case "untagged":
-            return promptLibrary.presets.filter { $0.tags.isEmpty }
-        default:
-            return promptLibrary.presets.filter { $0.tags.contains(selectedPromptTag) }
-        }
-    }
-    
+
     private var aboutSection: some View {
         Form {
             Section("About Nano Banana Helper") {
                 LabeledContent("Version") {
-                    Text("1.3.3")
+                    Text("1.3.4")
                         .fontWeight(.bold)
                 }
 
@@ -486,18 +399,6 @@ private struct PresetCard: View {
                 }
             }
 
-            HStack(spacing: 4) {
-                ForEach(preset.tags, id: \.self) { tag in
-                    Text(tag)
-                        .font(.system(size: 9))
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Color.accentColor.opacity(0.1))
-                        .foregroundStyle(Color.accentColor)
-                        .cornerRadius(4)
-                }
-            }
-
             Text(preset.updatedAt, style: .relative)
                 .font(.system(size: 9))
                 .foregroundStyle(.tertiary)
@@ -522,7 +423,6 @@ private struct PresetEditSheet: View {
     @State private var name: String = ""
     @State private var userPrompt: String = ""
     @State private var systemPrompt: String = ""
-    @State private var selectedTags: Set<String> = []
 
     var body: some View {
         VStack(spacing: 20) {
@@ -543,21 +443,6 @@ private struct PresetEditSheet: View {
                     TextEditor(text: $systemPrompt)
                         .frame(minHeight: 60)
                 }
-
-                Section("Tags") {
-                    ForEach(promptLibrary.tags, id: \.self) { tag in
-                        Toggle(tag, isOn: Binding(
-                            get: { selectedTags.contains(tag) },
-                            set: { _ in
-                                if selectedTags.contains(tag) {
-                                    selectedTags.remove(tag)
-                                } else {
-                                    selectedTags.insert(tag)
-                                }
-                            }
-                        ))
-                    }
-                }
             }
             .formStyle(.grouped)
 
@@ -570,7 +455,6 @@ private struct PresetEditSheet: View {
                     updated.name = name
                     updated.userPrompt = userPrompt
                     updated.systemPrompt = systemPrompt.isEmpty ? nil : systemPrompt
-                    updated.tags = Array(selectedTags)
                     promptLibrary.update(updated)
                     dismiss()
                 }
@@ -584,7 +468,6 @@ private struct PresetEditSheet: View {
             name = preset.name
             userPrompt = preset.userPrompt
             systemPrompt = preset.systemPrompt ?? ""
-            selectedTags = Set(preset.tags)
         }
     }
 }

@@ -7,9 +7,6 @@ struct InspectorView: View {
     @Environment(PromptLibrary.self) private var promptLibrary
     @Environment(BatchOrchestrator.self) private var orchestrator
 
-    @State private var showingPresetPopover = false
-    @State private var showingSaveSheet = false
-
     let sizes = ImageSize.allCases.map { $0.rawValue }
 
     var body: some View {
@@ -88,122 +85,34 @@ struct InspectorView: View {
                         .padding(.horizontal)
                     }
 
-                    VStack(alignment: .leading, spacing: 10) {
-                        // Semantic Header: Category [Actions]
-                        HStack(alignment: .center, spacing: 8) {
-                            Text("Prompt")
-                                .font(.system(size: 11, weight: .bold))
-                                .foregroundStyle(.secondary)
-                                .textCase(.uppercase)
+                    // Prompt Bar
+                    PromptBarView(stagingManager: stagingManager, project: projectManager.currentProject)
+                        .padding(.horizontal)
 
-                            Spacer()
+                    // Ratio Selector
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Aspect Ratio")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.secondary)
+                            .textCase(.uppercase)
 
-                            // Contextual Actions
-                            HStack(spacing: 12) {
-                                // Load Preset Popover
-                                Button(action: { showingPresetPopover = true }) {
-                                    Image(systemName: "bookmark.fill")
-                                        .font(.system(size: 13))
-                                        .foregroundStyle(.secondary)
-                                }
-                                .buttonStyle(.plain)
-                                .help("Browse Presets")
-                                .popover(isPresented: $showingPresetPopover) {
-                                    PromptPresetPopover(
-                                        stagingManager: stagingManager,
-                                        project: projectManager.currentProject
-                                    )
-                                    .frame(width: 320, height: 400)
-                                }
+                        AspectRatioSelector(selectedRatio: $stagingManager.aspectRatio)
+                    }
+                    .padding(.horizontal)
 
-                                // Save Preset
-                                Button(action: {
-                                    showingSaveSheet = true
-                                }) {
-                                    Image(systemName: "square.and.arrow.down")
-                                        .font(.system(size: 13))
-                                        .foregroundStyle(.secondary)
-                                }
-                                .buttonStyle(.plain)
-                                .help("Save as Preset")
-                                .disabled(stagingManager.prompt.isEmpty && stagingManager.systemPrompt.isEmpty)
-                            }
+                    // Size Row
+                    HStack {
+                        Text("Size")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.secondary)
+                            .textCase(.uppercase)
+                        Spacer()
+                        Picker("", selection: $stagingManager.imageSize) {
+                            ForEach(sizes, id: \.self) { Text($0) }
                         }
-                        .padding(.horizontal, 2)
-
-                        // Stacked Editors: User + System
-                        VStack(spacing: 8) {
-                            // User prompt editor
-                            ZStack(alignment: .topLeading) {
-                                if stagingManager.prompt.isEmpty {
-                                    Text("Describe how you want to transform this image...")
-                                        .foregroundStyle(.tertiary)
-                                        .padding(8)
-                                        .allowsHitTesting(false)
-                                }
-                                TextEditor(text: $stagingManager.prompt)
-                                    .font(.system(.body, design: .rounded))
-                                    .padding(6)
-                                    .frame(minHeight: 80, maxHeight: 160)
-                            }
-                            .background(Color(nsColor: .textBackgroundColor))
-                            .cornerRadius(8)
-
-                            // System prompt editor (with purple tint)
-                            ZStack(alignment: .topLeading) {
-                                if stagingManager.systemPrompt.isEmpty {
-                                    Text("Set behavioral context for the model...")
-                                        .foregroundStyle(.tertiary)
-                                        .padding(8)
-                                        .allowsHitTesting(false)
-                                }
-                                TextEditor(text: $stagingManager.systemPrompt)
-                                    .font(.system(.body, design: .rounded))
-                                    .padding(6)
-                                    .frame(minHeight: 80, maxHeight: 160)
-                            }
-                            .background(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(Color.purple.opacity(0.04))
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .stroke(Color.purple.opacity(0.12), lineWidth: 1)
-                            )
-                        }
-                        .fixedSize(horizontal: false, vertical: true)
-
-                        // Divider
-                        Rectangle()
-                            .fill(.quaternary)
-                            .frame(height: 1)
-                            .padding(.top, 6)
-                            .padding(.vertical, 4)
-
-                        // Ratio Selector (keep existing)
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Aspect Ratio")
-                                .font(.system(size: 11, weight: .bold))
-                                .foregroundStyle(.secondary)
-                                .textCase(.uppercase)
-
-                            AspectRatioSelector(selectedRatio: $stagingManager.aspectRatio)
-                        }
-
-                        // Size Row (keep existing)
-                        HStack {
-                            Text("Size")
-                                .font(.system(size: 11, weight: .bold))
-                                .foregroundStyle(.secondary)
-                                .textCase(.uppercase)
-                            Spacer()
-                            Picker("", selection: $stagingManager.imageSize) {
-                                ForEach(sizes, id: \.self) { Text($0) }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.menu)
-                            .frame(width: 85)
-                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(width: 85)
                     }
                     .padding(.horizontal)
 
@@ -260,13 +169,6 @@ struct InspectorView: View {
         }
         .frame(minWidth: 280, idealWidth: 300, maxWidth: 350)
         .background(VisualEffectView(material: .sidebar, blendingMode: .withinWindow))
-        .sheet(isPresented: $showingSaveSheet) {
-            SavePresetSheet(
-                promptLibrary: promptLibrary,
-                userPrompt: stagingManager.prompt,
-                systemPrompt: stagingManager.systemPrompt
-            )
-        }
     }
 
     private var buttonTitle: String {

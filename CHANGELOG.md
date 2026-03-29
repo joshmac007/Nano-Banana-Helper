@@ -2,6 +2,22 @@
 
 All notable changes to Nano Banana Helper will be documented in this file.
 
+## [1.3.4] - 2026-03-29
+
+### Changed
+- **Prompt UI Redesign**: Complete overhaul of the prompt management interface
+  - **Prompt Bar**: Compact preview bar in Inspector replaces cramped inline TextEditors — click to edit, dropdown for presets
+  - **Edit Sheet**: Focused full-size editing sheet with collapsible system prompt section and inline "Save as Preset" footer
+  - **Preset Menu**: Native macOS dropdown menu replaces custom popover — load, edit, duplicate, set default, delete presets
+  - **Settings Simplified**: Flat preset card grid replaces tag sidebar layout
+
+### Removed
+- **Tag System**: Removed tags from presets entirely — unnecessary complexity for a 5-15 preset library
+- `PromptPresetPopover` — replaced by native Menu in PromptBarView
+- `SavePresetSheet` — replaced by inline save in PromptEditSheet
+- Tag CRUD methods from `PromptLibrary` (`addTag`, `removeTag`, `renameTag`)
+- Tag sidebar, tag alerts, and tag filtering from Settings
+
 ## [1.3.3] - 2026-03-29
 
 ### Added

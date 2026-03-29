@@ -20,7 +20,13 @@ struct MainLayoutView: View {
             SidebarView(
                 projectManager: projectManager,
                 onSelectProject: { project in
-                    // Logic to load project-specific settings could go here
+                    projectManager.selectProject(project)
+                    // Load default preset if set
+                    if let presetID = project.defaultPresetID,
+                       let preset = promptLibrary.preset(id: presetID) {
+                        stagingManager.prompt = preset.userPrompt
+                        stagingManager.systemPrompt = preset.systemPrompt ?? ""
+                    }
                 },
                 onOpenSettings: {
                     showingSettings = true
@@ -58,9 +64,8 @@ struct MainLayoutView: View {
                     
                     // Right Inspector
                     InspectorView(
-                        stagingManager: stagingManager, 
-                        projectManager: projectManager,
-                        promptLibrary: promptLibrary
+                        stagingManager: stagingManager,
+                        projectManager: projectManager
                     )
                     .frame(width: inspectorWidth)
                 }
@@ -69,6 +74,7 @@ struct MainLayoutView: View {
         .navigationTitle(projectManager.currentProject?.name ?? "Nano Banana Pro")
         .frame(minWidth: 1000, minHeight: 600)
         .environment(projectManager)
+        .environment(promptLibrary)
         .onAppear {
              // Load saved prompts if needed
              promptLibrary.load()

@@ -9,7 +9,13 @@ struct SettingsView: View {
     @State private var isLoaded: Bool = false
     @State private var selectedTab: SettingsTab = .api
     @State private var selectedModel: String = "gemini-3.1-flash-image-preview"
-    
+    @State private var selectedPromptTag: String = "all"
+    @State private var showingAddTagAlert = false
+    @State private var showingRenameTagAlert = false
+    @State private var newTagName = ""
+    @State private var tagNameToRename: String? = nil
+    @State private var editingPreset: PromptPreset? = nil
+
     @Environment(ProjectManager.self) private var projectManager
     @Environment(PromptLibrary.self) private var promptLibrary
     @Environment(\.dismiss) private var dismiss
@@ -223,48 +229,126 @@ struct SettingsView: View {
                 }
             }
             .listStyle(.inset)
-            .frame(height: 400)
         }
     }
-    
+
     private var promptsSection: some View {
-        VStack(spacing: 0) {
-            if promptLibrary.prompts.isEmpty {
-                ContentUnavailableView("No Saved Prompts", 
-                                       systemImage: "bookmark.slash",
-                                       description: Text("Prompts you save as templates will appear here."))
-                    .frame(height: 400)
-            } else {
-                List {
-                    ForEach(promptLibrary.prompts) { saved in
+        HStack(spacing: 0) {
+            // Tag Sidebar
+            VStack(alignment: .leading, spacing: 0) {
+                List(selection: $selectedPromptTag) {
+                    Text("All Presets")
+                        .tag("all")
+                    Text("Untagged")
+                        .tag("untagged")
+                    Divider()
+                    ForEach(promptLibrary.tags, id: \.self) { tag in
                         HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(saved.name)
-                                    .fontWeight(.medium)
-                                Text(saved.prompt)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                            }
-                            
+                            Text(tag)
+                                .lineLimit(1)
                             Spacer()
-                            
-                            Button(role: .destructive) {
-                                withAnimation {
-                                    promptLibrary.delete(saved)
-                                }
-                            } label: {
-                                Image(systemName: "trash")
-                            }
-                            .buttonStyle(.borderless)
-                            .foregroundStyle(.red)
+                            Text("\(promptLibrary.presets.filter { $0.tags.contains(tag) }.count)")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
                         }
-                        .padding(.vertical, 4)
+                        .tag(tag)
+                        .contextMenu {
+                            Button("Rename") {
+                                showingRenameTagAlert = true
+                                tagNameToRename = tag
+                            }
+                            Button("Delete", role: .destructive) {
+                                promptLibrary.removeTag(tag)
+                                if selectedPromptTag == tag {
+                                    selectedPromptTag = "all"
+                                }
+                            }
+                        }
                     }
                 }
-                .listStyle(.inset)
-                .frame(height: 400)
+                .listStyle(.sidebar)
+                .frame(width: 150)
+
+                Divider()
+
+                // Add Tag Button
+                Button(action: { showingAddTagAlert = true }) {
+                    Label("Add Tag", systemImage: "plus")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .padding(8)
             }
+
+            Divider()
+
+            // Preset Cards
+            if filteredPresets.isEmpty {
+                ContentUnavailableView(
+                    "No Presets",
+                    systemImage: "bookmark.slash",
+                    description: Text("Save prompt presets from the Inspector.")
+                )
+                .frame(maxWidth: .infinity)
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 12)], spacing: 12) {
+                        ForEach(filteredPresets) { preset in
+                            PresetCard(preset: preset, promptLibrary: promptLibrary)
+                                .contextMenu {
+                                    Button("Edit") {
+                                        editingPreset = preset
+                                    }
+                                    Button("Duplicate") {
+                                        promptLibrary.duplicate(preset)
+                                    }
+                                    Divider()
+                                    Button("Delete", role: .destructive) {
+                                        promptLibrary.delete(preset)
+                                    }
+                                }
+                        }
+                    }
+                    .padding()
+                }
+            }
+        }
+        .alert("Add Tag", isPresented: $showingAddTagAlert) {
+            TextField("Tag name", text: $newTagName)
+            Button("Cancel", role: .cancel) { newTagName = "" }
+            Button("Add") {
+                if !newTagName.trimmingCharacters(in: .whitespaces).isEmpty {
+                    promptLibrary.addTag(newTagName.trimmingCharacters(in: .whitespaces))
+                }
+                newTagName = ""
+            }
+            .disabled(newTagName.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+        .alert("Rename Tag", isPresented: $showingRenameTagAlert) {
+            TextField("New name", text: $newTagName)
+            Button("Cancel", role: .cancel) { newTagName = "" }
+            Button("Rename") {
+                if !newTagName.trimmingCharacters(in: .whitespaces).isEmpty, let oldName = tagNameToRename {
+                    promptLibrary.renameTag(oldName, to: newTagName.trimmingCharacters(in: .whitespaces))
+                }
+                newTagName = ""
+                tagNameToRename = nil
+            }
+            .disabled(newTagName.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+        .sheet(item: $editingPreset) { preset in
+            PresetEditSheet(preset: preset, promptLibrary: promptLibrary)
+        }
+    }
+
+    private var filteredPresets: [PromptPreset] {
+        switch selectedPromptTag {
+        case "all":
+            return promptLibrary.presets
+        case "untagged":
+            return promptLibrary.presets.filter { $0.tags.isEmpty }
+        default:
+            return promptLibrary.presets.filter { $0.tags.contains(selectedPromptTag) }
         }
     }
     
@@ -370,6 +454,137 @@ struct SettingsView: View {
         let service = NanoBananaService()
         Task {
             await service.setModelName(modelName)
+        }
+    }
+}
+
+// MARK: - Preset Card
+
+private struct PresetCard: View {
+    let preset: PromptPreset
+    var promptLibrary: PromptLibrary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(preset.name)
+                .font(.system(size: 13, weight: .semibold))
+                .lineLimit(1)
+
+            Text(preset.userPrompt)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+
+            if preset.systemPrompt != nil && !(preset.systemPrompt?.isEmpty ?? true) {
+                HStack(spacing: 3) {
+                    Image(systemName: "cpu")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.purple)
+                    Text("Has system prompt")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.purple.opacity(0.8))
+                }
+            }
+
+            HStack(spacing: 4) {
+                ForEach(preset.tags, id: \.self) { tag in
+                    Text(tag)
+                        .font(.system(size: 9))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.accentColor.opacity(0.1))
+                        .foregroundStyle(Color.accentColor)
+                        .cornerRadius(4)
+                }
+            }
+
+            Text(preset.updatedAt, style: .relative)
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(10)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
+        )
+    }
+}
+
+// MARK: - Preset Edit Sheet
+
+private struct PresetEditSheet: View {
+    let preset: PromptPreset
+    var promptLibrary: PromptLibrary
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String = ""
+    @State private var userPrompt: String = ""
+    @State private var systemPrompt: String = ""
+    @State private var selectedTags: Set<String> = []
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Edit Preset")
+                .font(.headline)
+
+            Form {
+                Section("Name") {
+                    TextField("Preset name", text: $name)
+                }
+
+                Section("User Prompt") {
+                    TextEditor(text: $userPrompt)
+                        .frame(minHeight: 80)
+                }
+
+                Section("System Prompt") {
+                    TextEditor(text: $systemPrompt)
+                        .frame(minHeight: 60)
+                }
+
+                Section("Tags") {
+                    ForEach(promptLibrary.tags, id: \.self) { tag in
+                        Toggle(tag, isOn: Binding(
+                            get: { selectedTags.contains(tag) },
+                            set: { _ in
+                                if selectedTags.contains(tag) {
+                                    selectedTags.remove(tag)
+                                } else {
+                                    selectedTags.insert(tag)
+                                }
+                            }
+                        ))
+                    }
+                }
+            }
+            .formStyle(.grouped)
+
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Save") {
+                    var updated = preset
+                    updated.name = name
+                    updated.userPrompt = userPrompt
+                    updated.systemPrompt = systemPrompt.isEmpty ? nil : systemPrompt
+                    updated.tags = Array(selectedTags)
+                    promptLibrary.update(updated)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(name.isEmpty)
+            }
+        }
+        .padding()
+        .frame(width: 450, height: 500)
+        .onAppear {
+            name = preset.name
+            userPrompt = preset.userPrompt
+            systemPrompt = preset.systemPrompt ?? ""
+            selectedTags = Set(preset.tags)
         }
     }
 }

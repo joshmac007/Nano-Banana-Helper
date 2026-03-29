@@ -17,6 +17,7 @@ class Project: Codable, Identifiable, Hashable {
     
     // Presets
     var defaultPrompt: String?
+    var defaultPresetID: UUID?
     var defaultAspectRatio: String?
     var defaultImageSize: String?
     var defaultUseBatchTier: Bool?
@@ -55,7 +56,7 @@ class Project: Codable, Identifiable, Hashable {
     
     enum CodingKeys: CodingKey {
         case id, name, createdAt, outputDirectory, totalCost, imageCount
-        case defaultPrompt, defaultAspectRatio, defaultImageSize, defaultUseBatchTier
+        case defaultPrompt, defaultPresetID, defaultAspectRatio, defaultImageSize, defaultUseBatchTier
         case isArchived, projectNotes, outputDirectoryBookmark
     }
     
@@ -68,6 +69,7 @@ class Project: Codable, Identifiable, Hashable {
         totalCost = try container.decode(Double.self, forKey: .totalCost)
         imageCount = try container.decode(Int.self, forKey: .imageCount)
         defaultPrompt = try container.decodeIfPresent(String.self, forKey: .defaultPrompt)
+        defaultPresetID = try container.decodeIfPresent(UUID.self, forKey: .defaultPresetID)
         defaultAspectRatio = try container.decodeIfPresent(String.self, forKey: .defaultAspectRatio)
         defaultImageSize = try container.decodeIfPresent(String.self, forKey: .defaultImageSize)
         defaultUseBatchTier = try container.decodeIfPresent(Bool.self, forKey: .defaultUseBatchTier)
@@ -85,6 +87,7 @@ class Project: Codable, Identifiable, Hashable {
         try container.encode(totalCost, forKey: .totalCost)
         try container.encode(imageCount, forKey: .imageCount)
         try container.encodeIfPresent(defaultPrompt, forKey: .defaultPrompt)
+        try container.encodeIfPresent(defaultPresetID, forKey: .defaultPresetID)
         try container.encodeIfPresent(defaultAspectRatio, forKey: .defaultAspectRatio)
         try container.encodeIfPresent(defaultImageSize, forKey: .defaultImageSize)
         try container.encodeIfPresent(defaultUseBatchTier, forKey: .defaultUseBatchTier)
@@ -113,6 +116,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     let externalJobName: String?
     let tokenUsage: TokenUsage?
     let modelName: String?
+    let systemPrompt: String?
 
     init(
         projectId: UUID,
@@ -127,7 +131,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         error: String? = nil,
         externalJobName: String? = nil,
         tokenUsage: TokenUsage? = nil,
-        modelName: String? = nil
+        modelName: String? = nil,
+        systemPrompt: String? = nil
     ) {
         self.id = UUID()
         self.projectId = projectId
@@ -144,6 +149,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.externalJobName = externalJobName
         self.tokenUsage = tokenUsage
         self.modelName = modelName
+        self.systemPrompt = systemPrompt
     }
     
     // Backward compatibility for single source path
@@ -172,7 +178,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         case prompt, aspectRatio, imageSize, usedBatchTier, cost
         case status, error, externalJobName
         case sourceImageBookmarks, outputImageBookmark
-        case tokenUsage, modelName
+        case tokenUsage, modelName, systemPrompt
     }
     
     init(
@@ -190,7 +196,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         sourceImageBookmarks: [Data]? = nil,
         outputImageBookmark: Data? = nil,
         tokenUsage: TokenUsage? = nil,
-        modelName: String? = nil
+        modelName: String? = nil,
+        systemPrompt: String? = nil
     ) {
         self.id = UUID()
         self.projectId = projectId
@@ -209,6 +216,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.outputImageBookmark = outputImageBookmark
         self.tokenUsage = tokenUsage
         self.modelName = modelName
+        self.systemPrompt = systemPrompt
     }
     
     init(from decoder: Decoder) throws {
@@ -230,6 +238,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         outputImageBookmark = try container.decodeIfPresent(Data.self, forKey: .outputImageBookmark)
         tokenUsage = try container.decodeIfPresent(TokenUsage.self, forKey: .tokenUsage)
         modelName = try container.decodeIfPresent(String.self, forKey: .modelName)
+        systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt)
     }
     
     func encode(to encoder: Encoder) throws {
@@ -251,6 +260,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         try container.encodeIfPresent(outputImageBookmark, forKey: .outputImageBookmark)
         try container.encodeIfPresent(tokenUsage, forKey: .tokenUsage)
         try container.encodeIfPresent(modelName, forKey: .modelName)
+        try container.encodeIfPresent(systemPrompt, forKey: .systemPrompt)
     }
 }
 

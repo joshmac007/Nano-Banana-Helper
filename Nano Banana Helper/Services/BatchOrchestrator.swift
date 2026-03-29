@@ -175,7 +175,8 @@ final class BatchOrchestrator {
                     status: "cancelled",
                     error: "Cancelled by user",
                     externalJobName: job.externalJobName,
-                    modelName: AppConfig.load().modelName
+                    modelName: AppConfig.load().modelName,
+                    systemPrompt: batch.systemPrompt
                 )
                 if let jobName = job.externalJobName {
                     onHistoryEntryUpdated?(jobName, entry)
@@ -407,7 +408,8 @@ final class BatchOrchestrator {
                                 cost: 0,
                                 status: "processing",
                                 externalJobName: jobInfo.jobName,
-                                modelName: AppConfig.load().modelName
+                                modelName: AppConfig.load().modelName,
+                                systemPrompt: settings.systemPrompt
                             )
                             onImageCompleted?(entry)
                         }
@@ -517,7 +519,8 @@ final class BatchOrchestrator {
                     sourceImageBookmarks: sourceBookmarks.isEmpty ? nil : sourceBookmarks,
                     outputImageBookmark: outputBookmark,
                     tokenUsage: response.tokenUsage,
-                    modelName: currentModelName
+                    modelName: currentModelName,
+                    systemPrompt: settings.systemPrompt
                 )
                 
                 if let jobName = jobName {
@@ -555,7 +558,8 @@ final class BatchOrchestrator {
                 status: "failed",
                 error: error.localizedDescription,
                 externalJobName: job.externalJobName,
-                modelName: await service.getModelName()
+                modelName: await service.getModelName(),
+                systemPrompt: settings.systemPrompt
             )
             
             if let jobName = job.externalJobName {

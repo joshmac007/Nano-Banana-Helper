@@ -272,7 +272,8 @@ struct InspectorView: View {
                         imageSize: stagingManager.imageSize,
                         isBatchTier: stagingManager.isBatchTier,
                         isMultiInput: stagingManager.isMultiInput,
-                        generationMode: stagingManager.generationMode
+                        generationMode: stagingManager.generationMode,
+                        modelName: AppConfig.load().modelName
                     )
                     .padding(.horizontal)
                 }

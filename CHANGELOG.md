@@ -2,6 +2,30 @@
 
 All notable changes to Nano Banana Helper will be documented in this file.
 
+## [1.3.2] - 2026-03-29
+
+### Added
+- **Billing & Usage Tracking**: Real token usage captured from Gemini API `usageMetadata` responses
+  - `TokenUsage` struct stored on each `HistoryEntry` with prompt/candidates/total token counts
+  - Model name recorded per history entry
+- **Session Spend Indicator**: Bottom dock shows live session cost during batch processing, or total spend when idle
+- **Usage Dashboard**: New "Usage" tab in Settings with:
+  - Current session stats (cost, tokens, image count)
+  - Time-filtered history (Today / 7 Days / 30 Days / All Time)
+  - Token breakdown (input vs output)
+  - Cost breakdown by model, resolution, and project
+  - CSV export with model and token columns
+- **Cost Report Enhancements**: "By Model" section, token usage summary card, billing disclaimer
+
+### Changed
+- `CostSummary.record()` now accepts optional `tokens` and `modelName` parameters (backward compatible)
+- `HistoryEntry` extended with optional `tokenUsage` and `modelName` fields (backward compatible)
+- CSV export includes Model, InputTokens, OutputTokens columns
+- `BottomDockView` now displays spend indicator from `ProjectManager`
+
+### Fixed
+- **Xcode Project Configuration**: Fixed `SDKROOT` from `iphoneos` to `macosx`, removed stray `IPHONEOS_DEPLOYMENT_TARGET` and `TARGETED_DEVICE_FAMILY` from all targets, unified `DEVELOPMENT_TEAM` across targets, added explicit `MACOSX_DEPLOYMENT_TARGET`, created proper `.xcscheme` with test targets
+
 ## [1.3.1] - 2026-03-22
 
 ### Fixed

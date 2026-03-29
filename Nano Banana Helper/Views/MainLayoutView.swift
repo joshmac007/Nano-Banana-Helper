@@ -87,8 +87,9 @@ struct MainLayoutView: View {
                  historyManager.updateEntry(byExternalJobName: jobName, with: entry)
              }
              
-             orchestrator.onCostIncurred = { cost, resolution, projectId in
-                 projectManager.costSummary.record(cost: cost, resolution: resolution, projectId: projectId)
+             orchestrator.onCostIncurred = { cost, resolution, projectId, tokenUsage, modelName in
+                 projectManager.costSummary.record(cost: cost, resolution: resolution, projectId: projectId, tokens: tokenUsage, modelName: modelName)
+                 projectManager.recordSessionUsage(cost: cost, tokens: tokenUsage)
              }
         }
         .onDisappear {
@@ -101,6 +102,7 @@ struct MainLayoutView: View {
             SettingsView()
                 .environment(projectManager)
                 .environment(promptLibrary)
+                .environment(historyManager)
         }     
     }
 }

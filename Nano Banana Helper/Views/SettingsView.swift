@@ -18,6 +18,7 @@ struct SettingsView: View {
         case api = "API"
         case projects = "Projects"
         case prompts = "Prompts"
+        case usage = "Usage"
         case about = "About"
     }
     
@@ -55,6 +56,8 @@ struct SettingsView: View {
                     projectsSection
                 case .prompts:
                     promptsSection
+                case .usage:
+                    UsageDashboardView()
                 case .about:
                     aboutSection
                 }
@@ -267,18 +270,18 @@ struct SettingsView: View {
     
     private var aboutSection: some View {
         Form {
-            Section("About Nano Banana Pro") {
+            Section("About Nano Banana Helper") {
                 LabeledContent("Version") {
-                    Text("1.0")
+                    Text("1.3.2")
                         .fontWeight(.bold)
                 }
-                
+
                 LabeledContent("Build") {
-                    Text("February 2026")
+                    Text("March 2026")
                 }
 
                 LabeledContent("Copyright") {
-                    Text("© 2026 Josh McSwain")
+                    Text("© 2026 Josh McSwain & Frédéric Guigand")
                 }
                 
                 Text("A powerful interface for high-throughput image editing using the Gemini Batch API.")

@@ -56,7 +56,7 @@ final class BatchOrchestrator {
 
     // Callbacks for history/cost tracking
     var onImageCompleted: ((HistoryEntry) -> Void)?
-    var onCostIncurred: ((Double, String, UUID) -> Void)?
+    var onCostIncurred: ((Double, String, UUID, TokenUsage?, String?) -> Void)?
     var onHistoryEntryUpdated: ((String, HistoryEntry) -> Void)?
     var onRestoreSettings: ((HistoryEntry) -> Void)?
     
@@ -174,7 +174,8 @@ final class BatchOrchestrator {
                     cost: 0,
                     status: "cancelled",
                     error: "Cancelled by user",
-                    externalJobName: job.externalJobName
+                    externalJobName: job.externalJobName,
+                    modelName: AppConfig.load().modelName
                 )
                 if let jobName = job.externalJobName {
                     onHistoryEntryUpdated?(jobName, entry)
@@ -405,7 +406,8 @@ final class BatchOrchestrator {
                                 usedBatchTier: settings.useBatchTier,
                                 cost: 0,
                                 status: "processing",
-                                externalJobName: jobInfo.jobName
+                                externalJobName: jobInfo.jobName,
+                                modelName: AppConfig.load().modelName
                             )
                             onImageCompleted?(entry)
                         }
@@ -493,6 +495,7 @@ final class BatchOrchestrator {
             job.completedAt = Date()
             
             let cost = settings.cost(inputCount: job.inputPaths.count)
+            let currentModelName = await service.getModelName()
             if let projectId = settings.projectId {
                 // Use bookmarks already captured before security scope was stopped.
                 // Do NOT use job.inputURLs here — that computed property calls
@@ -512,7 +515,9 @@ final class BatchOrchestrator {
                     status: "completed",
                     externalJobName: jobName,
                     sourceImageBookmarks: sourceBookmarks.isEmpty ? nil : sourceBookmarks,
-                    outputImageBookmark: outputBookmark
+                    outputImageBookmark: outputBookmark,
+                    tokenUsage: response.tokenUsage,
+                    modelName: currentModelName
                 )
                 
                 if let jobName = jobName {
@@ -520,7 +525,7 @@ final class BatchOrchestrator {
                 } else {
                     onImageCompleted?(historyEntry)
                 }
-                onCostIncurred?(cost, settings.imageSize, projectId)
+                onCostIncurred?(cost, settings.imageSize, projectId, response.tokenUsage, currentModelName)
             }
             
             saveActiveBatches()
@@ -549,7 +554,8 @@ final class BatchOrchestrator {
                 cost: 0,
                 status: "failed",
                 error: error.localizedDescription,
-                externalJobName: job.externalJobName
+                externalJobName: job.externalJobName,
+                modelName: await service.getModelName()
             )
             
             if let jobName = job.externalJobName {

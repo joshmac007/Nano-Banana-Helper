@@ -32,6 +32,7 @@ struct ImageEditRequest: Sendable {
 struct ImageEditResponse: Sendable {
     let imageData: Data
     let mimeType: String
+    let tokenUsage: TokenUsage?
 }
 
 /// Internal struct to hold batch job creation info
@@ -576,7 +577,15 @@ actor NanoBananaService {
         Task { @MainActor in
             LogManager.shared.log(.response, payload: "parseResponse keys: \(keysString)")
         }
-        
+
+        var tokenUsage: TokenUsage? = nil
+        if let um = rawJson["usageMetadata"] as? [String: Any],
+           let pt = um["promptTokenCount"] as? Int,
+           let ct = um["candidatesTokenCount"] as? Int,
+           let tt = um["totalTokenCount"] as? Int {
+            tokenUsage = TokenUsage(promptTokenCount: pt, candidatesTokenCount: ct, totalTokenCount: tt)
+        }
+
         // Handle batch API wrapper
         let json: [String: Any]
         if let responses = rawJson["responses"] as? [[String: Any]], let first = responses.first {
@@ -606,7 +615,7 @@ actor NanoBananaService {
                let mimeType = (inlineData["mime_type"] ?? inlineData["mimeType"]) as? String,
                let base64Data = inlineData["data"] as? String,
                let imageData = Data(base64Encoded: base64Data) {
-                return ImageEditResponse(imageData: imageData, mimeType: mimeType)
+                return ImageEditResponse(imageData: imageData, mimeType: mimeType, tokenUsage: tokenUsage)
             }
             // Also handle file_data format
             let fileData = part["file_data"] as? [String: Any] ?? part["fileData"] as? [String: Any]
@@ -614,7 +623,7 @@ actor NanoBananaService {
                let mimeType = (fileData["mime_type"] ?? fileData["mimeType"]) as? String,
                let base64Data = fileData["data"] as? String,
                let imageData = Data(base64Encoded: base64Data) {
-                return ImageEditResponse(imageData: imageData, mimeType: mimeType)
+                return ImageEditResponse(imageData: imageData, mimeType: mimeType, tokenUsage: tokenUsage)
             }
         }
         

@@ -111,7 +111,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     let status: String // "completed", "cancelled", "failed"
     let error: String?
     let externalJobName: String?
-    
+    let tokenUsage: TokenUsage?
+    let modelName: String?
+
     init(
         projectId: UUID,
         sourceImagePaths: [String],
@@ -123,7 +125,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         cost: Double,
         status: String = "completed",
         error: String? = nil,
-        externalJobName: String? = nil
+        externalJobName: String? = nil,
+        tokenUsage: TokenUsage? = nil,
+        modelName: String? = nil
     ) {
         self.id = UUID()
         self.projectId = projectId
@@ -138,6 +142,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.status = status
         self.error = error
         self.externalJobName = externalJobName
+        self.tokenUsage = tokenUsage
+        self.modelName = modelName
     }
     
     // Backward compatibility for single source path
@@ -166,6 +172,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         case prompt, aspectRatio, imageSize, usedBatchTier, cost
         case status, error, externalJobName
         case sourceImageBookmarks, outputImageBookmark
+        case tokenUsage, modelName
     }
     
     init(
@@ -181,7 +188,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         error: String? = nil,
         externalJobName: String? = nil,
         sourceImageBookmarks: [Data]? = nil,
-        outputImageBookmark: Data? = nil
+        outputImageBookmark: Data? = nil,
+        tokenUsage: TokenUsage? = nil,
+        modelName: String? = nil
     ) {
         self.id = UUID()
         self.projectId = projectId
@@ -198,6 +207,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.externalJobName = externalJobName
         self.sourceImageBookmarks = sourceImageBookmarks
         self.outputImageBookmark = outputImageBookmark
+        self.tokenUsage = tokenUsage
+        self.modelName = modelName
     }
     
     init(from decoder: Decoder) throws {
@@ -217,6 +228,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
         sourceImageBookmarks = try container.decodeIfPresent([Data].self, forKey: .sourceImageBookmarks)
         outputImageBookmark = try container.decodeIfPresent(Data.self, forKey: .outputImageBookmark)
+        tokenUsage = try container.decodeIfPresent(TokenUsage.self, forKey: .tokenUsage)
+        modelName = try container.decodeIfPresent(String.self, forKey: .modelName)
     }
     
     func encode(to encoder: Encoder) throws {
@@ -236,6 +249,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         try container.encodeIfPresent(externalJobName, forKey: .externalJobName)
         try container.encodeIfPresent(sourceImageBookmarks, forKey: .sourceImageBookmarks)
         try container.encodeIfPresent(outputImageBookmark, forKey: .outputImageBookmark)
+        try container.encodeIfPresent(tokenUsage, forKey: .tokenUsage)
+        try container.encodeIfPresent(modelName, forKey: .modelName)
     }
 }
 
@@ -247,19 +262,65 @@ struct CostSummary: Codable {
     var imageCount: Int
     var byResolution: [String: Double]
     var byProject: [String: Double]  // Project ID string -> cost
-    
+    var totalTokens: Int
+    var inputTokens: Int
+    var outputTokens: Int
+    var byModel: [String: Double]
+
+    enum CodingKeys: String, CodingKey {
+        case totalSpent, imageCount, byResolution, byProject
+        case totalTokens, inputTokens, outputTokens, byModel
+    }
+
     init() {
         totalSpent = 0
         imageCount = 0
         byResolution = [:]
         byProject = [:]
+        totalTokens = 0
+        inputTokens = 0
+        outputTokens = 0
+        byModel = [:]
     }
-    
-    mutating func record(cost: Double, resolution: String, projectId: UUID) {
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        totalSpent = try container.decode(Double.self, forKey: .totalSpent)
+        imageCount = try container.decode(Int.self, forKey: .imageCount)
+        byResolution = try container.decode([String: Double].self, forKey: .byResolution)
+        byProject = try container.decode([String: Double].self, forKey: .byProject)
+        totalTokens = try container.decodeIfPresent(Int.self, forKey: .totalTokens) ?? 0
+        inputTokens = try container.decodeIfPresent(Int.self, forKey: .inputTokens) ?? 0
+        outputTokens = try container.decodeIfPresent(Int.self, forKey: .outputTokens) ?? 0
+        byModel = try container.decodeIfPresent([String: Double].self, forKey: .byModel) ?? [:]
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(totalSpent, forKey: .totalSpent)
+        try container.encode(imageCount, forKey: .imageCount)
+        try container.encode(byResolution, forKey: .byResolution)
+        try container.encode(byProject, forKey: .byProject)
+        try container.encode(totalTokens, forKey: .totalTokens)
+        try container.encode(inputTokens, forKey: .inputTokens)
+        try container.encode(outputTokens, forKey: .outputTokens)
+        try container.encode(byModel, forKey: .byModel)
+    }
+
+    mutating func record(cost: Double, resolution: String, projectId: UUID,
+                         tokens: TokenUsage? = nil, modelName: String? = nil) {
         totalSpent += cost
         imageCount += 1
         byResolution[resolution, default: 0] += cost
         byProject[projectId.uuidString, default: 0] += cost
+        if let tokens {
+            totalTokens += tokens.totalTokenCount
+            inputTokens += tokens.promptTokenCount
+            outputTokens += tokens.candidatesTokenCount
+        }
+        if let modelName {
+            byModel[modelName, default: 0] += cost
+        }
     }
 }
 

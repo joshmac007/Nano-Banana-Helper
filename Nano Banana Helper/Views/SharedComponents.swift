@@ -26,6 +26,7 @@ struct CostEstimatorView: View {
     let isBatchTier: Bool
     let isMultiInput: Bool
     let generationMode: GenerationMode
+    let modelName: String?
     
     private var inputCostPerImage: Double { isBatchTier ? 0.0006 : 0.0011 }
     
@@ -78,6 +79,13 @@ struct CostEstimatorView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            if let modelName {
+                Text(modelName)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
             Spacer()
             Text("≈ $\(totalCost, specifier: "%.2f")")
                 .font(.headline)

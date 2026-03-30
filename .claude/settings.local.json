@@ -16,7 +16,13 @@
       "Bash(rm -rf build/export && mkdir -p build/export && cp -R \"build/NanoBananaHelper.xcarchive/Products/Applications/Nano Banana Helper.app\" \"build/export/\" && ls -la \"build/export/Nano Banana Helper.app\" | head -5)",
       "mcp__web-search-prime__web_search_prime",
       "Bash(cd:*)",
-      "Bash(xed:*)"
+      "Bash(xed:*)",
+      "Bash(/Users/frederic/.claude/plugins/cache/superpowers-extended-cc-marketplace/superpowers-extended-cc/5.2.3/skills/brainstorming/scripts/start-server.sh --project-dir /Volumes/ssd/ai/github/Nano-Banana-Helper)",
+      "Bash(\"/Volumes/ssd/ai/github/Nano-Banana-Helper/build-dmg.sh\")",
+      "Bash(./build-dmg.sh 2>&1)",
+      "Bash(hdiutil attach:*)",
+      "Read(//tmp/**)",
+      "Bash(hdiutil detach:*)"
     ]
   }
 }

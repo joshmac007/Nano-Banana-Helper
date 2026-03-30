@@ -8,18 +8,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Open in Xcode
 xed .
 
+# Build DMG (cleans derived data, builds Release, creates DMG in project root)
+./build-dmg.sh
+
 # Build from command line (Debug) — must override team ID
 xcodebuild -project "Nano Banana Helper.xcodeproj" -scheme "Nano Banana Helper" -configuration Debug DEVELOPMENT_TEAM=46BZ85ALNS
 
 # Run all tests (deployment target override needed if host macOS < SDK)
 xcodebuild -project "Nano Banana Helper.xcodeproj" -scheme "Nano Banana Helper" -destination 'platform=macOS' test MACOSX_DEPLOYMENT_TARGET=26.2
 
-# Run a single unit test (Swift Testing framework)
-xcodebuild -project "Nano Banana Helper.xcodeproj" -scheme "Nano Banana Helper" -destination 'platform=macOS' test -only-testing:Nano-Banana-HelperTests/ClassName/testName
+# Run a single unit test (Swift Testing framework) — target ID uses underscores
+xcodebuild -project "Nano Banana Helper.xcodeproj" -scheme "Nano Banana Helper" -destination 'platform=macOS' test MACOSX_DEPLOYMENT_TARGET=26.2 -only-testing:Nano_Banana_HelperTests/ClassName/testName
 
 # Run a single UI test (XCTest framework)
 xcodebuild -project "Nano Banana Helper.xcodeproj" -scheme "Nano Banana Helper" -destination 'platform=macOS' test -only-testing:Nano-Banana-HelperUITests/ClassName/testName
 ```
+
+**Always build a DMG after any code change.** Run `./build-dmg.sh` at the end of every task. The DMG is stored at `Nano Banana Helper.dmg` in the project root.
 
 ## Architecture Overview
 
@@ -51,6 +56,15 @@ Models/          → Data structures, @Observable state managers
 | `TokenUsage` | Models/BillingModels.swift | `nonisolated` struct with prompt/candidates/total token counts. Decoded from API `usageMetadata` |
 | `CostSummary` | Models/Models.swift | Extended with `totalTokens`, `inputTokens`, `outputTokens`, `byModel`. Custom `Codable` for backward compat (new fields default to 0/empty) |
 | `AppPaths` | Models/AppPaths.swift | Centralized path management, security-scoped bookmark helpers |
+| `Project` | Models/Models.swift | `@Observable class` — domain model grouping batch jobs. Properties: id, name, outputDirectory, totalCost, presets |
+| `HistoryEntry` | Models/Models.swift | Core data type for a completed image edit with token usage, model name, cost metadata |
+| `ImageTask` | Models/Models.swift | `@Observable class` — single image task within a batch, multi-input support |
+| `BatchJob` | Models/Models.swift | `@Observable class` — batch container with `isTextMode` flag |
+| `JobPhase` | Models/Models.swift | Enum: `.pending`, `.submitting`, `.polling`, `.reconnecting`, `.downloading`, `.completed`, `.failed` |
+| `ImageSize` | Models/Models.swift | Enum: `512`, `1K`, `2K`, `4K` with `standardCost`/`batchCost`/`calculateCost()` |
+| `AspectRatio` | Models/AspectRatio.swift | Supported output ratios with categories (auto, square, landscape, portrait) |
+| `GenerationMode` | Models/BatchStagingManager.swift | Enum: `.image` (edit existing) or `.text` (generate from scratch) |
+| `Constants` | Models/Constants.swift | App-wide constants (`maxTextImageVariations = 4`) |
 
 ### View Hierarchy
 
@@ -90,6 +104,13 @@ Callbacks are wired in `MainLayoutView.onAppear`:
 orchestrator.onImageCompleted = { entry in
     historyManager.addEntry(entry)
 }
+orchestrator.onHistoryEntryUpdated = { jobName, entry in
+    historyManager.updateEntry(byExternalJobName: jobName, with: entry)
+}
+orchestrator.onCostIncurred = { cost, resolution, projectId, tokenUsage, modelName in
+    projectManager.costSummary.record(cost:cost, resolution:resolution, projectId:projectId, tokens:tokenUsage, modelName:modelName)
+    projectManager.recordSessionUsage(cost: cost, tokens: tokenUsage)
+}
 ```
 
 ### Security-Scoped Bookmarks
@@ -106,6 +127,8 @@ Types passed into/out of `NanoBananaService` (actor) must be `nonisolated`. See 
 - 10-second polling interval
 - 360 max poll attempts (1 hour timeout)
 - `TaskGroup` for throttled concurrent submission and polling in `BatchOrchestrator`
+- `enqueueTextGeneration(...)` for text-to-image mode (`.text` generation mode)
+- `resumePollingFromHistory(for:)` to resume failed batch jobs from history
 
 ## API Integration
 
@@ -130,3 +153,17 @@ Data stored in `~/Library/Application Support/NanoBananaProAssistant/`:
 
 ### Data Migration
 `AppPaths.migrateIfNeeded()` handles one-time migration from the legacy `NanoBananaPro` directory to `NanoBananaProAssistant`. Called at launch from `ProjectManager`.
+
+### Xcode Project Configuration
+- macOS only app — `SDKROOT = macosx` on all targets. Never set `IPHONEOS_DEPLOYMENT_TARGET` or `TARGETED_DEVICE_FAMILY`.
+- `MACOSX_DEPLOYMENT_TARGET = 26.2` must be set explicitly (host machine may be older than the Xcode SDK).
+- Shared scheme at `xcshareddata/xcschemes/Nano Banana Helper.xcscheme`. Test targets must have `buildForRunning = "NO"` in BuildAction to avoid XCTest frameworks being embedded in the app bundle (adds ~30MB).
+- Unit tests use Swift Testing (`@Test` macro), UI tests use XCTest. Both targets need `import Foundation` explicitly.
+- When building DMGs, clean derived data first to avoid stale frameworks: `rm -rf ~/Library/Developer/Xcode/DerivedData/Nano_Banana_Helper-*`
+
+### Backward-Compatible Codable
+When adding new fields to persisted `Codable` structs (`HistoryEntry`, `CostSummary`), always use `decodeIfPresent` with sensible defaults and write explicit `init(from decoder:)` / `encode(to encoder:)` — synthesized Codable will crash on existing JSON files missing the new fields.
+
+### Dead Code
+Three view files compile but are never referenced — do not modify without checking usage:
+`ProjectGalleryView.swift`, `ProjectListView.swift`, `DropZoneView.swift`

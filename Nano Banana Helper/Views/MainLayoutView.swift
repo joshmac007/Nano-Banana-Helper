@@ -13,7 +13,7 @@ struct MainLayoutView: View {
     @State private var sidebarWidth: CGFloat = 250
     @State private var inspectorWidth: CGFloat = 300
     
-    @State private var showingSettings = false
+    @State private var settingsSheet: SettingsView.SettingsTab? = nil
     
     var body: some View {
         NavigationSplitView {
@@ -29,7 +29,7 @@ struct MainLayoutView: View {
                     }
                 },
                 onOpenSettings: {
-                    showingSettings = true
+                    settingsSheet = .api
                 }
             )
             .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 300)
@@ -104,11 +104,14 @@ struct MainLayoutView: View {
             orchestrator.onHistoryEntryUpdated = nil
             orchestrator.onCostIncurred = nil
         }
-        .sheet(isPresented: $showingSettings) {
-            SettingsView()
+        .sheet(item: $settingsSheet) { tab in
+            SettingsView(initialTab: tab)
                 .environment(projectManager)
                 .environment(promptLibrary)
                 .environment(historyManager)
-        }     
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openPromptSettings)) { _ in
+            settingsSheet = .prompts
+        }
     }
 }

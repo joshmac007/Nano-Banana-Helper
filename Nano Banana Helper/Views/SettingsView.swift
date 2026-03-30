@@ -9,13 +9,15 @@ struct SettingsView: View {
     @State private var isLoaded: Bool = false
     @State private var selectedTab: SettingsTab = .api
     @State private var selectedModel: String = "gemini-3.1-flash-image-preview"
-    @State private var editingPreset: PromptPreset? = nil
+
+    var initialTab: SettingsTab = .api
 
     @Environment(ProjectManager.self) private var projectManager
     @Environment(PromptLibrary.self) private var promptLibrary
     @Environment(\.dismiss) private var dismiss
     
-    enum SettingsTab: String, CaseIterable {
+    enum SettingsTab: String, CaseIterable, Identifiable {
+        var id: String { rawValue }
         case api = "API"
         case projects = "Projects"
         case prompts = "Prompts"
@@ -49,24 +51,23 @@ struct SettingsView: View {
             
             Divider()
             
-            ScrollView {
-                switch selectedTab {
-                case .api:
-                    apiSection
-                case .projects:
-                    projectsSection
-                case .prompts:
-                    promptsSection
-                case .usage:
-                    UsageDashboardView()
-                case .about:
-                    aboutSection
-                }
+            switch selectedTab {
+            case .api:
+                apiSection
+            case .projects:
+                projectsSection
+            case .prompts:
+                PromptsManagementView()
+            case .usage:
+                UsageDashboardView()
+            case .about:
+                aboutSection
             }
         }
         .frame(width: 500, height: 650)
         .onAppear {
             if !isLoaded {
+                selectedTab = initialTab
                 checkExistingKey()
                 loadCurrentModel()
                 isLoaded = true
@@ -227,49 +228,12 @@ struct SettingsView: View {
         }
     }
 
-    private var promptsSection: some View {
-        Group {
-            if promptLibrary.presets.isEmpty {
-                ContentUnavailableView(
-                    "No Presets",
-                    systemImage: "bookmark.slash",
-                    description: Text("Save prompt presets from the Inspector.")
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 12)], spacing: 12) {
-                        ForEach(promptLibrary.presets) { preset in
-                            PresetCard(preset: preset, promptLibrary: promptLibrary)
-                                .contextMenu {
-                                    Button("Edit") {
-                                        editingPreset = preset
-                                    }
-                                    Button("Duplicate") {
-                                        promptLibrary.duplicate(preset)
-                                    }
-                                    Divider()
-                                    Button("Delete", role: .destructive) {
-                                        promptLibrary.delete(preset)
-                                    }
-                                }
-                        }
-                    }
-                    .padding()
-                }
-            }
-        }
-        .sheet(item: $editingPreset) { preset in
-            PresetEditSheet(preset: preset, promptLibrary: promptLibrary)
-        }
-    }
-
 
     private var aboutSection: some View {
         Form {
             Section("About Nano Banana Helper") {
                 LabeledContent("Version") {
-                    Text("1.3.4")
+                    Text("1.3.5")
                         .fontWeight(.bold)
                 }
 
@@ -367,107 +331,6 @@ struct SettingsView: View {
         let service = NanoBananaService()
         Task {
             await service.setModelName(modelName)
-        }
-    }
-}
-
-// MARK: - Preset Card
-
-private struct PresetCard: View {
-    let preset: PromptPreset
-    var promptLibrary: PromptLibrary
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(preset.name)
-                .font(.system(size: 13, weight: .semibold))
-                .lineLimit(1)
-
-            Text(preset.userPrompt)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .lineLimit(3)
-
-            if preset.systemPrompt != nil && !(preset.systemPrompt?.isEmpty ?? true) {
-                HStack(spacing: 3) {
-                    Image(systemName: "cpu")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.purple)
-                    Text("Has system prompt")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.purple.opacity(0.8))
-                }
-            }
-
-            Text(preset.updatedAt, style: .relative)
-                .font(.system(size: 9))
-                .foregroundStyle(.tertiary)
-        }
-        .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .cornerRadius(8)
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
-        )
-    }
-}
-
-// MARK: - Preset Edit Sheet
-
-private struct PresetEditSheet: View {
-    let preset: PromptPreset
-    var promptLibrary: PromptLibrary
-
-    @Environment(\.dismiss) private var dismiss
-    @State private var name: String = ""
-    @State private var userPrompt: String = ""
-    @State private var systemPrompt: String = ""
-
-    var body: some View {
-        VStack(spacing: 20) {
-            Text("Edit Preset")
-                .font(.headline)
-
-            Form {
-                Section("Name") {
-                    TextField("Preset name", text: $name)
-                }
-
-                Section("User Prompt") {
-                    TextEditor(text: $userPrompt)
-                        .frame(minHeight: 80)
-                }
-
-                Section("System Prompt") {
-                    TextEditor(text: $systemPrompt)
-                        .frame(minHeight: 60)
-                }
-            }
-            .formStyle(.grouped)
-
-            HStack {
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Spacer()
-                Button("Save") {
-                    var updated = preset
-                    updated.name = name
-                    updated.userPrompt = userPrompt
-                    updated.systemPrompt = systemPrompt.isEmpty ? nil : systemPrompt
-                    promptLibrary.update(updated)
-                    dismiss()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(name.isEmpty)
-            }
-        }
-        .padding()
-        .frame(width: 450, height: 500)
-        .onAppear {
-            name = preset.name
-            userPrompt = preset.userPrompt
-            systemPrompt = preset.systemPrompt ?? ""
         }
     }
 }

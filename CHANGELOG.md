@@ -2,6 +2,31 @@
 
 All notable changes to Nano Banana Helper will be documented in this file.
 
+## [1.3.5] - 2026-03-30
+
+### Added
+- **Prompts Management View**: Full-featured preset management page in Settings > Prompts, replacing the bare card grid
+  - Search presets by name or prompt content
+  - Sort by name, date created, or last modified
+  - Create new presets with the "+" toolbar button
+  - Edit presets via single-click selection + Edit toolbar button, or context menu
+  - Keyboard shortcut: Return to edit selected preset
+  - Duplicate presets from context menu
+  - Set/remove project default preset from context menu
+  - Delete presets with confirmation alert
+  - Preset rows show: name, user prompt preview (or purple "System prompt only" badge), system prompt indicator, relative timestamp, and gold star for project defaults
+  - Collapsible system prompt section in the edit sheet with purple accent
+
+### Changed
+- **Settings Tab Routing**: Settings opens to the correct tab via atomic `.sheet(item:)` pattern — sidebar Settings icon opens to API, "Manage All..." opens to Prompts
+- **"Manage All..." Menu Entry**: Now reliably opens Settings to the Prompts tab via NotificationCenter bridge (previously called an unresponsive `NSApp.sendAction`)
+- **SettingsView**: Removed outer ScrollView and ~140 lines of inline preset code — each tab manages its own scrolling, presets handled by dedicated `PromptsManagementView`
+
+### Fixed
+- **System-Only Presets Lost Menu Actions**: Presets with only a system prompt (empty userPrompt) wouldn't show Edit/Duplicate/Delete/Set Default in the presets dropdown menu — fixed guard to check both prompt fields
+- **Preset List Rows Not Selectable**: Missing `.tag()` on list rows prevented SwiftUI `List(selection:)` from mapping clicks to the selection binding — added explicit tags
+- **Prompts Tab Rendering**: Nested scrollable containers (`List` inside `ScrollView`) caused NSTableView rendering conflicts on macOS — presets now render correctly
+
 ## [1.3.4] - 2026-03-29
 
 ### Changed

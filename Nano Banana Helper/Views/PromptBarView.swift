@@ -1,5 +1,9 @@
 import SwiftUI
 
+extension Notification.Name {
+    static let openPromptSettings = Notification.Name("openPromptSettings")
+}
+
 struct PromptBarView: View {
     @Bindable var stagingManager: BatchStagingManager
     var project: Project?
@@ -160,8 +164,7 @@ struct PromptBarView: View {
         }
 
         Button("Manage All...") {
-            // Opens Settings — handled by parent or notification
-            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            NotificationCenter.default.post(name: .openPromptSettings, object: nil)
         }
     }
 
@@ -169,7 +172,7 @@ struct PromptBarView: View {
 
     /// Checks if the current prompt text exactly matches a saved preset
     private var currentMatchingPreset: PromptPreset? {
-        guard !stagingManager.prompt.isEmpty else { return nil }
+        guard !stagingManager.prompt.isEmpty || !stagingManager.systemPrompt.isEmpty else { return nil }
         return promptLibrary.presets.first { preset in
             preset.userPrompt == stagingManager.prompt
                 && (preset.systemPrompt ?? "") == stagingManager.systemPrompt

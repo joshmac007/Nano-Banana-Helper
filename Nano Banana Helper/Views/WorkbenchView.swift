@@ -63,6 +63,7 @@ struct WorkbenchView: View {
                         onReuse: { entry in
                             // Reuse logic: Load prompt and settings back to staging
                             stagingManager.prompt = entry.prompt
+                            stagingManager.systemPrompt = entry.systemPrompt ?? ""
                             stagingManager.aspectRatio = entry.aspectRatio
                             stagingManager.imageSize = entry.imageSize
                             stagingManager.isBatchTier = entry.usedBatchTier

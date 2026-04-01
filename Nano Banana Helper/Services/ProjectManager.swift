@@ -10,7 +10,10 @@ class ProjectManager {
     var projects: [Project] = []
     var currentProject: Project?
     var costSummary = CostSummary()
-    
+    var sessionCost: Double = 0
+    var sessionTokens: Int = 0
+    var sessionImageCount: Int = 0
+
     private var appSupportURL: URL { AppPaths.appSupportURL }
     private var projectsListURL: URL { AppPaths.projectsURL }
     private var costSummaryURL: URL { AppPaths.costSummaryURL }
@@ -184,19 +187,25 @@ class ProjectManager {
     func rebuildCostSummary(from entries: [HistoryEntry]) {
         // Reset summary
         costSummary = CostSummary()
-        
+
         // Re-accumulate from all history
         for entry in entries {
-            costSummary.record(cost: entry.cost, resolution: entry.imageSize, projectId: entry.projectId)
+            costSummary.record(cost: entry.cost, resolution: entry.imageSize, projectId: entry.projectId, tokens: entry.tokenUsage, modelName: entry.modelName)
         }
-        
+
         saveCostSummary()
+    }
+
+    func recordSessionUsage(cost: Double, tokens: TokenUsage?) {
+        sessionCost += cost
+        sessionTokens += (tokens?.totalTokenCount ?? 0)
+        sessionImageCount += 1
     }
     
     // MARK: - Export
     
     func exportCostReportCSV(entries: [HistoryEntry] = []) -> URL? {
-        var csv = "Date,Project,Prompt,Resolution,Tier,Cost,Status\n"
+        var csv = "Date,Project,Prompt,Resolution,Tier,Model,Cost,InputTokens,OutputTokens,Status\n"
         
         if entries.isEmpty {
             // Fallback: summary rows only (no history entries provided)
@@ -220,7 +229,10 @@ class ProjectManager {
                     .replacingOccurrences(of: "\n", with: " ")
                 let tier = entry.usedBatchTier ? "Batch" : "Standard"
                 let date = entry.timestamp.ISO8601Format()
-                csv += "\(date),\(project),\(prompt),\(entry.imageSize),\(tier),\(entry.cost),\(entry.status)\n"
+                let model = entry.modelName ?? "unknown"
+                let inTokens = entry.tokenUsage?.promptTokenCount ?? 0
+                let outTokens = entry.tokenUsage?.candidatesTokenCount ?? 0
+                csv += "\(date),\(project),\(prompt),\(entry.imageSize),\(tier),\(model),\(entry.cost),\(inTokens),\(outTokens),\(entry.status)\n"
             }
         }
         

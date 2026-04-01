@@ -17,6 +17,7 @@ class Project: Codable, Identifiable, Hashable {
     
     // Presets
     var defaultPrompt: String?
+    var defaultPresetID: UUID?
     var defaultAspectRatio: String?
     var defaultImageSize: String?
     var defaultUseBatchTier: Bool?
@@ -55,7 +56,7 @@ class Project: Codable, Identifiable, Hashable {
     
     enum CodingKeys: CodingKey {
         case id, name, createdAt, outputDirectory, totalCost, imageCount
-        case defaultPrompt, defaultAspectRatio, defaultImageSize, defaultUseBatchTier
+        case defaultPrompt, defaultPresetID, defaultAspectRatio, defaultImageSize, defaultUseBatchTier
         case isArchived, projectNotes, outputDirectoryBookmark
     }
     
@@ -68,6 +69,7 @@ class Project: Codable, Identifiable, Hashable {
         totalCost = try container.decode(Double.self, forKey: .totalCost)
         imageCount = try container.decode(Int.self, forKey: .imageCount)
         defaultPrompt = try container.decodeIfPresent(String.self, forKey: .defaultPrompt)
+        defaultPresetID = try container.decodeIfPresent(UUID.self, forKey: .defaultPresetID)
         defaultAspectRatio = try container.decodeIfPresent(String.self, forKey: .defaultAspectRatio)
         defaultImageSize = try container.decodeIfPresent(String.self, forKey: .defaultImageSize)
         defaultUseBatchTier = try container.decodeIfPresent(Bool.self, forKey: .defaultUseBatchTier)
@@ -85,6 +87,7 @@ class Project: Codable, Identifiable, Hashable {
         try container.encode(totalCost, forKey: .totalCost)
         try container.encode(imageCount, forKey: .imageCount)
         try container.encodeIfPresent(defaultPrompt, forKey: .defaultPrompt)
+        try container.encodeIfPresent(defaultPresetID, forKey: .defaultPresetID)
         try container.encodeIfPresent(defaultAspectRatio, forKey: .defaultAspectRatio)
         try container.encodeIfPresent(defaultImageSize, forKey: .defaultImageSize)
         try container.encodeIfPresent(defaultUseBatchTier, forKey: .defaultUseBatchTier)
@@ -111,7 +114,10 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     let status: String // "completed", "cancelled", "failed"
     let error: String?
     let externalJobName: String?
-    
+    let tokenUsage: TokenUsage?
+    let modelName: String?
+    let systemPrompt: String?
+
     init(
         projectId: UUID,
         sourceImagePaths: [String],
@@ -123,7 +129,10 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         cost: Double,
         status: String = "completed",
         error: String? = nil,
-        externalJobName: String? = nil
+        externalJobName: String? = nil,
+        tokenUsage: TokenUsage? = nil,
+        modelName: String? = nil,
+        systemPrompt: String? = nil
     ) {
         self.id = UUID()
         self.projectId = projectId
@@ -138,6 +147,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.status = status
         self.error = error
         self.externalJobName = externalJobName
+        self.tokenUsage = tokenUsage
+        self.modelName = modelName
+        self.systemPrompt = systemPrompt
     }
     
     // Backward compatibility for single source path
@@ -166,6 +178,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         case prompt, aspectRatio, imageSize, usedBatchTier, cost
         case status, error, externalJobName
         case sourceImageBookmarks, outputImageBookmark
+        case tokenUsage, modelName, systemPrompt
     }
     
     init(
@@ -181,7 +194,10 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         error: String? = nil,
         externalJobName: String? = nil,
         sourceImageBookmarks: [Data]? = nil,
-        outputImageBookmark: Data? = nil
+        outputImageBookmark: Data? = nil,
+        tokenUsage: TokenUsage? = nil,
+        modelName: String? = nil,
+        systemPrompt: String? = nil
     ) {
         self.id = UUID()
         self.projectId = projectId
@@ -198,6 +214,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.externalJobName = externalJobName
         self.sourceImageBookmarks = sourceImageBookmarks
         self.outputImageBookmark = outputImageBookmark
+        self.tokenUsage = tokenUsage
+        self.modelName = modelName
+        self.systemPrompt = systemPrompt
     }
     
     init(from decoder: Decoder) throws {
@@ -217,6 +236,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
         sourceImageBookmarks = try container.decodeIfPresent([Data].self, forKey: .sourceImageBookmarks)
         outputImageBookmark = try container.decodeIfPresent(Data.self, forKey: .outputImageBookmark)
+        tokenUsage = try container.decodeIfPresent(TokenUsage.self, forKey: .tokenUsage)
+        modelName = try container.decodeIfPresent(String.self, forKey: .modelName)
+        systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt)
     }
     
     func encode(to encoder: Encoder) throws {
@@ -236,6 +258,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         try container.encodeIfPresent(externalJobName, forKey: .externalJobName)
         try container.encodeIfPresent(sourceImageBookmarks, forKey: .sourceImageBookmarks)
         try container.encodeIfPresent(outputImageBookmark, forKey: .outputImageBookmark)
+        try container.encodeIfPresent(tokenUsage, forKey: .tokenUsage)
+        try container.encodeIfPresent(modelName, forKey: .modelName)
+        try container.encodeIfPresent(systemPrompt, forKey: .systemPrompt)
     }
 }
 
@@ -247,19 +272,65 @@ struct CostSummary: Codable {
     var imageCount: Int
     var byResolution: [String: Double]
     var byProject: [String: Double]  // Project ID string -> cost
-    
+    var totalTokens: Int
+    var inputTokens: Int
+    var outputTokens: Int
+    var byModel: [String: Double]
+
+    enum CodingKeys: String, CodingKey {
+        case totalSpent, imageCount, byResolution, byProject
+        case totalTokens, inputTokens, outputTokens, byModel
+    }
+
     init() {
         totalSpent = 0
         imageCount = 0
         byResolution = [:]
         byProject = [:]
+        totalTokens = 0
+        inputTokens = 0
+        outputTokens = 0
+        byModel = [:]
     }
-    
-    mutating func record(cost: Double, resolution: String, projectId: UUID) {
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        totalSpent = try container.decode(Double.self, forKey: .totalSpent)
+        imageCount = try container.decode(Int.self, forKey: .imageCount)
+        byResolution = try container.decode([String: Double].self, forKey: .byResolution)
+        byProject = try container.decode([String: Double].self, forKey: .byProject)
+        totalTokens = try container.decodeIfPresent(Int.self, forKey: .totalTokens) ?? 0
+        inputTokens = try container.decodeIfPresent(Int.self, forKey: .inputTokens) ?? 0
+        outputTokens = try container.decodeIfPresent(Int.self, forKey: .outputTokens) ?? 0
+        byModel = try container.decodeIfPresent([String: Double].self, forKey: .byModel) ?? [:]
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(totalSpent, forKey: .totalSpent)
+        try container.encode(imageCount, forKey: .imageCount)
+        try container.encode(byResolution, forKey: .byResolution)
+        try container.encode(byProject, forKey: .byProject)
+        try container.encode(totalTokens, forKey: .totalTokens)
+        try container.encode(inputTokens, forKey: .inputTokens)
+        try container.encode(outputTokens, forKey: .outputTokens)
+        try container.encode(byModel, forKey: .byModel)
+    }
+
+    mutating func record(cost: Double, resolution: String, projectId: UUID,
+                         tokens: TokenUsage? = nil, modelName: String? = nil) {
         totalSpent += cost
         imageCount += 1
         byResolution[resolution, default: 0] += cost
         byProject[projectId.uuidString, default: 0] += cost
+        if let tokens {
+            totalTokens += tokens.totalTokenCount
+            inputTokens += tokens.promptTokenCount
+            outputTokens += tokens.candidatesTokenCount
+        }
+        if let modelName {
+            byModel[modelName, default: 0] += cost
+        }
     }
 }
 
@@ -322,9 +393,10 @@ class BatchJob: Identifiable, Codable {
     var useBatchTier: Bool
     var status: String
     var tasks: [ImageTask]
+    var isTextMode: Bool = false // For text-to-image generation
 
     enum CodingKeys: String, CodingKey {
-        case id, createdAt, projectId, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, useBatchTier, status, tasks
+        case id, createdAt, projectId, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, useBatchTier, status, tasks, isTextMode
     }
 
     required init(from decoder: Decoder) throws {
@@ -340,6 +412,7 @@ class BatchJob: Identifiable, Codable {
         useBatchTier = try container.decode(Bool.self, forKey: .useBatchTier)
         status = try container.decode(String.self, forKey: .status)
         tasks = try container.decode([ImageTask].self, forKey: .tasks)
+        isTextMode = try container.decodeIfPresent(Bool.self, forKey: .isTextMode) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -355,6 +428,7 @@ class BatchJob: Identifiable, Codable {
         try container.encode(useBatchTier, forKey: .useBatchTier)
         try container.encode(status, forKey: .status)
         try container.encode(tasks, forKey: .tasks)
+        try container.encode(isTextMode, forKey: .isTextMode)
     }
     
     init(
@@ -389,27 +463,14 @@ class BatchJob: Identifiable, Codable {
     
     /// Calculate cost for a specific task based on settings
     func cost(for task: ImageTask) -> Double {
-        let inputRate = useBatchTier ? 0.0006 : 0.0011
-        let inputCost = inputRate * Double(max(1, task.inputPaths.count))
-        
-        let outputCost: Double
-        if useBatchTier {
-            // Batch Tier: 50% cheaper
-            switch imageSize {
-            case "4K": outputCost = 0.12
-            case "2K", "1K": outputCost = 0.067
-            default: outputCost = 0.067
-            }
-        } else {
-            // Standard Tier
-            switch imageSize {
-            case "4K": outputCost = 0.24
-            case "2K", "1K": outputCost = 0.134
-            default: outputCost = 0.134
-            }
+        if isTextMode {
+            return ImageSize.calculateTextModeCost(
+                imageSize: imageSize,
+                outputCount: 1,
+                isBatchTier: useBatchTier
+            )
         }
-        
-        return inputCost + outputCost
+        return ImageSize.calculateCost(imageSize: imageSize, inputCount: task.inputPaths.count, isBatchTier: useBatchTier)
     }
 }
 
@@ -549,5 +610,60 @@ class ImageTask: Identifiable, Codable {
     var duration: TimeInterval? {
         guard let start = startedAt, let end = completedAt else { return nil }
         return end.timeIntervalSince(start)
+    }
+}
+
+// MARK: - Image Size Configuration
+
+/// Supported output image sizes with centralized pricing
+enum ImageSize: String, CaseIterable, Identifiable {
+    case size512 = "512"
+    case size1K = "1K"
+    case size2K = "2K"
+    case size4K = "4K"
+    
+    var id: String { rawValue }
+    
+    var displayName: String { rawValue }
+    
+    /// Output cost per image for standard tier
+    var standardCost: Double {
+        switch self {
+        case .size4K: return 0.24
+        case .size2K: return 0.134
+        case .size1K: return 0.067
+        case .size512: return 0.034
+        }
+    }
+    
+    /// Output cost per image for batch tier (50% off)
+    var batchCost: Double {
+        standardCost / 2
+    }
+    
+    /// Get cost for given tier
+    func cost(isBatchTier: Bool) -> Double {
+        isBatchTier ? batchCost : standardCost
+    }
+    
+    /// Calculate total cost including input images
+    static func calculateCost(imageSize: String, inputCount: Int, isBatchTier: Bool) -> Double {
+        let inputRate = isBatchTier ? 0.0006 : 0.0011
+        let inputCost = inputRate * Double(max(1, inputCount))
+        
+        guard let size = ImageSize(rawValue: imageSize) else {
+            return inputCost + (isBatchTier ? 0.067 : 0.134) // fallback to 1K pricing
+        }
+        
+        return inputCost + size.cost(isBatchTier: isBatchTier)
+    }
+    
+    /// Calculate cost for text-to-image generation (no input images)
+    static func calculateTextModeCost(imageSize: String, outputCount: Int, isBatchTier: Bool) -> Double {
+        guard let size = ImageSize(rawValue: imageSize) else {
+            // Fallback to 1K pricing
+            return Double(outputCount) * (isBatchTier ? 0.067 : 0.134)
+        }
+        return Double(outputCount) * size.cost(isBatchTier: isBatchTier)
     }
 }

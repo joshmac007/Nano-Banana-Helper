@@ -338,6 +338,18 @@ struct HistoryRowView: View {
                 Text(entry.prompt)
                     .font(.system(.subheadline, weight: .medium))
                     .lineLimit(2)
+
+                if let systemPrompt = entry.systemPrompt, !systemPrompt.isEmpty {
+                    HStack(spacing: 4) {
+                        Image(systemName: "cpu")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.purple)
+                        Text(systemPrompt)
+                            .font(.system(.caption2, design: .rounded))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
                 
                 // Line 2: Metadata Bundle (Cost, Project, Size, Aspect, Batch)
                 HStack(spacing: 8) {

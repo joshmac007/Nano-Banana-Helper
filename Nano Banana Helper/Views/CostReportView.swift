@@ -125,7 +125,87 @@ struct CostReportView: View {
                     .padding()
                     .background(.background.secondary)
                     .cornerRadius(12)
-                    
+
+                    // Breakdown by model
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("By Model")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+
+                        ForEach(Array(costSummary.byModel.keys.sorted()), id: \.self) { model in
+                            HStack {
+                                Image(systemName: "cpu")
+                                    .foregroundStyle(.secondary)
+
+                                Text(model)
+                                    .font(.subheadline)
+                                    .lineLimit(1)
+
+                                Spacer()
+
+                                Text(formatCurrency(costSummary.byModel[model] ?? 0))
+                                    .font(.subheadline)
+                                    .fontWeight(.medium)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(.quaternary.opacity(0.5))
+                            .cornerRadius(6)
+                        }
+
+                        if costSummary.byModel.isEmpty {
+                            Text("No model data yet")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                        }
+                    }
+                    .padding()
+                    .background(.background.secondary)
+                    .cornerRadius(12)
+
+                    if costSummary.totalTokens > 0 {
+                        VStack(spacing: 12) {
+                            Text("Token Usage")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+
+                            HStack(spacing: 24) {
+                                VStack {
+                                    Text("\(costSummary.totalTokens)")
+                                        .font(.title2)
+                                        .fontWeight(.bold)
+                                    Text("Total")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                VStack {
+                                    Text("\(costSummary.inputTokens)")
+                                        .font(.title2)
+                                        .fontWeight(.bold)
+                                        .foregroundStyle(.blue)
+                                    Text("Input")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                VStack {
+                                    Text("\(costSummary.outputTokens)")
+                                        .font(.title2)
+                                        .fontWeight(.bold)
+                                        .foregroundStyle(.orange)
+                                    Text("Output")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(.quaternary)
+                        .cornerRadius(12)
+                    }
+
                     // Pricing reference
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Pricing Reference")
@@ -162,6 +242,11 @@ struct CostReportView: View {
                             }
                             .font(.caption)
                         }
+
+                        Text("Usage data is based on app tracking only. Actual billing is determined by your Google Cloud billing account.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 4)
                     }
                     .padding()
                     .background(.background.secondary)

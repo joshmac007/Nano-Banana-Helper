@@ -13,17 +13,23 @@ struct MainLayoutView: View {
     @State private var sidebarWidth: CGFloat = 250
     @State private var inspectorWidth: CGFloat = 300
     
-    @State private var showingSettings = false
+    @State private var settingsSheet: SettingsView.SettingsTab? = nil
     
     var body: some View {
         NavigationSplitView {
             SidebarView(
                 projectManager: projectManager,
                 onSelectProject: { project in
-                    // Logic to load project-specific settings could go here
+                    projectManager.selectProject(project)
+                    // Load default preset if set
+                    if let presetID = project.defaultPresetID,
+                       let preset = promptLibrary.preset(id: presetID) {
+                        stagingManager.prompt = preset.userPrompt
+                        stagingManager.systemPrompt = preset.systemPrompt ?? ""
+                    }
                 },
                 onOpenSettings: {
-                    showingSettings = true
+                    settingsSheet = .api
                 }
             )
             .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 300)
@@ -58,9 +64,8 @@ struct MainLayoutView: View {
                     
                     // Right Inspector
                     InspectorView(
-                        stagingManager: stagingManager, 
-                        projectManager: projectManager,
-                        promptLibrary: promptLibrary
+                        stagingManager: stagingManager,
+                        projectManager: projectManager
                     )
                     .frame(width: inspectorWidth)
                 }
@@ -69,6 +74,7 @@ struct MainLayoutView: View {
         .navigationTitle(projectManager.currentProject?.name ?? "Nano Banana Pro")
         .frame(minWidth: 1000, minHeight: 600)
         .environment(projectManager)
+        .environment(promptLibrary)
         .onAppear {
              // Load saved prompts if needed
              promptLibrary.load()
@@ -87,8 +93,9 @@ struct MainLayoutView: View {
                  historyManager.updateEntry(byExternalJobName: jobName, with: entry)
              }
              
-             orchestrator.onCostIncurred = { cost, resolution, projectId in
-                 projectManager.costSummary.record(cost: cost, resolution: resolution, projectId: projectId)
+             orchestrator.onCostIncurred = { cost, resolution, projectId, tokenUsage, modelName in
+                 projectManager.costSummary.record(cost: cost, resolution: resolution, projectId: projectId, tokens: tokenUsage, modelName: modelName)
+                 projectManager.recordSessionUsage(cost: cost, tokens: tokenUsage)
              }
         }
         .onDisappear {
@@ -97,10 +104,14 @@ struct MainLayoutView: View {
             orchestrator.onHistoryEntryUpdated = nil
             orchestrator.onCostIncurred = nil
         }
-        .sheet(isPresented: $showingSettings) {
-            SettingsView()
+        .sheet(item: $settingsSheet) { tab in
+            SettingsView(initialTab: tab)
                 .environment(projectManager)
                 .environment(promptLibrary)
-        }     
+                .environment(historyManager)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openPromptSettings)) { _ in
+            settingsSheet = .prompts
+        }
     }
 }

@@ -8,15 +8,20 @@ struct SettingsView: View {
     @State private var hasExistingKey: Bool = false
     @State private var isLoaded: Bool = false
     @State private var selectedTab: SettingsTab = .api
-    
+    @State private var selectedModel: String = "gemini-3.1-flash-image-preview"
+
+    var initialTab: SettingsTab = .api
+
     @Environment(ProjectManager.self) private var projectManager
     @Environment(PromptLibrary.self) private var promptLibrary
     @Environment(\.dismiss) private var dismiss
     
-    enum SettingsTab: String, CaseIterable {
+    enum SettingsTab: String, CaseIterable, Identifiable {
+        var id: String { rawValue }
         case api = "API"
         case projects = "Projects"
         case prompts = "Prompts"
+        case usage = "Usage"
         case about = "About"
     }
     
@@ -46,23 +51,25 @@ struct SettingsView: View {
             
             Divider()
             
-            ScrollView {
-                switch selectedTab {
-                case .api:
-                    apiSection
-                case .projects:
-                    projectsSection
-                case .prompts:
-                    promptsSection
-                case .about:
-                    aboutSection
-                }
+            switch selectedTab {
+            case .api:
+                apiSection
+            case .projects:
+                projectsSection
+            case .prompts:
+                PromptsManagementView()
+            case .usage:
+                UsageDashboardView()
+            case .about:
+                aboutSection
             }
         }
         .frame(width: 500, height: 650)
         .onAppear {
             if !isLoaded {
+                selectedTab = initialTab
                 checkExistingKey()
+                loadCurrentModel()
                 isLoaded = true
             }
         }
@@ -112,6 +119,26 @@ struct SettingsView: View {
                                     .frame(width: 20, height: 20)
                             }
                             .buttonStyle(.plain)
+                        }
+                    }
+                    
+                    // Model Selection Row
+                    HStack(alignment: .center) {
+                        Text("Image Model")
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                        
+                        Spacer()
+                        
+                        Picker("", selection: $selectedModel) {
+                            Text("Nano Banana 2 (Default)").tag("gemini-3.1-flash-image-preview")
+                            Text("Nano Banana (Stable)").tag("gemini-2.5-flash-image-preview")
+                            Text("Nano Banana Pro (Legacy)").tag("gemini-3-pro-image-preview")
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 200)
+                        .onChange(of: selectedModel) { _, newValue in
+                            saveModelSelection(newValue)
                         }
                     }
                     
@@ -198,65 +225,24 @@ struct SettingsView: View {
                 }
             }
             .listStyle(.inset)
-            .frame(height: 400)
         }
     }
-    
-    private var promptsSection: some View {
-        VStack(spacing: 0) {
-            if promptLibrary.prompts.isEmpty {
-                ContentUnavailableView("No Saved Prompts", 
-                                       systemImage: "bookmark.slash",
-                                       description: Text("Prompts you save as templates will appear here."))
-                    .frame(height: 400)
-            } else {
-                List {
-                    ForEach(promptLibrary.prompts) { saved in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(saved.name)
-                                    .fontWeight(.medium)
-                                Text(saved.prompt)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                            }
-                            
-                            Spacer()
-                            
-                            Button(role: .destructive) {
-                                withAnimation {
-                                    promptLibrary.delete(saved)
-                                }
-                            } label: {
-                                Image(systemName: "trash")
-                            }
-                            .buttonStyle(.borderless)
-                            .foregroundStyle(.red)
-                        }
-                        .padding(.vertical, 4)
-                    }
-                }
-                .listStyle(.inset)
-                .frame(height: 400)
-            }
-        }
-    }
-    
+
+
     private var aboutSection: some View {
         Form {
-            Section("About Nano Banana Pro") {
+            Section("About Nano Banana Helper") {
                 LabeledContent("Version") {
-                    Text("1.0")
+                    Text("1.3.5")
                         .fontWeight(.bold)
                 }
-                
+
                 LabeledContent("Build") {
-                    Text("February 2026")
+                    Text("March 2026")
                 }
 
                 LabeledContent("Copyright") {
-                    Text("© 2026 Josh McSwain")
+                    Text("© 2026 Josh McSwain & Frédéric Guigand")
                 }
                 
                 Text("A powerful interface for high-throughput image editing using the Gemini Batch API.")
@@ -331,6 +317,20 @@ struct SettingsView: View {
             }
         } else {
             showKey.toggle()
+        }
+    }
+    
+    private func loadCurrentModel() {
+        let service = NanoBananaService()
+        Task {
+            selectedModel = await service.getModelName()
+        }
+    }
+    
+    private func saveModelSelection(_ modelName: String) {
+        let service = NanoBananaService()
+        Task {
+            await service.setModelName(modelName)
         }
     }
 }

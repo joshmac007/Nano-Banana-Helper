@@ -2,6 +2,7 @@ import SwiftUI
 
 struct BottomDockView: View {
     @Environment(BatchOrchestrator.self) private var orchestrator
+    @Environment(ProjectManager.self) private var projectManager
     @Binding var isQueueOpen: Bool
     
     var body: some View {
@@ -23,7 +24,18 @@ struct BottomDockView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                
+
+                Group {
+                    if projectManager.sessionCost > 0 {
+                        Text("Session: $\(projectManager.sessionCost, specifier: "%.2f")")
+                    } else if projectManager.costSummary.totalSpent > 0 {
+                        Text("Total: $\(projectManager.costSummary.totalSpent, specifier: "%.2f")")
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+
                 Spacer()
                 
                 // Toggle Drawer Button (Explicit button, but entire bar is also tappable)

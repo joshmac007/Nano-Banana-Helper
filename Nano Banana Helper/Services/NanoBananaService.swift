@@ -2,18 +2,37 @@ import Foundation
 
 /// Request structure for image editing
 struct ImageEditRequest: Sendable {
-    let inputImageURLs: [URL] // Changed to array
+    let inputImageURLs: [URL] // Empty array for text-to-image generation
     let prompt: String
     let systemInstruction: String?
     let aspectRatio: String
     let imageSize: String
     let useBatchTier: Bool
+    
+    /// Convenience initializer for text-to-image generation (no input images)
+    static func textOnly(
+        prompt: String,
+        systemInstruction: String? = nil,
+        aspectRatio: String,
+        imageSize: String,
+        useBatchTier: Bool
+    ) -> ImageEditRequest {
+        ImageEditRequest(
+            inputImageURLs: [],
+            prompt: prompt,
+            systemInstruction: systemInstruction,
+            aspectRatio: aspectRatio,
+            imageSize: imageSize,
+            useBatchTier: useBatchTier
+        )
+    }
 }
 
 /// Response structure from Gemini API
 struct ImageEditResponse: Sendable {
     let imageData: Data
     let mimeType: String
+    let tokenUsage: TokenUsage?
 }
 
 /// Internal struct to hold batch job creation info
@@ -50,7 +69,7 @@ actor NanoBananaService {
     
     private var modelName: String {
         get async {
-            await MainActor.run { AppConfig.load().modelName } ?? "gemini-3-pro-image-preview"
+            await MainActor.run { AppConfig.load().modelName } ?? "gemini-3.1-flash-image-preview"
         }
     }
     
@@ -83,6 +102,20 @@ actor NanoBananaService {
     
     func hasAPIKey() async -> Bool {
         await getAPIKey() != nil
+    }
+    
+    // MARK: - Model Name Management
+    
+    func setModelName(_ name: String) async {
+        await MainActor.run {
+            var config = AppConfig.load()
+            config.modelName = name.isEmpty ? nil : name
+            config.save()
+        }
+    }
+    
+    func getModelName() async -> String {
+        await MainActor.run { AppConfig.load().modelName } ?? "gemini-3.1-flash-image-preview"
     }
     
     // MARK: - Image Editing
@@ -136,8 +169,9 @@ actor NanoBananaService {
             ])
         }
         
-        // Validate size for batch requests (20MB limit for inline requests)
-        if request.useBatchTier && totalDataSize > maxBatchPayloadSize {
+        // Validate size for batch requests WITH images (20MB limit for inline requests)
+        // Skip validation for text-to-image mode (empty inputImageURLs)
+        if !request.inputImageURLs.isEmpty && request.useBatchTier && totalDataSize > maxBatchPayloadSize {
             throw NanoBananaError.batchError(message: "Total image data (\(totalDataSize / 1024 / 1024)MB) exceeds 20MB limit for batch inline requests. Use smaller images or fewer images per batch.")
         }
         
@@ -543,7 +577,15 @@ actor NanoBananaService {
         Task { @MainActor in
             LogManager.shared.log(.response, payload: "parseResponse keys: \(keysString)")
         }
-        
+
+        var tokenUsage: TokenUsage? = nil
+        if let um = rawJson["usageMetadata"] as? [String: Any],
+           let pt = um["promptTokenCount"] as? Int,
+           let ct = um["candidatesTokenCount"] as? Int,
+           let tt = um["totalTokenCount"] as? Int {
+            tokenUsage = TokenUsage(promptTokenCount: pt, candidatesTokenCount: ct, totalTokenCount: tt)
+        }
+
         // Handle batch API wrapper
         let json: [String: Any]
         if let responses = rawJson["responses"] as? [[String: Any]], let first = responses.first {
@@ -573,7 +615,7 @@ actor NanoBananaService {
                let mimeType = (inlineData["mime_type"] ?? inlineData["mimeType"]) as? String,
                let base64Data = inlineData["data"] as? String,
                let imageData = Data(base64Encoded: base64Data) {
-                return ImageEditResponse(imageData: imageData, mimeType: mimeType)
+                return ImageEditResponse(imageData: imageData, mimeType: mimeType, tokenUsage: tokenUsage)
             }
             // Also handle file_data format
             let fileData = part["file_data"] as? [String: Any] ?? part["fileData"] as? [String: Any]
@@ -581,7 +623,7 @@ actor NanoBananaService {
                let mimeType = (fileData["mime_type"] ?? fileData["mimeType"]) as? String,
                let base64Data = fileData["data"] as? String,
                let imageData = Data(base64Encoded: base64Data) {
-                return ImageEditResponse(imageData: imageData, mimeType: mimeType)
+                return ImageEditResponse(imageData: imageData, mimeType: mimeType, tokenUsage: tokenUsage)
             }
         }
         

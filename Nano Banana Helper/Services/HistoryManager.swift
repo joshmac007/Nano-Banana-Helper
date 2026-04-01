@@ -6,19 +6,24 @@ class HistoryManager {
     private let fileManager = FileManager.default
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let projectsDirectoryURL: URL
+    private let bookmarkDependencies: AppPaths.BookmarkResolutionDependencies
     
     var entries: [HistoryEntry] = []
     var allGlobalEntries: [HistoryEntry] = []
     
-    private var appSupportURL: URL { AppPaths.appSupportURL }
-    
     private func historyURL(for projectId: UUID) -> URL {
-        AppPaths.projectsDirectoryURL
+        projectsDirectoryURL
             .appendingPathComponent(projectId.uuidString)
             .appendingPathComponent("history.json")
     }
     
-    init() {
+    init(
+        projectsDirectoryURL: URL = AppPaths.projectsDirectoryURL,
+        bookmarkDependencies: AppPaths.BookmarkResolutionDependencies = .live
+    ) {
+        self.projectsDirectoryURL = projectsDirectoryURL
+        self.bookmarkDependencies = bookmarkDependencies
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
@@ -36,6 +41,9 @@ class HistoryManager {
         do {
             let data = try Data(contentsOf: url)
             entries = try decoder.decode([HistoryEntry].self, from: data)
+            if refreshBookmarksIfNeeded(in: &entries) {
+                saveHistory(for: projectId)
+            }
         } catch {
             print("Failed to load history: \(error)")
             entries = []
@@ -51,7 +59,10 @@ class HistoryManager {
             
             do {
                 let data = try Data(contentsOf: url)
-                let projectEntries = try decoder.decode([HistoryEntry].self, from: data)
+                var projectEntries = try decoder.decode([HistoryEntry].self, from: data)
+                if refreshBookmarksIfNeeded(in: &projectEntries) {
+                    saveEntries(projectEntries, to: url)
+                }
                 allEntries.append(contentsOf: projectEntries)
             } catch {
                 print("Failed to load history for project \(project.name): \(error)")
@@ -68,13 +79,7 @@ class HistoryManager {
         // Ensure directory exists
         let directory = url.deletingLastPathComponent()
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-        
-        do {
-            let data = try encoder.encode(entries)
-            try data.write(to: url)
-        } catch {
-            print("Failed to save history: \(error)")
-        }
+        saveEntries(entries, to: url)
     }
     
     // MARK: - Entry Management
@@ -129,6 +134,7 @@ class HistoryManager {
     
     func clearHistory(for projectId: UUID) {
         entries.removeAll { $0.projectId == projectId }
+        allGlobalEntries.removeAll { $0.projectId == projectId }
         saveHistory(for: projectId)
     }
     
@@ -150,5 +156,54 @@ class HistoryManager {
     
     func imageCount(for projectId: UUID) -> Int {
         entries(for: projectId).count
+    }
+
+    private func saveEntries(_ entries: [HistoryEntry], to url: URL) {
+        do {
+            let data = try encoder.encode(entries)
+            try data.write(to: url)
+        } catch {
+            print("Failed to save history: \(error)")
+        }
+    }
+
+    @discardableResult
+    private func refreshBookmarksIfNeeded(in entries: inout [HistoryEntry]) -> Bool {
+        var didRefresh = false
+
+        for index in entries.indices {
+            if let sourceBookmarks = entries[index].sourceImageBookmarks {
+                var updatedBookmarks = sourceBookmarks
+
+                for bookmarkIndex in sourceBookmarks.indices {
+                    guard let resolution = AppPaths.resolveBookmarkToPath(
+                        sourceBookmarks[bookmarkIndex],
+                        dependencies: bookmarkDependencies
+                    ),
+                    let refreshedBookmark = resolution.refreshedBookmarkData else {
+                        continue
+                    }
+
+                    updatedBookmarks[bookmarkIndex] = refreshedBookmark
+                    didRefresh = true
+                }
+
+                if updatedBookmarks != sourceBookmarks {
+                    entries[index].sourceImageBookmarks = updatedBookmarks
+                }
+            }
+
+            if let outputBookmark = entries[index].outputImageBookmark,
+               let resolution = AppPaths.resolveBookmarkToPath(
+                outputBookmark,
+                dependencies: bookmarkDependencies
+               ),
+               let refreshedBookmark = resolution.refreshedBookmarkData {
+                entries[index].outputImageBookmark = refreshedBookmark
+                didRefresh = true
+            }
+        }
+
+        return didRefresh
     }
 }

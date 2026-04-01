@@ -30,8 +30,8 @@ class Project: Codable, Identifiable, Hashable {
         // Resolve the bookmark briefly to capture the path, then stop access immediately.
         // Display-only: we only need the path string for labels and FileManager checks.
         if let bookmark = outputDirectoryBookmark,
-           let path = AppPaths.resolveBookmarkToPath(bookmark) {
-            return URL(fileURLWithPath: path)
+           let resolution = AppPaths.resolveBookmarkToPath(bookmark) {
+            return URL(fileURLWithPath: resolution.path)
         }
         return URL(fileURLWithPath: outputDirectory)
     }
@@ -118,40 +118,6 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     let modelName: String?
     let systemPrompt: String?
 
-    init(
-        projectId: UUID,
-        sourceImagePaths: [String],
-        outputImagePath: String,
-        prompt: String,
-        aspectRatio: String,
-        imageSize: String,
-        usedBatchTier: Bool,
-        cost: Double,
-        status: String = "completed",
-        error: String? = nil,
-        externalJobName: String? = nil,
-        tokenUsage: TokenUsage? = nil,
-        modelName: String? = nil,
-        systemPrompt: String? = nil
-    ) {
-        self.id = UUID()
-        self.projectId = projectId
-        self.timestamp = Date()
-        self.sourceImagePaths = sourceImagePaths
-        self.outputImagePath = outputImagePath
-        self.prompt = prompt
-        self.aspectRatio = aspectRatio
-        self.imageSize = imageSize
-        self.usedBatchTier = usedBatchTier
-        self.cost = cost
-        self.status = status
-        self.error = error
-        self.externalJobName = externalJobName
-        self.tokenUsage = tokenUsage
-        self.modelName = modelName
-        self.systemPrompt = systemPrompt
-    }
-    
     // Backward compatibility for single source path
     var sourceImagePath: String { sourceImagePaths.first ?? "" }
     

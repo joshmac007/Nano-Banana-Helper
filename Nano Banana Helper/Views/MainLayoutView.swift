@@ -94,8 +94,13 @@ struct MainLayoutView: View {
              }
              
              orchestrator.onCostIncurred = { cost, resolution, projectId, tokenUsage, modelName in
-                 projectManager.costSummary.record(cost: cost, resolution: resolution, projectId: projectId, tokens: tokenUsage, modelName: modelName)
-                 projectManager.recordSessionUsage(cost: cost, tokens: tokenUsage)
+                 projectManager.recordCostIncurred(
+                    cost: cost,
+                    resolution: resolution,
+                    projectId: projectId,
+                    tokenUsage: tokenUsage,
+                    modelName: modelName
+                 )
              }
         }
         .onDisappear {

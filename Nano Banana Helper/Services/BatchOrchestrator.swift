@@ -29,6 +29,8 @@ struct BatchSettings: Sendable {
 @Observable
 @MainActor
 final class BatchOrchestrator {
+    typealias ProcessQueueOverride = @Sendable (UUID) async -> Void
+
     // Computed views over activeBatches
     var pendingJobs: [ImageTask] {
         activeBatches.flatMap { $0.tasks.filter { $0.status == "pending" } }
@@ -51,18 +53,31 @@ final class BatchOrchestrator {
     var statusMessage: String = "Ready"
     
     private var activeBatches: [BatchJob] = []
-    private let service = NanoBananaService()
+    private let service: NanoBananaService
     private let concurrencyLimit = 5 // Paid tier: safe default for concurrent submissions
+    private let activeBatchURL: URL
+    private let bookmarkDependencies: AppPaths.BookmarkResolutionDependencies
+    private let autoStartEnqueuedBatches: Bool
+    private let processQueueOverride: ProcessQueueOverride?
 
     // Callbacks for history/cost tracking
     var onImageCompleted: ((HistoryEntry) -> Void)?
     var onCostIncurred: ((Double, String, UUID, TokenUsage?, String?) -> Void)?
     var onHistoryEntryUpdated: ((String, HistoryEntry) -> Void)?
     var onRestoreSettings: ((HistoryEntry) -> Void)?
-    
-    private let activeBatchURL = AppPaths.activeBatchURL
 
-    init() {
+    init(
+        service: NanoBananaService = NanoBananaService(),
+        activeBatchURL: URL? = nil,
+        bookmarkDependencies: AppPaths.BookmarkResolutionDependencies? = nil,
+        autoStartEnqueuedBatches: Bool = true,
+        processQueueOverride: ProcessQueueOverride? = nil
+    ) {
+        self.service = service
+        self.activeBatchURL = activeBatchURL ?? AppPaths.activeBatchURL
+        self.bookmarkDependencies = bookmarkDependencies ?? .live
+        self.autoStartEnqueuedBatches = autoStartEnqueuedBatches
+        self.processQueueOverride = processQueueOverride
         loadActiveBatches()
     }
     
@@ -79,8 +94,10 @@ final class BatchOrchestrator {
         updateProgress()
         
         // Auto-start this batch
-        Task {
-            await start(batch: batch)
+        if autoStartEnqueuedBatches {
+            Task {
+                await start(batch: batch)
+            }
         }
     }
     
@@ -123,13 +140,25 @@ final class BatchOrchestrator {
         batch.status = "processing"
         statusMessage = "Processing \(activeBatches.count) batches..."
         
-        await processQueue(batch: batch)
+        if let processQueueOverride {
+            await processQueueOverride(batch.id)
+        } else {
+            await processQueue(batch: batch)
+        }
     }
     
     /// Resume all interrupted batches
     func startAll() async {
-        for batch in activeBatches where batch.status == "pending" || batch.status == "processing" {
-            await start(batch: batch)
+        let batchIDs = activeBatches
+            .filter { $0.status == "pending" || $0.status == "processing" }
+            .map(\.id)
+
+        await withTaskGroup(of: Void.self) { group in
+            for batchID in batchIDs {
+                group.addTask {
+                    await self.startBatchIfNeeded(id: batchID)
+                }
+            }
         }
     }
     
@@ -154,7 +183,9 @@ final class BatchOrchestrator {
         batch.status = "cancelled"
         
         // Move all pending/processing to failed and cancel on API side
-        let jobsToCancel = batch.tasks.filter { $0.status == "processing" || $0.status == "pending" || $0.status == "submitting" }
+        let jobsToCancel = batch.tasks.filter {
+            $0.status == "processing" || $0.status == "pending" || $0.phase == .submitting
+        }
         
         for job in jobsToCancel {
             job.status = "failed"
@@ -204,6 +235,7 @@ final class BatchOrchestrator {
         activeBatches = []
         currentProgress = 0.0
         statusMessage = "Ready"
+        saveActiveBatches()
     }
     
     /// Remove failed tasks at specific indices
@@ -272,17 +304,45 @@ final class BatchOrchestrator {
         
         statusMessage = "Submitting \(jobsToSubmit.count) jobs..."
         
+        var didRefreshInputBookmarks = false
         let submissionDataList: [JobSubmissionData] = jobsToSubmit.map { job in
             // Resolve security-scoped URLs from bookmarks if available.
             // resolveBookmark calls startAccessingSecurityScopedResource internally.
             if let bookmarks = job.inputBookmarks, !bookmarks.isEmpty {
-                let resolvedURLs = bookmarks.compactMap { AppPaths.resolveBookmark($0) }
-                if !resolvedURLs.isEmpty {
-                    return JobSubmissionData(id: job.id, inputURLs: resolvedURLs, inputPaths: job.inputPaths, hasSecurityScope: true)
+                var updatedBookmarks = bookmarks
+                let resolvedBookmarks: [AppPaths.ResolvedBookmark] = bookmarks.enumerated().compactMap { item in
+                    guard let resolution = AppPaths.resolveBookmark(
+                        item.element,
+                        dependencies: bookmarkDependencies
+                    ) else {
+                        return nil
+                    }
+                    if let refreshedBookmark = resolution.refreshedBookmarkData {
+                        updatedBookmarks[item.offset] = refreshedBookmark
+                    }
+                    return resolution
+                }
+
+                if updatedBookmarks != bookmarks {
+                    job.inputBookmarks = updatedBookmarks
+                    didRefreshInputBookmarks = true
+                }
+
+                if !resolvedBookmarks.isEmpty {
+                    return JobSubmissionData(
+                        id: job.id,
+                        inputURLs: resolvedBookmarks.map(\.url),
+                        inputPaths: job.inputPaths,
+                        hasSecurityScope: true
+                    )
                 }
             }
             // Fallback to plain path-based URLs (drag-and-drop, or already-accessible files)
             return JobSubmissionData(id: job.id, inputURLs: job.inputPaths.map { URL(fileURLWithPath: $0) }, inputPaths: job.inputPaths, hasSecurityScope: false)
+        }
+
+        if didRefreshInputBookmarks {
+            saveActiveBatches()
         }
         
         let batchSettings = BatchSettings(
@@ -656,10 +716,22 @@ final class BatchOrchestrator {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             
+            var loadedBatches: [BatchJob] = []
             if let batches = try? decoder.decode([BatchJob].self, from: data) {
-                activeBatches = batches
+                loadedBatches = batches
             } else if let singleBatch = try? decoder.decode(BatchJob.self, from: data) {
-                 activeBatches = [singleBatch]
+                 loadedBatches = [singleBatch]
+            }
+
+            activeBatches = loadedBatches
+
+            // Refresh stale bookmarks in the background so they don't block app launch.
+            // BatchOrchestrator is @MainActor, so this Task also runs on the main actor —
+            // writes to activeBatches are safe, but they happen after init returns.
+            Task {
+                if self.refreshInputBookmarksIfNeeded() {
+                    self.saveActiveBatches()
+                }
             }
             
             if !processingJobs.isEmpty || !pendingJobs.isEmpty {
@@ -669,6 +741,43 @@ final class BatchOrchestrator {
         } catch {
             print("Failed to load active batches: \(error)")
         }
+    }
+
+
+    private func startBatchIfNeeded(id: UUID) async {
+        guard let batch = activeBatches.first(where: { $0.id == id }) else { return }
+        await start(batch: batch)
+    }
+
+    @discardableResult
+    private func refreshInputBookmarksIfNeeded() -> Bool {
+        var didRefresh = false
+
+        for batch in activeBatches {
+            for task in batch.tasks {
+                guard let inputBookmarks = task.inputBookmarks else { continue }
+                var updatedBookmarks = inputBookmarks
+
+                for index in inputBookmarks.indices {
+                    guard let resolution = AppPaths.resolveBookmarkToPath(
+                        inputBookmarks[index],
+                        dependencies: bookmarkDependencies
+                    ),
+                    let refreshedBookmark = resolution.refreshedBookmarkData else {
+                        continue
+                    }
+
+                    updatedBookmarks[index] = refreshedBookmark
+                    didRefresh = true
+                }
+
+                if updatedBookmarks != inputBookmarks {
+                    task.inputBookmarks = updatedBookmarks
+                }
+            }
+        }
+
+        return didRefresh
     }
 
     func resumePollingFromHistory(for entry: HistoryEntry) {

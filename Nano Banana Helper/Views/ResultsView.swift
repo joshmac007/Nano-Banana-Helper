@@ -6,6 +6,7 @@ struct ResultsView: View {
     var projectManager: ProjectManager
 
     @State private var selectedEntry: HistoryEntry?
+    @State private var imageLoader = ResultsImageLoader()
     @AppStorage("resultsImagesPerRow") private var imagesPerRow: Int = 3
 
     private var completedEntries: [HistoryEntry] {
@@ -70,7 +71,8 @@ struct ResultsView: View {
                                     entry: entry,
                                     project: project,
                                     historyManager: historyManager,
-                                    projectManager: projectManager
+                                    projectManager: projectManager,
+                                    imageLoader: imageLoader
                                 )
                                 .onTapGesture {
                                     selectedEntry = entry
@@ -89,21 +91,22 @@ struct ResultsView: View {
                     entry: entry,
                     project: project,
                     historyManager: historyManager,
-                    projectManager: projectManager
+                    projectManager: projectManager,
+                    imageLoader: imageLoader
                 )
             }
         }
     }
 }
 
-struct ResultCard: View {
+fileprivate struct ResultCard: View {
     let entry: HistoryEntry
     let project: Project
     let historyManager: HistoryManager
     let projectManager: ProjectManager
+    let imageLoader: ResultsImageLoader
 
-    @State private var image: NSImage?
-    @State private var outputAccessDenied = false
+    @State private var outputPhase: ResultsImagePhase = .loading
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -111,22 +114,24 @@ struct ResultCard: View {
                 .aspectRatio(4 / 3, contentMode: .fit)
                 .overlay {
                     ZStack(alignment: .topTrailing) {
-                        if let image {
+                        if let image = displayOutputPhase.loadedImage {
                             Image(nsImage: image)
                                 .resizable()
                                 .aspectRatio(contentMode: .fill)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                                 .background(Color.black.opacity(0.04))
+                        } else if displayOutputPhase.isLoading {
+                            ResultsCardLoadingPlaceholder()
                         } else {
                             Rectangle()
                                 .fill(Color.secondary.opacity(0.1))
                                 .overlay {
-                                    Image(systemName: outputAccessDenied ? "lock.fill" : "photo")
+                                    Image(systemName: displayOutputPhase.isAccessDenied ? "lock.fill" : "exclamationmark.triangle")
                                         .foregroundStyle(.secondary)
                                 }
                         }
 
-                        if outputAccessDenied {
+                        if displayOutputPhase.isAccessDenied {
                             Button(action: reauthorizeOutput) {
                                 Image(systemName: "lock.badge.plus")
                                     .padding(8)
@@ -160,37 +165,34 @@ struct ResultCard: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
         )
-        .task(id: outputLoadID) {
-            loadOutputImage()
+        .task(id: outputReference.cacheKey) {
+            await loadOutputImage()
         }
     }
 
-    private var outputLoadID: String {
-        "\(entry.id.uuidString)-\(entry.outputImagePath)-\(entry.outputImageBookmark?.base64EncodedString() ?? "none")"
+    private var outputReference: ResultsImageReference {
+        ResultsImageReference(
+            entryID: entry.id,
+            role: .output,
+            fallbackPath: entry.outputImagePath,
+            bookmark: entry.outputImageBookmark
+        )
     }
 
-    private func loadOutputImage() {
-        switch AppPaths.loadImageData(
-            bookmark: entry.outputImageBookmark,
-            fallbackPath: entry.outputImagePath
-        ) {
-        case let .success(data, refreshedBookmark):
-            image = NSImage(data: data)
-            outputAccessDenied = false
-            if let refreshedBookmark {
-                historyManager.updateBookmarks(
-                    for: entry.id,
-                    outputBookmark: refreshedBookmark,
-                    sourceBookmarks: entry.sourceImageBookmarks
-                )
-            }
-        case let .fallbackUsed(data):
-            image = NSImage(data: data)
-            outputAccessDenied = false
-        case .accessDenied:
-            image = nil
-            outputAccessDenied = true
+    private var displayOutputPhase: ResultsImagePhase {
+        if case .loading = outputPhase,
+           let cachedPhase = imageLoader.cachedPhase(for: outputReference) {
+            return cachedPhase
         }
+        return outputPhase
+    }
+
+    @MainActor
+    private func loadOutputImage() async {
+        outputPhase = imageLoader.cachedPhase(for: outputReference) ?? .loading
+        let outcome = await imageLoader.load(reference: outputReference)
+        outputPhase = outcome.phase
+        persistRefreshedOutputBookmark(outcome.refreshedBookmark)
     }
 
     private func reauthorizeOutput() {
@@ -200,20 +202,28 @@ struct ResultCard: View {
             historyManager: historyManager
         )
     }
+
+    private func persistRefreshedOutputBookmark(_ refreshedBookmark: Data?) {
+        guard let refreshedBookmark else { return }
+        historyManager.updateBookmarks(
+            for: entry.id,
+            outputBookmark: refreshedBookmark,
+            sourceBookmarks: entry.sourceImageBookmarks
+        )
+    }
 }
 
-struct ResultDetailView: View {
+fileprivate struct ResultDetailView: View {
     let entry: HistoryEntry
     let project: Project
     let historyManager: HistoryManager
     let projectManager: ProjectManager
+    let imageLoader: ResultsImageLoader
 
     @Environment(\.dismiss) private var dismiss
 
-    @State private var outputImage: NSImage?
-    @State private var inputImage: NSImage?
-    @State private var outputAccessDenied = false
-    @State private var sourceAccessDenied = false
+    @State private var outputPhase: ResultsImagePhase = .loading
+    @State private var sourcePhase: ResultsImagePhase = .idle
 
     var body: some View {
         VStack {
@@ -229,13 +239,26 @@ struct ResultDetailView: View {
             }
 
             Group {
-                if outputAccessDenied {
+                if displayOutputPhase.isLoading {
+                    ResultsDetailLoadingState(message: "Loading image...")
+                } else if displayOutputPhase.isAccessDenied {
                     BookmarkAccessDeniedView(
                         message: "Output folder access has expired.",
                         onReauthorize: reauthorizeOutput
                     )
-                } else if let outputImage {
-                    if sourceAccessDenied {
+                } else if let outputImage = displayOutputPhase.loadedImage {
+                    if hasSourceImage, displaySourcePhase.isLoading {
+                        VStack(spacing: 16) {
+                            Image(nsImage: outputImage)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .padding(.horizontal)
+
+                            ResultsDetailLoadingState(message: "Loading original image...")
+                                .frame(maxHeight: 120)
+                        }
+                    } else if displaySourcePhase.isAccessDenied {
                         VStack(spacing: 16) {
                             Image(nsImage: outputImage)
                                 .resizable()
@@ -248,11 +271,23 @@ struct ResultDetailView: View {
                                 onReauthorize: reauthorizeSource
                             )
                         }
-                    } else if let inputImage {
+                    } else if let inputImage = displaySourcePhase.loadedImage {
                         ComparisonView(before: inputImage, after: outputImage)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .clipShape(RoundedRectangle(cornerRadius: 12))
                             .padding()
+                    } else if hasSourceImage, displaySourcePhase.isFailed {
+                        VStack(spacing: 16) {
+                            Image(nsImage: outputImage)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .padding(.horizontal)
+
+                            Label("Original image could not be loaded.", systemImage: "exclamationmark.triangle")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
                     } else {
                         Image(nsImage: outputImage)
                             .resizable()
@@ -261,7 +296,7 @@ struct ResultDetailView: View {
                             .padding()
                     }
                 } else {
-                    ContentUnavailableView("Image Not Found", systemImage: "exclamationmark.triangle")
+                    ContentUnavailableView("Image Unavailable", systemImage: "exclamationmark.triangle")
                 }
             }
 
@@ -277,72 +312,73 @@ struct ResultDetailView: View {
             .padding(.bottom)
         }
         .frame(minWidth: 800, minHeight: 600)
-        .task(id: outputLoadID) {
-            loadOutputImage()
+        .task(id: outputReference.cacheKey) {
+            await loadOutputImage()
         }
-        .task(id: sourceLoadID) {
-            loadSourceImage()
-        }
-    }
-
-    private var outputLoadID: String {
-        "\(entry.id.uuidString)-\(entry.outputImagePath)-\(entry.outputImageBookmark?.base64EncodedString() ?? "none")"
-    }
-
-    private var sourceLoadID: String {
-        let sourcePath = entry.sourceImagePaths.first ?? ""
-        let sourceBookmark = entry.sourceImageBookmarks?.first?.base64EncodedString() ?? "none"
-        return "\(entry.id.uuidString)-\(sourcePath)-\(sourceBookmark)"
-    }
-
-    private func loadOutputImage() {
-        switch AppPaths.loadImageData(
-            bookmark: entry.outputImageBookmark,
-            fallbackPath: entry.outputImagePath
-        ) {
-        case let .success(data, refreshedBookmark):
-            outputImage = NSImage(data: data)
-            outputAccessDenied = false
-            if let refreshedBookmark {
-                historyManager.updateBookmarks(
-                    for: entry.id,
-                    outputBookmark: refreshedBookmark,
-                    sourceBookmarks: entry.sourceImageBookmarks
-                )
-            }
-        case let .fallbackUsed(data):
-            outputImage = NSImage(data: data)
-            outputAccessDenied = false
-        case .accessDenied:
-            outputImage = nil
-            outputAccessDenied = true
+        .task(id: sourceReference?.cacheKey ?? "result-source-\(entry.id.uuidString)-none") {
+            await loadSourceImage()
         }
     }
 
-    private func loadSourceImage() {
-        guard let sourcePath = entry.sourceImagePaths.first, !sourcePath.isEmpty else {
-            inputImage = nil
-            sourceAccessDenied = false
+    private var hasSourceImage: Bool {
+        !(entry.sourceImagePaths.first ?? "").isEmpty
+    }
+
+    private var outputReference: ResultsImageReference {
+        ResultsImageReference(
+            entryID: entry.id,
+            role: .output,
+            fallbackPath: entry.outputImagePath,
+            bookmark: entry.outputImageBookmark
+        )
+    }
+
+    private var sourceReference: ResultsImageReference? {
+        guard let sourcePath = entry.sourceImagePaths.first, !sourcePath.isEmpty else { return nil }
+        return ResultsImageReference(
+            entryID: entry.id,
+            role: .sourcePrimary,
+            fallbackPath: sourcePath,
+            bookmark: entry.sourceImageBookmarks?.first
+        )
+    }
+
+    private var displayOutputPhase: ResultsImagePhase {
+        if case .loading = outputPhase,
+           let cachedPhase = imageLoader.cachedPhase(for: outputReference) {
+            return cachedPhase
+        }
+        return outputPhase
+    }
+
+    private var displaySourcePhase: ResultsImagePhase {
+        guard let sourceReference else { return .idle }
+        if case .loading = sourcePhase,
+           let cachedPhase = imageLoader.cachedPhase(for: sourceReference) {
+            return cachedPhase
+        }
+        return sourcePhase
+    }
+
+    @MainActor
+    private func loadOutputImage() async {
+        outputPhase = imageLoader.cachedPhase(for: outputReference) ?? .loading
+        let outcome = await imageLoader.load(reference: outputReference)
+        outputPhase = outcome.phase
+        persistRefreshedOutputBookmark(outcome.refreshedBookmark)
+    }
+
+    @MainActor
+    private func loadSourceImage() async {
+        guard let sourceReference else {
+            sourcePhase = .idle
             return
         }
 
-        switch AppPaths.loadImageData(
-            bookmark: entry.sourceImageBookmarks?.first,
-            fallbackPath: sourcePath
-        ) {
-        case let .success(data, refreshedBookmark):
-            inputImage = NSImage(data: data)
-            sourceAccessDenied = false
-            if let refreshedBookmark {
-                persistRefreshedSourceBookmark(refreshedBookmark, at: 0)
-            }
-        case let .fallbackUsed(data):
-            inputImage = NSImage(data: data)
-            sourceAccessDenied = false
-        case .accessDenied:
-            inputImage = nil
-            sourceAccessDenied = true
-        }
+        sourcePhase = imageLoader.cachedPhase(for: sourceReference) ?? .loading
+        let outcome = await imageLoader.load(reference: sourceReference)
+        sourcePhase = outcome.phase
+        persistRefreshedSourceBookmark(outcome.refreshedBookmark, at: 0)
     }
 
     private func openFile() {
@@ -404,8 +440,18 @@ struct ResultDetailView: View {
         )
     }
 
-    private func persistRefreshedSourceBookmark(_ refreshedBookmark: Data, at index: Int) {
-        guard var updatedSourceBookmarks = entry.sourceImageBookmarks,
+    private func persistRefreshedOutputBookmark(_ refreshedBookmark: Data?) {
+        guard let refreshedBookmark else { return }
+        historyManager.updateBookmarks(
+            for: entry.id,
+            outputBookmark: refreshedBookmark,
+            sourceBookmarks: entry.sourceImageBookmarks
+        )
+    }
+
+    private func persistRefreshedSourceBookmark(_ refreshedBookmark: Data?, at index: Int) {
+        guard let refreshedBookmark,
+              var updatedSourceBookmarks = entry.sourceImageBookmarks,
               updatedSourceBookmarks.indices.contains(index) else {
             return
         }
@@ -416,6 +462,165 @@ struct ResultDetailView: View {
             outputBookmark: entry.outputImageBookmark,
             sourceBookmarks: updatedSourceBookmarks
         )
+    }
+}
+
+private struct ResultsCardLoadingPlaceholder: View {
+    var body: some View {
+        Rectangle()
+            .fill(Color.secondary.opacity(0.08))
+            .overlay {
+                ProgressView()
+                    .controlSize(.small)
+            }
+    }
+}
+
+private struct ResultsDetailLoadingState: View {
+    let message: String
+
+    var body: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+    }
+}
+
+private enum ResultsImageRole: String, Sendable {
+    case output
+    case sourcePrimary
+}
+
+private struct ResultsImageReference: Sendable {
+    let cacheKey: String
+    let fallbackPath: String
+    let bookmark: Data?
+
+    init(entryID: UUID, role: ResultsImageRole, fallbackPath: String, bookmark: Data?) {
+        cacheKey = "\(entryID.uuidString)|\(role.rawValue)|\(fallbackPath)"
+        self.fallbackPath = fallbackPath
+        self.bookmark = bookmark
+    }
+}
+
+private enum ResultsImagePhase {
+    case idle
+    case loading
+    case loaded(NSImage)
+    case accessDenied
+    case failed
+
+    var loadedImage: NSImage? {
+        guard case let .loaded(image) = self else { return nil }
+        return image
+    }
+
+    var isLoading: Bool {
+        if case .loading = self {
+            return true
+        }
+        return false
+    }
+
+    var isAccessDenied: Bool {
+        if case .accessDenied = self {
+            return true
+        }
+        return false
+    }
+
+    var isFailed: Bool {
+        if case .failed = self {
+            return true
+        }
+        return false
+    }
+}
+
+private struct ResultsImageLoadOutcome {
+    let phase: ResultsImagePhase
+    let refreshedBookmark: Data?
+}
+
+private enum ResultsImageReadResult: Sendable {
+    case success(Data, refreshedBookmark: Data?)
+    case fallbackUsed(Data)
+    case accessDenied
+}
+
+fileprivate final class ResultsImageLoader {
+    private let cache = NSCache<NSString, NSImage>()
+
+    init() {
+        cache.countLimit = 120
+        cache.totalCostLimit = 256 * 1024 * 1024
+    }
+
+    fileprivate func cachedPhase(for reference: ResultsImageReference) -> ResultsImagePhase? {
+        guard let image = cache.object(forKey: reference.cacheKey as NSString) else { return nil }
+        return .loaded(image)
+    }
+
+    fileprivate func load(reference: ResultsImageReference) async -> ResultsImageLoadOutcome {
+        if let cachedPhase = cachedPhase(for: reference) {
+            return ResultsImageLoadOutcome(phase: cachedPhase, refreshedBookmark: nil)
+        }
+
+        let readResult = await Task.detached(priority: .utility) {
+            ResultsImageLoader.read(reference: reference)
+        }.value
+
+        switch readResult {
+        case let .success(data, refreshedBookmark):
+            guard let image = NSImage(data: data) else {
+                return ResultsImageLoadOutcome(phase: .failed, refreshedBookmark: refreshedBookmark)
+            }
+            cache(image, for: reference)
+            return ResultsImageLoadOutcome(phase: .loaded(image), refreshedBookmark: refreshedBookmark)
+        case let .fallbackUsed(data):
+            guard let image = NSImage(data: data) else {
+                return ResultsImageLoadOutcome(phase: .failed, refreshedBookmark: nil)
+            }
+            cache(image, for: reference)
+            return ResultsImageLoadOutcome(phase: .loaded(image), refreshedBookmark: nil)
+        case .accessDenied:
+            return ResultsImageLoadOutcome(phase: .accessDenied, refreshedBookmark: nil)
+        }
+    }
+
+    private func cache(_ image: NSImage, for reference: ResultsImageReference) {
+        cache.setObject(
+            image,
+            forKey: reference.cacheKey as NSString,
+            cost: image.approximateMemoryCost
+        )
+    }
+
+    nonisolated private static func read(reference: ResultsImageReference) -> ResultsImageReadResult {
+        switch AppPaths.loadImageData(
+            bookmark: reference.bookmark,
+            fallbackPath: reference.fallbackPath
+        ) {
+        case let .success(data, refreshedBookmark):
+            return .success(data, refreshedBookmark: refreshedBookmark)
+        case let .fallbackUsed(data):
+            return .fallbackUsed(data)
+        case .accessDenied:
+            return .accessDenied
+        }
+    }
+}
+
+private extension NSImage {
+    var approximateMemoryCost: Int {
+        let width = max(Int(size.width), 1)
+        let height = max(Int(size.height), 1)
+        return max(width * height * 4, 1)
     }
 }
 

@@ -6,13 +6,28 @@ struct ResultsView: View {
     var projectManager: ProjectManager
 
     @State private var selectedEntry: HistoryEntry?
-    @State private var iconSize: CGFloat = 200
+    @AppStorage("resultsImagesPerRow") private var imagesPerRow: Int = 3
 
     private var completedEntries: [HistoryEntry] {
         guard let projectID = projectManager.currentProject?.id else { return [] }
         return historyManager.allGlobalEntries.filter {
             $0.projectId == projectID && $0.status == "completed"
         }
+    }
+
+    private var clampedImagesPerRow: Int {
+        min(max(imagesPerRow, 1), 6)
+    }
+
+    private var gridColumns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: 16), count: clampedImagesPerRow)
+    }
+
+    private var imagesPerRowBinding: Binding<Double> {
+        Binding(
+            get: { Double(clampedImagesPerRow) },
+            set: { imagesPerRow = Int($0.rounded()) }
+        )
     }
 
     var body: some View {
@@ -25,11 +40,11 @@ struct ResultsView: View {
                 Spacer()
 
                 HStack {
-                    Image(systemName: "photo")
+                    Image(systemName: "square.grid.2x2")
                         .font(.caption)
-                    Slider(value: $iconSize, in: 100...400)
+                    Slider(value: imagesPerRowBinding, in: 1...6, step: 1)
                         .frame(width: 120)
-                    Image(systemName: "photo.fill")
+                    Image(systemName: "square.grid.3x3")
                         .font(.caption)
                 }
                 .padding(.horizontal)
@@ -48,15 +63,14 @@ struct ResultsView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: iconSize), spacing: 16)], spacing: 16) {
+                    LazyVGrid(columns: gridColumns, spacing: 16) {
                         ForEach(completedEntries) { entry in
                             if let project = projectManager.projects.first(where: { $0.id == entry.projectId }) {
                                 ResultCard(
                                     entry: entry,
                                     project: project,
                                     historyManager: historyManager,
-                                    projectManager: projectManager,
-                                    size: iconSize
+                                    projectManager: projectManager
                                 )
                                 .onTapGesture {
                                     selectedEntry = entry
@@ -87,41 +101,46 @@ struct ResultCard: View {
     let project: Project
     let historyManager: HistoryManager
     let projectManager: ProjectManager
-    let size: CGFloat
 
     @State private var image: NSImage?
     @State private var outputAccessDenied = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ZStack(alignment: .topTrailing) {
-                if let image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: size, height: size * 3 / 4)
-                        .background(Color.black.opacity(0.04))
-                } else {
-                    Rectangle()
-                        .fill(Color.secondary.opacity(0.1))
-                        .frame(width: size, height: size * 3 / 4)
-                        .overlay {
-                            Image(systemName: outputAccessDenied ? "lock.fill" : "photo")
-                                .foregroundStyle(.secondary)
+            Color.clear
+                .aspectRatio(4 / 3, contentMode: .fit)
+                .overlay {
+                    ZStack(alignment: .topTrailing) {
+                        if let image {
+                            Image(nsImage: image)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .background(Color.black.opacity(0.04))
+                        } else {
+                            Rectangle()
+                                .fill(Color.secondary.opacity(0.1))
+                                .overlay {
+                                    Image(systemName: outputAccessDenied ? "lock.fill" : "photo")
+                                        .foregroundStyle(.secondary)
+                                }
                         }
-                }
 
-                if outputAccessDenied {
-                    Button(action: reauthorizeOutput) {
-                        Image(systemName: "lock.badge.plus")
+                        if outputAccessDenied {
+                            Button(action: reauthorizeOutput) {
+                                Image(systemName: "lock.badge.plus")
+                                    .padding(8)
+                                    .background(.ultraThinMaterial, in: Circle())
+                            }
+                            .buttonStyle(.plain)
                             .padding(8)
-                            .background(.ultraThinMaterial, in: Circle())
+                            .help("Grant access to the output folder")
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .padding(8)
-                    .help("Grant access to the output folder")
                 }
-            }
+                .frame(maxWidth: .infinity)
+                .background(Color.black.opacity(0.04))
+                .clipped()
 
             HStack {
                 Text(URL(fileURLWithPath: entry.outputImagePath).lastPathComponent)

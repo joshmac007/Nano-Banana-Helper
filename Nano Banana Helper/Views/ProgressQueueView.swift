@@ -2,6 +2,8 @@ import SwiftUI
 
 /// The "Banana Peel" - visual progress queue
 struct ProgressQueueView: View {
+    let historyManager: HistoryManager
+    let projectManager: ProjectManager
     @Environment(BatchOrchestrator.self) private var orchestrator
     @State private var logManager = LogManager.shared
     @State private var isLogVisible: Bool = false
@@ -202,9 +204,26 @@ struct ProgressQueueView: View {
     
     private func openOutputFolder() {
         if let firstCompleted = orchestrator.completedJobs.first,
-           let outputPath = firstCompleted.outputPath {
-            let folderURL = URL(fileURLWithPath: outputPath).deletingLastPathComponent()
-            NSWorkspace.shared.open(folderURL)
+           let projectID = firstCompleted.projectId,
+           let project = projectManager.projects.first(where: { $0.id == projectID }) {
+            switch AppPaths.revealDirectory(
+                bookmark: project.outputDirectoryBookmark,
+                fallbackPath: project.outputDirectory
+            ) {
+            case let .success(_, refreshedBookmark):
+                if let refreshedBookmark {
+                    project.outputDirectoryBookmark = refreshedBookmark
+                    projectManager.saveProjects()
+                }
+            case .fallbackUsed:
+                break
+            case .accessDenied:
+                BookmarkReauthorization.reauthorizeOutputFolder(
+                    for: project,
+                    projectManager: projectManager,
+                    historyManager: historyManager
+                )
+            }
         }
     }
 }
@@ -309,8 +328,10 @@ struct TaskRowView: View {
             Spacer()
             
             // Open output button for completed tasks
-            if task.status == "completed", let outputURL = task.outputURL {
-                Button(action: { NSWorkspace.shared.open(outputURL) }) {
+            if task.status == "completed", let outputPath = task.outputPath {
+                Button(action: {
+                    _ = AppPaths.openFile(bookmark: nil, fallbackPath: outputPath)
+                }) {
                     Image(systemName: "arrow.up.right.square")
                         .foregroundStyle(.secondary)
                 }

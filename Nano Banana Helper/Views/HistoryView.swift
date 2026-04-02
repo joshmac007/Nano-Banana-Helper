@@ -1,25 +1,29 @@
-import SwiftUI
 import AppKit
+import SwiftUI
 
 struct HistoryView: View {
     let entries: [HistoryEntry]
+    let historyManager: HistoryManager
+    let projectManager: ProjectManager
     var projects: [Project] = []
 
-    var activeJobIDs: Set<String> = [] // IDs of jobs currently in memory
+    var activeJobIDs: Set<String> = []
     var onDelete: ((HistoryEntry) -> Void)?
     var onReuse: ((HistoryEntry) -> Void)?
     var onResumePolling: ((HistoryEntry) -> Void)?
-    
+
     @State private var selectedEntry: HistoryEntry?
-    @State private var rescueJobID: String = ""
+    @State private var rescueJobID = ""
     @State private var entryToRescue: HistoryEntry?
     @State private var showingRescueDialog = false
-    
-    @State private var searchText: String = ""
+
+    @State private var searchText = ""
     @State private var selectedProjectId: UUID?
-    
+
     init(
         entries: [HistoryEntry],
+        historyManager: HistoryManager,
+        projectManager: ProjectManager,
         projects: [Project] = [],
         initialProjectId: UUID? = nil,
         activeJobIDs: Set<String> = [],
@@ -28,6 +32,8 @@ struct HistoryView: View {
         onResumePolling: ((HistoryEntry) -> Void)? = nil
     ) {
         self.entries = entries
+        self.historyManager = historyManager
+        self.projectManager = projectManager
         self.projects = projects
         self.activeJobIDs = activeJobIDs
         self.onDelete = onDelete
@@ -35,29 +41,26 @@ struct HistoryView: View {
         self.onResumePolling = onResumePolling
         self._selectedProjectId = State(initialValue: initialProjectId)
     }
-    
+
     var headerTitle: String {
         if let selectedProjectId, let project = projects.first(where: { $0.id == selectedProjectId }) {
             return "\(project.name) History"
         }
         return "Global Feed"
     }
-    
+
     var filteredEntries: [HistoryEntry] {
         entries.filter { entry in
-            let matchesSearch = searchText.isEmpty || 
-                entry.prompt.localizedCaseInsensitiveContains(searchText) ||
-                entry.externalJobName?.localizedCaseInsensitiveContains(searchText) == true
-            
+            let matchesSearch = searchText.isEmpty
+                || entry.prompt.localizedCaseInsensitiveContains(searchText)
+                || entry.externalJobName?.localizedCaseInsensitiveContains(searchText) == true
             let matchesProject = selectedProjectId == nil || entry.projectId == selectedProjectId
-            
             return matchesSearch && matchesProject
         }
     }
-    
+
     var body: some View {
         VStack(spacing: 0) {
-            // Header - full width with search and project filter
             VStack(spacing: 12) {
                 HStack {
                     Text(headerTitle)
@@ -68,7 +71,7 @@ struct HistoryView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                
+
                 HStack {
                     HStack {
                         Image(systemName: "magnifyingglass")
@@ -79,7 +82,7 @@ struct HistoryView: View {
                     .padding(8)
                     .background(Color.secondary.opacity(0.1))
                     .cornerRadius(8)
-                    
+
                     Picker("Project", selection: $selectedProjectId) {
                         Text("All Projects").tag(UUID?.none)
                         Divider()
@@ -91,9 +94,9 @@ struct HistoryView: View {
                 }
             }
             .padding()
-            
+
             Divider()
-            
+
             if entries.isEmpty {
                 VStack {
                     Spacer()
@@ -106,24 +109,30 @@ struct HistoryView: View {
                 }
             } else {
                 List(filteredEntries, selection: $selectedEntry) { entry in
-                    let projectName = projects.first { $0.id == entry.projectId }?.name ?? "Unknown"
+                    let project = projects.first { $0.id == entry.projectId }
+                    let projectName = project?.name ?? "Unknown"
                     let isActive = entry.externalJobName.map { activeJobIDs.contains($0) } ?? false
-                    
+
                     HistoryRowView(
-                        entry: entry, 
+                        entry: entry,
+                        project: project,
                         projectName: projectName,
+                        historyManager: historyManager,
+                        projectManager: projectManager,
                         isActive: isActive,
-                        onReuse: onReuse, 
+                        onReuse: onReuse,
                         onResumePolling: onResumePolling,
-                        onRescue: { 
+                        onRescue: {
                             entryToRescue = entry
                             rescueJobID = ""
                             showingRescueDialog = true
                         }
                     )
                     .contextMenu {
-                        Button("Show in Finder") {
-                            NSWorkspace.shared.activateFileViewerSelecting([entry.outputURL])
+                        if let project {
+                            Button("Show in Finder") {
+                                revealOutput(for: entry, project: project)
+                            }
                         }
                         Button("Reuse Settings") {
                             onReuse?(entry)
@@ -160,22 +169,21 @@ struct HistoryView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
-                
+
                 TextField("Job ID (e.g. batches/bkzq...)", text: $rescueJobID)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
-                
+
                 HStack {
                     Button("Cancel") {
                         showingRescueDialog = false
                     }
                     .keyboardShortcut(.cancelAction)
-                    
+
                     Spacer()
-                    
+
                     Button("Rescue & Poll") {
                         if let entry = entryToRescue, !rescueJobID.isEmpty {
-                            // Create a temporary entry with the ID
                             let rescuedEntry = HistoryEntry(
                                 projectId: entry.projectId,
                                 sourceImagePaths: entry.sourceImagePaths,
@@ -201,27 +209,53 @@ struct HistoryView: View {
             .frame(width: 400)
         }
     }
-}
 
+    private func revealOutput(for entry: HistoryEntry, project: Project) {
+        switch AppPaths.revealInFinder(
+            bookmark: entry.outputImageBookmark,
+            fallbackPath: entry.outputImagePath
+        ) {
+        case let .success(_, refreshedBookmark):
+            if let refreshedBookmark {
+                historyManager.updateBookmarks(
+                    for: entry.id,
+                    outputBookmark: refreshedBookmark,
+                    sourceBookmarks: entry.sourceImageBookmarks
+                )
+            }
+        case .fallbackUsed:
+            break
+        case .accessDenied:
+            BookmarkReauthorization.reauthorizeOutputFolder(
+                for: project,
+                projectManager: projectManager,
+                historyManager: historyManager
+            )
+        }
+    }
+}
 
 struct HistoryRowView: View {
     let entry: HistoryEntry
+    let project: Project?
     let projectName: String
+    let historyManager: HistoryManager
+    let projectManager: ProjectManager
     var isActive: Bool = false
     var onReuse: ((HistoryEntry) -> Void)?
     var onResumePolling: ((HistoryEntry) -> Void)?
     var onRescue: (() -> Void)?
-    
+
     @State private var sourceImage: NSImage?
     @State private var outputImage: NSImage?
+    @State private var sourceAccessDenied = false
+    @State private var outputAccessDenied = false
     @State private var showingPreview = false
-    
+
     var body: some View {
         HStack(alignment: .center, spacing: 16) {
-            // Part 1: Thumbnails (Matched to text height)
             HStack(spacing: 4) {
-                // Source
-                ZStack(alignment: .bottomTrailing) {
+                ZStack(alignment: .topTrailing) {
                     if let sourceImage {
                         Image(nsImage: sourceImage)
                             .resizable()
@@ -232,10 +266,18 @@ struct HistoryRowView: View {
                         RoundedRectangle(cornerRadius: 8)
                             .fill(.quaternary)
                             .frame(width: 64, height: 64)
-                            .overlay(Image(systemName: "photo").foregroundStyle(.tertiary))
+                            .overlay(Image(systemName: sourceAccessDenied ? "lock.fill" : "photo").foregroundStyle(.tertiary))
                     }
-                    
-                    if entry.sourceImagePaths.count > 1 {
+
+                    if sourceAccessDenied {
+                        Button(action: reauthorizeSource) {
+                            Image(systemName: "lock.badge.plus")
+                                .padding(4)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .offset(x: 4, y: -4)
+                    } else if entry.sourceImagePaths.count > 1 {
                         Text("\(entry.sourceImagePaths.count)")
                             .font(.system(size: 10, weight: .bold))
                             .foregroundStyle(.white)
@@ -245,43 +287,53 @@ struct HistoryRowView: View {
                             .offset(x: 4, y: 4)
                     }
                 }
-                
+
                 Image(systemName: "arrow.right")
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.tertiary)
-                
-                // Output/Status
+
                 if entry.status == "completed" {
-                    if let outputImage {
-                        ZStack(alignment: .bottomTrailing) {
-                            Image(nsImage: outputImage)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: 64, height: 64)
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                                .onTapGesture {
-                                    showingPreview = true
+                    ZStack(alignment: .topTrailing) {
+                        if let outputImage {
+                            ZStack(alignment: .bottomTrailing) {
+                                Image(nsImage: outputImage)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: 64, height: 64)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                                    .onTapGesture {
+                                        showingPreview = true
+                                    }
+                                    .help("Click to preview")
+
+                                if entry.sourceImagePaths.count > 1 {
+                                    Text("1")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 4)
+                                        .background(Color.green)
+                                        .clipShape(Capsule())
+                                        .offset(x: 4, y: 4)
                                 }
-                                .help("Click to preview")
-                            
-                            if entry.sourceImagePaths.count > 1 {
-                                Text("1")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .foregroundStyle(.white)
-                                    .padding(.horizontal, 4)
-                                    .background(Color.green)
-                                    .clipShape(Capsule())
-                                    .offset(x: 4, y: 4)
                             }
+                        } else {
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(.quaternary)
+                                .frame(width: 64, height: 64)
+                                .overlay(Image(systemName: outputAccessDenied ? "lock.fill" : "photo").foregroundStyle(.tertiary))
                         }
-                    } else {
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(.quaternary)
-                            .frame(width: 64, height: 64)
-                            .overlay(Image(systemName: "photo").foregroundStyle(.tertiary))
+
+                        if outputAccessDenied {
+                            Button(action: reauthorizeOutput) {
+                                Image(systemName: "lock.badge.plus")
+                                    .padding(4)
+                                    .background(.ultraThinMaterial, in: Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .offset(x: 4, y: -4)
+                        }
                     }
                 } else {
-                    // Processing / Failed / Cancelled
                     RoundedRectangle(cornerRadius: 8)
                         .fill(statusColor.opacity(0.1))
                         .frame(width: 64, height: 64)
@@ -299,8 +351,7 @@ struct HistoryRowView: View {
                         )
                 }
             }
-            
-            // Part 2: Actions Column (Vertically Justified/Centered)
+
             VStack(spacing: 12) {
                 Button(action: { onReuse?(entry) }) {
                     Image(systemName: "gobackward")
@@ -309,7 +360,7 @@ struct HistoryRowView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Reuse Settings")
-                
+
                 if entry.status == "failed" || (entry.status == "processing" && !isActive) {
                     if entry.externalJobName != nil {
                         Button(action: { onResumePolling?(entry) }) {
@@ -331,10 +382,8 @@ struct HistoryRowView: View {
                 }
             }
             .frame(width: 24)
-            
-            // Part 3: Text Column (3 Lines)
+
             VStack(alignment: .leading, spacing: 4) {
-                // Line 1: Prompt
                 Text(entry.prompt)
                     .font(.system(.subheadline, weight: .medium))
                     .lineLimit(2)
@@ -350,13 +399,12 @@ struct HistoryRowView: View {
                             .lineLimit(1)
                     }
                 }
-                
-                // Line 2: Metadata Bundle (Cost, Project, Size, Aspect, Batch)
+
                 HStack(spacing: 8) {
                     Text(formatCurrency(entry.cost))
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
-                    
+
                     Text("in \(projectName)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -364,8 +412,7 @@ struct HistoryRowView: View {
                         .padding(.vertical, 2)
                         .background(Color.secondary.opacity(0.1))
                         .cornerRadius(4)
-                    
-                    // Meta Badges
+
                     HStack(spacing: 6) {
                         Text(entry.imageSize)
                             .font(.system(size: 9, weight: .bold))
@@ -373,11 +420,11 @@ struct HistoryRowView: View {
                             .padding(.vertical, 2)
                             .background(.quaternary)
                             .cornerRadius(4)
-                        
+
                         Text(entry.aspectRatio)
                             .font(.system(size: 9))
                             .foregroundStyle(.secondary)
-                        
+
                         if entry.usedBatchTier {
                             Text("Batch")
                                 .font(.system(size: 9, weight: .bold))
@@ -385,13 +432,12 @@ struct HistoryRowView: View {
                         }
                     }
                 }
-                
-                // Line 3: Status / Error
+
                 if entry.status != "completed" {
                     HStack(spacing: 4) {
                         Text(entry.status.uppercased())
                             .font(.system(size: 9, weight: .black))
-                        
+
                         if let error = entry.error {
                             Text(error)
                                 .font(.system(size: 9))
@@ -410,42 +456,44 @@ struct HistoryRowView: View {
                         .foregroundStyle(.green)
                 }
             }
-            
+
             Spacer()
         }
         .padding(.vertical, 12)
         .padding(.horizontal, 10)
         .contentShape(Rectangle())
-
-
-        .task {
-            await loadThumbnails()
+        .task(id: loadID) {
+            loadThumbnails()
         }
         .sheet(isPresented: $showingPreview) {
-            if let outputImage {
+            if outputAccessDenied {
+                BookmarkAccessDeniedView(
+                    message: "Output folder access has expired.",
+                    onReauthorize: reauthorizeOutput
+                )
+                .frame(minWidth: 400, minHeight: 300)
+            } else if let outputImage {
                 VStack(spacing: 16) {
                     Text("Preview")
                         .font(.headline)
-                    
+
                     Image(nsImage: outputImage)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                         .frame(maxWidth: 600, maxHeight: 600)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
-                    
+
                     HStack {
                         Text(entry.prompt)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
-                        
+
                         Spacer()
-                        
-                        Button("Show in Finder") {
-                            NSWorkspace.shared.activateFileViewerSelecting([entry.outputURL])
-                        }
-                        .buttonStyle(.bordered)
-                        
+
+                        Button("Show in Finder", action: revealOutput)
+                            .buttonStyle(.bordered)
+
                         Button("Close") {
                             showingPreview = false
                         }
@@ -457,17 +505,127 @@ struct HistoryRowView: View {
             }
         }
     }
-    
-    private func loadThumbnails() async {
-        // Load first source
-        if let firstURL = entry.sourceURLs.first {
-             sourceImage = NSImage(contentsOf: firstURL)
-        }
-        
-        // Load output
-        outputImage = NSImage(contentsOf: entry.outputURL)
+
+    private var loadID: String {
+        let sourceBookmark = entry.sourceImageBookmarks?.first?.base64EncodedString() ?? "none"
+        let outputBookmark = entry.outputImageBookmark?.base64EncodedString() ?? "none"
+        let firstSourcePath = entry.sourceImagePaths.first ?? ""
+        return "\(entry.id.uuidString)-\(firstSourcePath)-\(entry.outputImagePath)-\(sourceBookmark)-\(outputBookmark)"
     }
-    
+
+    private func loadThumbnails() {
+        if let sourcePath = entry.sourceImagePaths.first, !sourcePath.isEmpty {
+            switch AppPaths.loadImageData(
+                bookmark: entry.sourceImageBookmarks?.first,
+                fallbackPath: sourcePath
+            ) {
+            case let .success(data, refreshedBookmark):
+                sourceImage = NSImage(data: data)
+                sourceAccessDenied = false
+                if let refreshedBookmark {
+                    persistRefreshedSourceBookmark(refreshedBookmark, at: 0)
+                }
+            case let .fallbackUsed(data):
+                sourceImage = NSImage(data: data)
+                sourceAccessDenied = false
+            case .accessDenied:
+                sourceImage = nil
+                sourceAccessDenied = true
+            }
+        } else {
+            sourceImage = nil
+            sourceAccessDenied = false
+        }
+
+        guard entry.status == "completed", !entry.outputImagePath.isEmpty else {
+            outputImage = nil
+            outputAccessDenied = false
+            return
+        }
+
+        switch AppPaths.loadImageData(
+            bookmark: entry.outputImageBookmark,
+            fallbackPath: entry.outputImagePath
+        ) {
+        case let .success(data, refreshedBookmark):
+            outputImage = NSImage(data: data)
+            outputAccessDenied = false
+            if let refreshedBookmark {
+                historyManager.updateBookmarks(
+                    for: entry.id,
+                    outputBookmark: refreshedBookmark,
+                    sourceBookmarks: entry.sourceImageBookmarks
+                )
+            }
+        case let .fallbackUsed(data):
+            outputImage = NSImage(data: data)
+            outputAccessDenied = false
+        case .accessDenied:
+            outputImage = nil
+            outputAccessDenied = true
+        }
+    }
+
+    private func revealOutput() {
+        guard let project else { return }
+
+        switch AppPaths.revealInFinder(
+            bookmark: entry.outputImageBookmark,
+            fallbackPath: entry.outputImagePath
+        ) {
+        case let .success(_, refreshedBookmark):
+            if let refreshedBookmark {
+                historyManager.updateBookmarks(
+                    for: entry.id,
+                    outputBookmark: refreshedBookmark,
+                    sourceBookmarks: entry.sourceImageBookmarks
+                )
+            }
+        case .fallbackUsed:
+            break
+        case .accessDenied:
+            BookmarkReauthorization.reauthorizeOutputFolder(
+                for: project,
+                projectManager: projectManager,
+                historyManager: historyManager
+            )
+        }
+    }
+
+    private func reauthorizeOutput() {
+        guard let project else { return }
+        BookmarkReauthorization.reauthorizeOutputFolder(
+            for: project,
+            projectManager: projectManager,
+            historyManager: historyManager
+        )
+    }
+
+    private func reauthorizeSource() {
+        let suggestedFolderURL = entry.sourceImagePaths.first.map {
+            URL(fileURLWithPath: $0).deletingLastPathComponent()
+        }
+        BookmarkReauthorization.reauthorizeSourceFolder(
+            entryIds: [entry.id],
+            suggestedFolderURL: suggestedFolderURL,
+            historyManager: historyManager
+        )
+    }
+
+    private func persistRefreshedSourceBookmark(_ refreshedBookmark: Data, at index: Int) {
+        guard var updatedSourceBookmarks = entry.sourceImageBookmarks,
+              updatedSourceBookmarks.indices.contains(index) else {
+            return
+        }
+
+        updatedSourceBookmarks[index] = refreshedBookmark
+        historyManager.updateBookmarks(
+            for: entry.id,
+            outputBookmark: entry.outputImageBookmark,
+            sourceBookmarks: updatedSourceBookmarks
+        )
+    }
+
     private func formatCurrency(_ value: Double) -> String {
         let formatter = NumberFormatter()
         formatter.numberStyle = .currency
@@ -476,7 +634,7 @@ struct HistoryRowView: View {
         formatter.maximumFractionDigits = 4
         return formatter.string(from: NSNumber(value: value)) ?? "$0.00"
     }
-    
+
     private var statusColor: Color {
         switch entry.status {
         case "completed": return .green
@@ -485,12 +643,11 @@ struct HistoryRowView: View {
         default: return .secondary
         }
     }
-    
+
     private var statusIcon: String {
         switch entry.status {
-
         case "completed": return "checkmark.circle"
-        case "processing": return "pause.circle" // Zombie state if we see this icon
+        case "processing": return "pause.circle"
         case "cancelled": return "xmark.circle"
         case "failed": return "exclamationmark.triangle"
         default: return "questionmark"

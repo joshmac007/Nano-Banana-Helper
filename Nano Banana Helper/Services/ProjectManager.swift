@@ -6,6 +6,11 @@ class ProjectManager {
     private let fileManager = FileManager.default
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let appSupportURL: URL
+    private let projectsListURL: URL
+    private let costSummaryURL: URL
+    private let projectsDirectoryURL: URL
+    private let bookmarkDependencies: AppPaths.BookmarkResolutionDependencies
     
     var projects: [Project] = []
     var currentProject: Project?
@@ -13,12 +18,19 @@ class ProjectManager {
     var sessionCost: Double = 0
     var sessionTokens: Int = 0
     var sessionImageCount: Int = 0
-
-    private var appSupportURL: URL { AppPaths.appSupportURL }
-    private var projectsListURL: URL { AppPaths.projectsURL }
-    private var costSummaryURL: URL { AppPaths.costSummaryURL }
     
-    init() {
+    init(
+        appSupportURL: URL = AppPaths.appSupportURL,
+        projectsListURL: URL = AppPaths.projectsURL,
+        costSummaryURL: URL = AppPaths.costSummaryURL,
+        projectsDirectoryURL: URL = AppPaths.projectsDirectoryURL,
+        bookmarkDependencies: AppPaths.BookmarkResolutionDependencies = .live
+    ) {
+        self.appSupportURL = appSupportURL
+        self.projectsListURL = projectsListURL
+        self.costSummaryURL = costSummaryURL
+        self.projectsDirectoryURL = projectsDirectoryURL
+        self.bookmarkDependencies = bookmarkDependencies
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
@@ -46,11 +58,11 @@ class ProjectManager {
     
     private func ensureDirectoriesExist() {
         try? fileManager.createDirectory(at: appSupportURL, withIntermediateDirectories: true)
-        try? fileManager.createDirectory(at: appSupportURL.appendingPathComponent("projects"), withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: projectsDirectoryURL, withIntermediateDirectories: true)
     }
     
     private func projectDirectory(for project: Project) -> URL {
-        AppPaths.projectsDirectoryURL.appendingPathComponent(project.id.uuidString)
+        projectsDirectoryURL.appendingPathComponent(project.id.uuidString)
     }
     
     // MARK: - Project CRUD
@@ -127,6 +139,12 @@ class ProjectManager {
         do {
             let data = try Data(contentsOf: projectsListURL)
             projects = try decoder.decode([Project].self, from: data)
+            if refreshProjectBookmarksIfNeeded() {
+                saveProjects()
+                for project in projects {
+                    saveProjectMetadata(project)
+                }
+            }
         } catch {
             print("Failed to load projects: \(error)")
         }
@@ -201,6 +219,24 @@ class ProjectManager {
         sessionTokens += (tokens?.totalTokenCount ?? 0)
         sessionImageCount += 1
     }
+
+    func recordCostIncurred(
+        cost: Double,
+        resolution: String,
+        projectId: UUID,
+        tokenUsage: TokenUsage?,
+        modelName: String?
+    ) {
+        costSummary.record(
+            cost: cost,
+            resolution: resolution,
+            projectId: projectId,
+            tokens: tokenUsage,
+            modelName: modelName
+        )
+        recordSessionUsage(cost: cost, tokens: tokenUsage)
+        saveCostSummary()
+    }
     
     // MARK: - Export
     
@@ -245,5 +281,26 @@ class ProjectManager {
             print("Failed to export CSV: \(error)")
             return nil
         }
+    }
+
+    @discardableResult
+    private func refreshProjectBookmarksIfNeeded() -> Bool {
+        var didRefresh = false
+
+        for project in projects {
+            guard let bookmark = project.outputDirectoryBookmark,
+                  let resolution = AppPaths.resolveBookmarkToPath(
+                    bookmark,
+                    dependencies: bookmarkDependencies
+                  ),
+                  let refreshedBookmark = resolution.refreshedBookmarkData else {
+                continue
+            }
+
+            project.outputDirectoryBookmark = refreshedBookmark
+            didRefresh = true
+        }
+
+        return didRefresh
     }
 }

@@ -1,7 +1,14 @@
+import AppKit
 import Foundation
 
 /// Centralized management of application storage paths and data migration
 struct AppPaths {
+    enum AccessResult<T> {
+        case success(T, refreshedBookmark: Data?)
+        case fallbackUsed(T)
+        case accessDenied
+    }
+
     /// The primary application support directory for the current app version
     static let appSupportURL: URL = {
         let fileManager = FileManager.default
@@ -107,31 +114,69 @@ struct AppPaths {
             return nil
         }
     }
+
+    struct ResolvedBookmark {
+        let url: URL
+        let refreshedBookmarkData: Data?
+    }
+
+    struct ResolvedBookmarkPath {
+        let path: String
+        let refreshedBookmarkData: Data?
+    }
+
+    struct BookmarkResolutionDependencies {
+        let resolveURL: (Data) throws -> (url: URL, isStale: Bool)
+        let refreshBookmarkData: (URL) throws -> Data
+        let startAccessing: (URL) -> Bool
+        let stopAccessing: (URL) -> Void
+
+        static let live = BookmarkResolutionDependencies(
+            resolveURL: { data in
+                var isStale = false
+                let url = try URL(
+                    resolvingBookmarkData: data,
+                    options: .withSecurityScope,
+                    relativeTo: nil,
+                    bookmarkDataIsStale: &isStale
+                )
+                return (url, isStale)
+            },
+            refreshBookmarkData: { url in
+                try url.bookmarkData(
+                    options: .withSecurityScope,
+                    includingResourceValuesForKeys: nil,
+                    relativeTo: nil
+                )
+            },
+            startAccessing: { url in
+                url.startAccessingSecurityScopedResource()
+            },
+            stopAccessing: { url in
+                url.stopAccessingSecurityScopedResource()
+            }
+        )
+    }
     
     /// Resolve a security scoped bookmark and start accessing the resource.
     /// - Important: The caller is responsible for calling `stopAccessingSecurityScopedResource()`
     ///   on the returned URL when done. Prefer `withResolvedBookmark` or `resolveBookmarkToPath`
     ///   for display-only use cases to avoid leaks.
-    static func resolveBookmark(_ data: Data) -> URL? {
+    static func resolveBookmark(
+        _ data: Data,
+        dependencies: BookmarkResolutionDependencies = .live
+    ) -> ResolvedBookmark? {
         do {
-            var isStale = false
-            let url = try URL(
-                resolvingBookmarkData: data,
-                options: .withSecurityScope,
-                relativeTo: nil,
-                bookmarkDataIsStale: &isStale
-            )
+            let resolved = try dependencies.resolveURL(data)
+            let url = resolved.url
+            var refreshedBookmarkData: Data?
             
-            if isStale {
+            if resolved.isStale {
                 // Attempt to refresh the stale bookmark immediately.
                 // If we can't, return nil to force the user to re-select the file —
                 // a stale bookmark stored on disk will fail silently on next launch.
                 do {
-                    _ = try url.bookmarkData(
-                        options: .withSecurityScope,
-                        includingResourceValuesForKeys: nil,
-                        relativeTo: nil
-                    )
+                    refreshedBookmarkData = try dependencies.refreshBookmarkData(url)
                     print("⚠️ Stale bookmark refreshed for \(url.path) — caller should persist the updated bookmark")
                 } catch {
                     print("❌ Could not refresh stale bookmark for \(url.path): \(error). User must re-select the file.")
@@ -139,8 +184,8 @@ struct AppPaths {
                 }
             }
             
-            if url.startAccessingSecurityScopedResource() {
-                return url
+            if dependencies.startAccessing(url) {
+                return ResolvedBookmark(url: url, refreshedBookmarkData: refreshedBookmarkData)
             } else {
                 print("Failed to access security scoped resource: \(url.path)")
                 return nil
@@ -154,20 +199,158 @@ struct AppPaths {
     /// Resolves a bookmark, executes a closure with the scoped URL, then immediately stops access.
     /// Use this for short-lived operations (reading file data, loading an image, etc.).
     @discardableResult
-    static func withResolvedBookmark<T>(_ data: Data, _ body: (URL) throws -> T) rethrows -> T? {
-        guard let url = resolveBookmark(data) else { return nil }
-        defer { url.stopAccessingSecurityScopedResource() }
-        return try body(url)
+    static func withResolvedBookmark<T>(
+        _ data: Data,
+        dependencies: BookmarkResolutionDependencies = .live,
+        _ body: (URL) throws -> T
+    ) rethrows -> T? {
+        guard let resolved = resolveBookmark(data, dependencies: dependencies) else { return nil }
+        defer { dependencies.stopAccessing(resolved.url) }
+        return try body(resolved.url)
     }
     
     /// Resolves a bookmark, captures the file-system path, then immediately stops access.
     /// Safe for display-only use (labels, Finder reveals, FileManager checks) where a live
     /// security scope is not required.
-    static func resolveBookmarkToPath(_ data: Data) -> String? {
-        var result: String?
-        withResolvedBookmark(data) { url in
-            result = url.path
+    static func resolveBookmarkToPath(
+        _ data: Data,
+        dependencies: BookmarkResolutionDependencies = .live
+    ) -> ResolvedBookmarkPath? {
+        guard let resolved = resolveBookmark(data, dependencies: dependencies) else { return nil }
+        defer { dependencies.stopAccessing(resolved.url) }
+        return ResolvedBookmarkPath(
+            path: resolved.url.path,
+            refreshedBookmarkData: resolved.refreshedBookmarkData
+        )
+    }
+
+    static func loadImageData(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies = .live,
+        fileReader: (URL) -> Data? = { try? Data(contentsOf: $0) }
+    ) -> AccessResult<Data> {
+        if let bookmark,
+           let resolved = resolveBookmark(bookmark, dependencies: dependencies) {
+            defer { dependencies.stopAccessing(resolved.url) }
+            if let data = fileReader(resolved.url) {
+                return .success(data, refreshedBookmark: resolved.refreshedBookmarkData)
+            }
         }
-        return result
+
+        let fallbackURL = URL(fileURLWithPath: fallbackPath)
+        if let data = fileReader(fallbackURL) {
+            return .fallbackUsed(data)
+        }
+
+        return .accessDenied
+    }
+
+    static func openFile(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies = .live,
+        opener: (URL) -> Bool = { NSWorkspace.shared.open($0) }
+    ) -> AccessResult<Void> {
+        performURLAccess(
+            bookmark: bookmark,
+            fallbackPath: fallbackPath,
+            dependencies: dependencies,
+            operation: opener
+        )
+    }
+
+    static func openDirectory(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies = .live,
+        opener: (URL) -> Bool = { NSWorkspace.shared.open($0) }
+    ) -> AccessResult<Void> {
+        performURLAccess(
+            bookmark: bookmark,
+            fallbackPath: fallbackPath,
+            dependencies: dependencies,
+            operation: opener
+        )
+    }
+
+    static func revealInFinder(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies = .live,
+        revealer: ([URL]) -> Void = { NSWorkspace.shared.activateFileViewerSelecting($0) },
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> AccessResult<Void> {
+        performRevealAccess(
+            bookmark: bookmark,
+            fallbackPath: fallbackPath,
+            dependencies: dependencies,
+            revealer: revealer,
+            fileExists: fileExists
+        )
+    }
+
+    static func revealDirectory(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies = .live,
+        revealer: (String) -> Void = { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: $0) },
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> AccessResult<Void> {
+        performRevealAccess(
+            bookmark: bookmark,
+            fallbackPath: fallbackPath,
+            dependencies: dependencies,
+            revealer: { urls in
+                if let path = urls.first?.path {
+                    revealer(path)
+                }
+            },
+            fileExists: fileExists
+        )
+    }
+
+    private static func performURLAccess(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies,
+        operation: (URL) -> Bool
+    ) -> AccessResult<Void> {
+        if let bookmark,
+           let resolved = resolveBookmark(bookmark, dependencies: dependencies) {
+            defer { dependencies.stopAccessing(resolved.url) }
+            if operation(resolved.url) {
+                return .success((), refreshedBookmark: resolved.refreshedBookmarkData)
+            }
+        }
+
+        let fallbackURL = URL(fileURLWithPath: fallbackPath)
+        if operation(fallbackURL) {
+            return .fallbackUsed(())
+        }
+
+        return .accessDenied
+    }
+
+    private static func performRevealAccess(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies,
+        revealer: ([URL]) -> Void,
+        fileExists: (String) -> Bool
+    ) -> AccessResult<Void> {
+        if let bookmark,
+           let resolved = resolveBookmark(bookmark, dependencies: dependencies) {
+            defer { dependencies.stopAccessing(resolved.url) }
+            revealer([resolved.url])
+            return .success((), refreshedBookmark: resolved.refreshedBookmarkData)
+        }
+
+        guard !fallbackPath.isEmpty, fileExists(fallbackPath) else {
+            return .accessDenied
+        }
+
+        revealer([URL(fileURLWithPath: fallbackPath)])
+        return .fallbackUsed(())
     }
 }

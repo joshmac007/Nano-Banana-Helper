@@ -4,6 +4,7 @@ import AppKit
 struct InspectorView: View {
     @Bindable var stagingManager: BatchStagingManager
     var projectManager: ProjectManager
+    var historyManager: HistoryManager
     @Environment(PromptLibrary.self) private var promptLibrary
     @Environment(BatchOrchestrator.self) private var orchestrator
 
@@ -77,7 +78,11 @@ struct InspectorView: View {
                     }
 
                     if let project = projectManager.currentProject {
-                        OutputLocationView(project: project) { newURL, newBookmark in
+                        OutputLocationView(
+                            project: project,
+                            projectManager: projectManager,
+                            historyManager: historyManager
+                        ) { newURL, newBookmark in
                             project.outputDirectory = newURL.path
                             project.outputDirectoryBookmark = newBookmark
                             projectManager.saveProjects()
@@ -251,6 +256,8 @@ struct InspectorView: View {
 
 struct OutputLocationView: View {
     @Bindable var project: Project
+    let projectManager: ProjectManager
+    let historyManager: HistoryManager
     var onUpdate: (URL, Data) -> Void
 
     @State private var isMissing: Bool = false
@@ -312,7 +319,7 @@ struct OutputLocationView: View {
 
                     if !isAccessible && !isMissing {
                         Button("Grant Access...") {
-                            selectNewFolder() // Re-selecting grants permission
+                            reauthorizeFolder()
                         }
                     }
                 } label: {
@@ -341,8 +348,20 @@ struct OutputLocationView: View {
     }
 
     private func openInFinder() {
-        let url = project.outputURL
-        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: url.path)
+        switch AppPaths.revealDirectory(
+            bookmark: project.outputDirectoryBookmark,
+            fallbackPath: project.outputDirectory
+        ) {
+        case let .success(_, refreshedBookmark):
+            if let refreshedBookmark {
+                project.outputDirectoryBookmark = refreshedBookmark
+                projectManager.saveProjects()
+            }
+        case .fallbackUsed:
+            break
+        case .accessDenied:
+            reauthorizeFolder()
+        }
     }
 
     private func selectNewFolder() {
@@ -369,5 +388,14 @@ struct OutputLocationView: View {
         } catch {
             print("Failed to recreate folder: \(error)")
         }
+    }
+
+    private func reauthorizeFolder() {
+        BookmarkReauthorization.reauthorizeOutputFolder(
+            for: project,
+            projectManager: projectManager,
+            historyManager: historyManager
+        )
+        checkStatus()
     }
 }

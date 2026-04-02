@@ -41,6 +41,19 @@ struct BatchJobInfo: Sendable {
     let requestKey: String
 }
 
+struct PollRetryState: Sendable {
+    private(set) var consecutiveErrors = 0
+
+    mutating func registerRetryableError() -> TimeInterval {
+        consecutiveErrors += 1
+        return min(60, pow(2.0, Double(consecutiveErrors)))
+    }
+
+    mutating func reset() {
+        consecutiveErrors = 0
+    }
+}
+
 /// Simple config storage — @MainActor ensures all reads/writes are serialized
 @MainActor
 struct AppConfig: Codable {
@@ -70,12 +83,6 @@ actor NanoBananaService {
     private var modelName: String {
         get async {
             await MainActor.run { AppConfig.load().modelName } ?? "gemini-3.1-flash-image-preview"
-        }
-    }
-    
-    private var baseURL: String {
-        get async {
-            "https://generativelanguage.googleapis.com/v1beta/models/\(await modelName)"
         }
     }
     
@@ -207,7 +214,10 @@ actor NanoBananaService {
     // MARK: - Standard API
     
     private func processStandardRequest(_ payload: [String: Any], apiKey: String) async throws -> ImageEditResponse {
-        var urlRequest = URLRequest(url: URL(string: "\(await baseURL):generateContent?key=\(apiKey)")!)
+        let currentModelName = await modelName
+        var urlRequest = URLRequest(
+            url: try Self.generateContentURL(apiKey: apiKey, modelName: currentModelName)
+        )
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
@@ -236,7 +246,7 @@ actor NanoBananaService {
             throw NanoBananaError.apiError(statusCode: httpResponse.statusCode, data: data)
         }
         
-        return try parseResponse(data)
+        return try await parseResponse(data)
     }
     
     // MARK: - Batch Job Resume
@@ -274,7 +284,8 @@ actor NanoBananaService {
         ]
         
         // POST to :batchGenerateContent endpoint
-        let url = URL(string: "\(await baseURL):batchGenerateContent?key=\(apiKey)")!
+        let currentModelName = await modelName
+        let url = try Self.batchGenerateContentURL(apiKey: apiKey, modelName: currentModelName)
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -314,25 +325,20 @@ actor NanoBananaService {
         let maxPollCount = 360 // 360 × 10s = 1 hour max; prevents infinite loop on stuck API state
         var pollCount = 0
         let jobName = jobName.trimmingCharacters(in: .whitespacesAndNewlines)
-        var consecutiveErrors = 0
+        var retryState = PollRetryState()
         
         while pollCount <= maxPollCount {
             pollCount += 1
             onPollUpdate?(pollCount)
-            // Poll using the operation name
-            let urlString = "https://generativelanguage.googleapis.com/v1beta/\(jobName)?key=\(apiKey)"
             
             await LogManager.shared.log(.request, payload: "Polling batch job: \(jobName) (Attempt \(pollCount))")
             
             do {
-                var pollRequest = URLRequest(url: URL(string: urlString)!)
+                var pollRequest = URLRequest(url: try Self.batchOperationURL(jobName: jobName, apiKey: apiKey))
                 pollRequest.httpMethod = "GET"
                 
                 let (data, response) = try await session.data(for: pollRequest)
-                
-                // Reset error count on success
-                consecutiveErrors = 0
-                
+
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw NanoBananaError.invalidResponse
                 }
@@ -340,10 +346,9 @@ actor NanoBananaService {
                 if httpResponse.statusCode != 200 {
                     // Handle temporary 5xx errors or 429s by retrying
                     if (500...599).contains(httpResponse.statusCode) || httpResponse.statusCode == 429 {
-                        let delay = min(60, pow(2.0, Double(consecutiveErrors))) // Exponential backoff capped at 60s
+                        let delay = retryState.registerRetryableError()
                         await LogManager.shared.log(.error, payload: "Poll HTTP \(httpResponse.statusCode). Retrying in \(delay)s...")
                         try await Task.sleep(for: .seconds(delay))
-                        consecutiveErrors += 1
                         continue
                     }
                     
@@ -366,12 +371,13 @@ actor NanoBananaService {
                 let state = metadata?["state"] as? String ?? (done ? "JOB_STATE_SUCCEEDED" : "JOB_STATE_PENDING")
                 
                 await LogManager.shared.log(.response, payload: "Job state: \(state), done: \(done)")
+                retryState.reset()
                 
                 if done || completedStates.contains(state) {
                     if state == "JOB_STATE_SUCCEEDED" || done {
                         // Check for inlined responses in the response field
                         if let responseObj = json["response"] as? [String: Any] {
-                            return try extractResultFromResponse(responseObj, requestKey: requestKey, apiKey: apiKey)
+                            return try await extractResultFromResponse(responseObj, requestKey: requestKey, apiKey: apiKey)
                         }
                         // Some batch jobs may have results in metadata.dest
                         if let dest = metadata?["dest"] as? [String: Any] {
@@ -395,8 +401,7 @@ actor NanoBananaService {
                 let nsError = error as NSError
                 // Retry on network loss or timeout
                 if nsError.domain == NSURLErrorDomain {
-                    consecutiveErrors += 1
-                    let delay = min(60, pow(2.0, Double(consecutiveErrors)))
+                    let delay = retryState.registerRetryableError()
                     await LogManager.shared.log(.error, payload: "Network error during poll: \(error.localizedDescription). Retrying in \(delay)s...")
                      try await Task.sleep(for: .seconds(delay))
                     continue
@@ -412,43 +417,36 @@ actor NanoBananaService {
         throw NanoBananaError.timeout
     }
     
-    private func extractResultFromResponse(_ response: [String: Any], requestKey: String, apiKey: String) throws -> ImageEditResponse {
+    private func extractResultFromResponse(_ response: [String: Any], requestKey: String, apiKey: String) async throws -> ImageEditResponse {
         // Log the response structure for debugging
         if let responseData = try? JSONSerialization.data(withJSONObject: response, options: .prettyPrinted),
            let jsonString = String(data: responseData, encoding: .utf8) {
             let truncatedJson = String(jsonString.prefix(2000))
-            Task { @MainActor in
-                LogManager.shared.log(.response, payload: "Extracting result from response structure:\n\(truncatedJson)...")
-            }
+            await LogManager.shared.log(.response, payload: "Extracting result from response structure:\n\(truncatedJson)...")
         }
         
         // Check for inlined responses
         if let inlinedResponses = extractInlinedResponses(from: response) {
-            let count = inlinedResponses.count
-            Task { @MainActor in
-                LogManager.shared.log(.response, payload: "Found \(count) inlined response(s)")
-            }
+            await LogManager.shared.log(.response, payload: "Found \(inlinedResponses.count) inlined response(s)")
             for item in inlinedResponses {
                 // Try to match by key, or just use first response
                 if let innerResponse = item["response"] as? [String: Any] {
                     let responseData = try JSONSerialization.data(withJSONObject: innerResponse)
-                    return try parseResponse(responseData)
+                    return try await parseResponse(responseData)
                 }
             }
         }
         
         // Check if response itself has candidates directly (some batch formats)
         if response["candidates"] != nil {
-            Task { @MainActor in
-                LogManager.shared.log(.response, payload: "Found candidates directly in response, parsing directly")
-            }
+            await LogManager.shared.log(.response, payload: "Found candidates directly in response, parsing directly")
             let responseData = try JSONSerialization.data(withJSONObject: response)
-            return try parseResponse(responseData)
+            return try await parseResponse(responseData)
         }
         
         // Direct response parse attempt
         let responseData = try JSONSerialization.data(withJSONObject: response)
-        return try parseResponse(responseData)
+        return try await parseResponse(responseData)
     }
     
     private func extractResultFromDest(_ dest: [String: Any], requestKey: String, apiKey: String) async throws -> ImageEditResponse {
@@ -457,7 +455,7 @@ actor NanoBananaService {
             for item in inlinedResponses {
                 if let response = item["response"] as? [String: Any] {
                     let responseData = try JSONSerialization.data(withJSONObject: response)
-                    return try parseResponse(responseData)
+                    return try await parseResponse(responseData)
                 }
             }
         }
@@ -466,8 +464,9 @@ actor NanoBananaService {
         if let fileName = dest["fileName"] as? String ?? dest["file_name"] as? String ?? dest["responsesFile"] as? String {
             await LogManager.shared.log(.request, payload: "Downloading results from: \(fileName)")
             
-            let downloadURL = "https://generativelanguage.googleapis.com/download/v1beta/\(fileName):download?alt=media&key=\(apiKey)"
-            var downloadRequest = URLRequest(url: URL(string: downloadURL)!)
+            var downloadRequest = URLRequest(
+                url: try Self.downloadResultsURL(fileName: fileName, apiKey: apiKey)
+            )
             downloadRequest.httpMethod = "GET"
             
             let (data, response) = try await session.data(for: downloadRequest)
@@ -486,7 +485,7 @@ actor NanoBananaService {
                    let lineJson = try JSONSerialization.jsonObject(with: lineData) as? [String: Any] {
                     if let response = lineJson["response"] as? [String: Any] {
                         let responseData = try JSONSerialization.data(withJSONObject: response)
-                        return try parseResponse(responseData)
+                        return try await parseResponse(responseData)
                     }
                 }
             }
@@ -519,8 +518,7 @@ actor NanoBananaService {
         }
         
         let jobName = jobName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let urlString = "https://generativelanguage.googleapis.com/v1beta/\(jobName):cancel?key=\(apiKey)"
-        var urlRequest = URLRequest(url: URL(string: urlString)!)
+        var urlRequest = URLRequest(url: try Self.cancelBatchJobURL(jobName: jobName, apiKey: apiKey))
         urlRequest.httpMethod = "POST"
         
         await LogManager.shared.log(.request, payload: "Cancelling batch job: \(jobName)")
@@ -564,19 +562,14 @@ actor NanoBananaService {
         throw lastError ?? NanoBananaError.unknownError
     }
     
-    private func parseResponse(_ data: Data) throws -> ImageEditResponse {
+    private func parseResponse(_ data: Data) async throws -> ImageEditResponse {
         guard let rawJson = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            Task { @MainActor in
-                LogManager.shared.log(.error, payload: "parseResponse: Could not parse as JSON dictionary")
-            }
+            await LogManager.shared.log(.error, payload: "parseResponse: Could not parse as JSON dictionary")
             throw NanoBananaError.invalidResponseFormat
         }
         
-        // Log raw keys for debugging (capture before async)
-        let keysString = rawJson.keys.sorted().joined(separator: ", ")
-        Task { @MainActor in
-            LogManager.shared.log(.response, payload: "parseResponse keys: \(keysString)")
-        }
+        // Log raw keys for debugging
+        await LogManager.shared.log(.response, payload: "parseResponse keys: \(rawJson.keys.sorted().joined(separator: ", "))")
 
         var tokenUsage: TokenUsage? = nil
         if let um = rawJson["usageMetadata"] as? [String: Any],
@@ -598,13 +591,10 @@ actor NanoBananaService {
               let firstCandidate = candidates.first,
               let content = firstCandidate["content"] as? [String: Any],
               let parts = content["parts"] as? [[String: Any]] else {
-            // Log detailed failure info (capture values before async)
             let hasCandidates = json["candidates"] != nil
             let candidatesTypeStr = String(describing: type(of: json["candidates"] as Any))
             let jsonKeysString = json.keys.sorted().joined(separator: ", ")
-            Task { @MainActor in
-                LogManager.shared.log(.error, payload: "parseResponse structure issue - hasCandidates: \(hasCandidates), type: \(candidatesTypeStr), keys: \(jsonKeysString)")
-            }
+            await LogManager.shared.log(.error, payload: "parseResponse structure issue - hasCandidates: \(hasCandidates), type: \(candidatesTypeStr), keys: \(jsonKeysString)")
             throw NanoBananaError.invalidResponseFormat
         }
         
@@ -640,6 +630,58 @@ actor NanoBananaService {
         default: return "image/jpeg"
         }
     }
+
+    static func generateContentURL(apiKey: String, modelName: String) throws -> URL {
+        try apiURL(
+            path: "/v1beta/models/\(modelName):generateContent",
+            queryItems: [URLQueryItem(name: "key", value: apiKey)]
+        )
+    }
+
+    static func batchGenerateContentURL(apiKey: String, modelName: String) throws -> URL {
+        try apiURL(
+            path: "/v1beta/models/\(modelName):batchGenerateContent",
+            queryItems: [URLQueryItem(name: "key", value: apiKey)]
+        )
+    }
+
+    static func batchOperationURL(jobName: String, apiKey: String) throws -> URL {
+        try apiURL(
+            path: "/v1beta/\(jobName.trimmingCharacters(in: .whitespacesAndNewlines))",
+            queryItems: [URLQueryItem(name: "key", value: apiKey)]
+        )
+    }
+
+    static func downloadResultsURL(fileName: String, apiKey: String) throws -> URL {
+        try apiURL(
+            path: "/download/v1beta/\(fileName):download",
+            queryItems: [
+                URLQueryItem(name: "alt", value: "media"),
+                URLQueryItem(name: "key", value: apiKey)
+            ]
+        )
+    }
+
+    static func cancelBatchJobURL(jobName: String, apiKey: String) throws -> URL {
+        try apiURL(
+            path: "/v1beta/\(jobName.trimmingCharacters(in: .whitespacesAndNewlines)):cancel",
+            queryItems: [URLQueryItem(name: "key", value: apiKey)]
+        )
+    }
+
+    private static func apiURL(path: String, queryItems: [URLQueryItem]) throws -> URL {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "generativelanguage.googleapis.com"
+        components.path = path
+        components.queryItems = queryItems
+
+        guard let url = components.url else {
+            throw NanoBananaError.invalidRequestURL(path: path)
+        }
+
+        return url
+    }
 }
 
 /// Errors
@@ -648,6 +690,7 @@ enum NanoBananaError: LocalizedError {
     case invalidResponse
     case invalidResponseFormat
     case noImageInResponse
+    case invalidRequestURL(path: String)
     case apiError(statusCode: Int, data: Data)
     case batchError(message: String)
     case timeout
@@ -663,6 +706,8 @@ enum NanoBananaError: LocalizedError {
             return "Could not parse API response."
         case .noImageInResponse:
             return "No image in API response."
+        case .invalidRequestURL(let path):
+            return "Could not build a valid API request URL for path: \(path)"
         case .apiError(let code, let data):
             let msg = String(data: data, encoding: .utf8) ?? "Unknown"
             return "API error (\(code)): \(msg)"

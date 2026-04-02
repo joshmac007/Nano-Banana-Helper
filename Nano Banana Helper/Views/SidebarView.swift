@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SidebarView: View {
     @Bindable var projectManager: ProjectManager
+    let historyManager: HistoryManager
     var onSelectProject: ((Project) -> Void)?
     var onOpenSettings: (() -> Void)?
     
@@ -53,7 +54,24 @@ struct SidebarView: View {
                                 projectToRename = project
                             }
                             Button("Open Output Folder") {
-                                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: project.outputDirectory)
+                                switch AppPaths.revealDirectory(
+                                    bookmark: project.outputDirectoryBookmark,
+                                    fallbackPath: project.outputDirectory
+                                ) {
+                                case let .success(_, refreshedBookmark):
+                                    if let refreshedBookmark {
+                                        project.outputDirectoryBookmark = refreshedBookmark
+                                        projectManager.saveProjects()
+                                    }
+                                case .fallbackUsed:
+                                    break
+                                case .accessDenied:
+                                    BookmarkReauthorization.reauthorizeOutputFolder(
+                                        for: project,
+                                        projectManager: projectManager,
+                                        historyManager: historyManager
+                                    )
+                                }
                             }
                             Divider()
                             Button("Delete Project", role: .destructive) {

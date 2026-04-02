@@ -19,6 +19,7 @@ struct MainLayoutView: View {
         NavigationSplitView {
             SidebarView(
                 projectManager: projectManager,
+                historyManager: historyManager,
                 onSelectProject: { project in
                     projectManager.selectProject(project)
                     // Load default preset if set
@@ -48,7 +49,10 @@ struct MainLayoutView: View {
                         
                         if isQueueOpen {
                             Divider()
-                            ProgressQueueView()
+                            ProgressQueueView(
+                                historyManager: historyManager,
+                                projectManager: projectManager
+                            )
                                 .frame(height: 300) // Increased height
                                 .transition(.move(edge: .bottom))
                                 .background(VisualEffectView(material: .popover, blendingMode: .withinWindow))
@@ -65,7 +69,8 @@ struct MainLayoutView: View {
                     // Right Inspector
                     InspectorView(
                         stagingManager: stagingManager,
-                        projectManager: projectManager
+                        projectManager: projectManager,
+                        historyManager: historyManager
                     )
                     .frame(width: inspectorWidth)
                 }
@@ -94,8 +99,13 @@ struct MainLayoutView: View {
              }
              
              orchestrator.onCostIncurred = { cost, resolution, projectId, tokenUsage, modelName in
-                 projectManager.costSummary.record(cost: cost, resolution: resolution, projectId: projectId, tokens: tokenUsage, modelName: modelName)
-                 projectManager.recordSessionUsage(cost: cost, tokens: tokenUsage)
+                 projectManager.recordCostIncurred(
+                    cost: cost,
+                    resolution: resolution,
+                    projectId: projectId,
+                    tokenUsage: tokenUsage,
+                    modelName: modelName
+                 )
              }
         }
         .onDisappear {

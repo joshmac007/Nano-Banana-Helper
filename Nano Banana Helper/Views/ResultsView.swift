@@ -1,22 +1,29 @@
+import AppKit
 import SwiftUI
 
 struct ResultsView: View {
-    @Environment(BatchOrchestrator.self) private var orchestrator
-    @Environment(ProjectManager.self) private var projectManager // Inject ProjectManager
-    @State private var selectedTask: ImageTask?
+    var historyManager: HistoryManager
+    var projectManager: ProjectManager
+
+    @State private var selectedEntry: HistoryEntry?
     @State private var iconSize: CGFloat = 200
-    
+
+    private var completedEntries: [HistoryEntry] {
+        guard let projectID = projectManager.currentProject?.id else { return [] }
+        return historyManager.allGlobalEntries.filter {
+            $0.projectId == projectID && $0.status == "completed"
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            // Toolbar / Filter Bar
             HStack {
                 Text("Recent Results")
                     .font(.headline)
                     .foregroundStyle(.secondary)
-                
+
                 Spacer()
-                
-                // Icon Size Slider
+
                 HStack {
                     Image(systemName: "photo")
                         .font(.caption)
@@ -29,24 +36,32 @@ struct ResultsView: View {
             }
             .padding()
             .background(.background.secondary)
-            
+
             Divider()
-            
-            if orchestrator.completedJobs.isEmpty {
+
+            if completedEntries.isEmpty {
                 ContentUnavailableView {
                     Label("No Results Yet", systemImage: "photo.on.rectangle")
                 } description: {
-                    Text("Completed batch jobs will appear here.")
+                    Text("Completed history entries for this project will appear here.")
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: iconSize), spacing: 16)], spacing: 16) {
-                        ForEach(orchestrator.completedJobs.filter { $0.projectId == projectManager.currentProject?.id }.reversed()) { task in
-                            ResultCard(task: task, size: iconSize)
+                        ForEach(completedEntries) { entry in
+                            if let project = projectManager.projects.first(where: { $0.id == entry.projectId }) {
+                                ResultCard(
+                                    entry: entry,
+                                    project: project,
+                                    historyManager: historyManager,
+                                    projectManager: projectManager,
+                                    size: iconSize
+                                )
                                 .onTapGesture {
-                                    selectedTask = task
+                                    selectedEntry = entry
                                 }
+                            }
                         }
                     }
                     .padding()
@@ -54,42 +69,62 @@ struct ResultsView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .sheet(item: $selectedTask) { task in
-            ResultDetailView(task: task)
+        .sheet(item: $selectedEntry) { entry in
+            if let project = projectManager.projects.first(where: { $0.id == entry.projectId }) {
+                ResultDetailView(
+                    entry: entry,
+                    project: project,
+                    historyManager: historyManager,
+                    projectManager: projectManager
+                )
+            }
         }
     }
 }
 
 struct ResultCard: View {
-    let task: ImageTask
+    let entry: HistoryEntry
+    let project: Project
+    let historyManager: HistoryManager
+    let projectManager: ProjectManager
     let size: CGFloat
-    
+
+    @State private var image: NSImage?
+    @State private var outputAccessDenied = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Image Preview
-            ZStack {
-                if let path = task.outputPath,
-                   let nsImage = NSImage(contentsOfFile: path) {
-                    Image(nsImage: nsImage)
+            ZStack(alignment: .topTrailing) {
+                if let image {
+                    Image(nsImage: image)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                        .frame(width: size, height: size * 3/4)
+                        .frame(width: size, height: size * 3 / 4)
                         .background(Color.black.opacity(0.04))
                 } else {
                     Rectangle()
                         .fill(Color.secondary.opacity(0.1))
-                        .frame(width: size, height: size * 3/4)
+                        .frame(width: size, height: size * 3 / 4)
                         .overlay {
-                            Image(systemName: "photo")
+                            Image(systemName: outputAccessDenied ? "lock.fill" : "photo")
                                 .foregroundStyle(.secondary)
                         }
                 }
-                
-                // Hover overlay or status could go here
+
+                if outputAccessDenied {
+                    Button(action: reauthorizeOutput) {
+                        Image(systemName: "lock.badge.plus")
+                            .padding(8)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(8)
+                    .help("Grant access to the output folder")
+                }
             }
-            // Footer
+
             HStack {
-                Text(task.filename)
+                Text(URL(fileURLWithPath: entry.outputImagePath).lastPathComponent)
                     .font(.caption)
                     .lineLimit(1)
                 Spacer()
@@ -106,13 +141,61 @@ struct ResultCard: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
         )
+        .task(id: outputLoadID) {
+            loadOutputImage()
+        }
+    }
+
+    private var outputLoadID: String {
+        "\(entry.id.uuidString)-\(entry.outputImagePath)-\(entry.outputImageBookmark?.base64EncodedString() ?? "none")"
+    }
+
+    private func loadOutputImage() {
+        switch AppPaths.loadImageData(
+            bookmark: entry.outputImageBookmark,
+            fallbackPath: entry.outputImagePath
+        ) {
+        case let .success(data, refreshedBookmark):
+            image = NSImage(data: data)
+            outputAccessDenied = false
+            if let refreshedBookmark {
+                historyManager.updateBookmarks(
+                    for: entry.id,
+                    outputBookmark: refreshedBookmark,
+                    sourceBookmarks: entry.sourceImageBookmarks
+                )
+            }
+        case let .fallbackUsed(data):
+            image = NSImage(data: data)
+            outputAccessDenied = false
+        case .accessDenied:
+            image = nil
+            outputAccessDenied = true
+        }
+    }
+
+    private func reauthorizeOutput() {
+        BookmarkReauthorization.reauthorizeOutputFolder(
+            for: project,
+            projectManager: projectManager,
+            historyManager: historyManager
+        )
     }
 }
 
 struct ResultDetailView: View {
-    let task: ImageTask
-    @Environment(\.dismiss) var dismiss
-    
+    let entry: HistoryEntry
+    let project: Project
+    let historyManager: HistoryManager
+    let projectManager: ProjectManager
+
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var outputImage: NSImage?
+    @State private var inputImage: NSImage?
+    @State private var outputAccessDenied = false
+    @State private var sourceAccessDenied = false
+
     var body: some View {
         VStack {
             HStack {
@@ -125,48 +208,195 @@ struct ResultDetailView: View {
                 .buttonStyle(.plain)
                 .padding()
             }
-            
-            if let path = task.outputPath,
-               let nsImage = NSImage(contentsOfFile: path) {
-                
-                VStack {
-                    // Comparison Toggle
-                    if let inputPath = task.inputPaths.first,
-                       let inputImage = NSImage(contentsOfFile: inputPath) {
-                        
-                        ComparisonView(before: inputImage, after: nsImage)
+
+            Group {
+                if outputAccessDenied {
+                    BookmarkAccessDeniedView(
+                        message: "Output folder access has expired.",
+                        onReauthorize: reauthorizeOutput
+                    )
+                } else if let outputImage {
+                    if sourceAccessDenied {
+                        VStack(spacing: 16) {
+                            Image(nsImage: outputImage)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .padding(.horizontal)
+
+                            BookmarkAccessDeniedView(
+                                message: "Source image access has expired.",
+                                onReauthorize: reauthorizeSource
+                            )
+                        }
+                    } else if let inputImage {
+                        ComparisonView(before: inputImage, after: outputImage)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .clipShape(RoundedRectangle(cornerRadius: 12))
                             .padding()
                     } else {
-                        // Fallback if no input available
-                        Image(nsImage: nsImage)
+                        Image(nsImage: outputImage)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .padding()
                     }
+                } else {
+                    ContentUnavailableView("Image Not Found", systemImage: "exclamationmark.triangle")
                 }
-            } else {
-                ContentUnavailableView("Image Not Found", systemImage: "exclamationmark.triangle")
             }
-            
+
             HStack {
-                if let path = task.outputPath {
-                     Button("Open File") {
-                         NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                     }
-                     .buttonStyle(.bordered)
-                     
-                     Button("Show in Finder") {
-                         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-                     }
-                     .buttonStyle(.bordered)
-                }
+                Button("Open File", action: openFile)
+                    .buttonStyle(.bordered)
+                    .disabled(entry.outputImagePath.isEmpty)
+
+                Button("Show in Finder", action: revealFile)
+                    .buttonStyle(.bordered)
+                    .disabled(entry.outputImagePath.isEmpty)
             }
             .padding(.bottom)
         }
         .frame(minWidth: 800, minHeight: 600)
+        .task(id: outputLoadID) {
+            loadOutputImage()
+        }
+        .task(id: sourceLoadID) {
+            loadSourceImage()
+        }
+    }
+
+    private var outputLoadID: String {
+        "\(entry.id.uuidString)-\(entry.outputImagePath)-\(entry.outputImageBookmark?.base64EncodedString() ?? "none")"
+    }
+
+    private var sourceLoadID: String {
+        let sourcePath = entry.sourceImagePaths.first ?? ""
+        let sourceBookmark = entry.sourceImageBookmarks?.first?.base64EncodedString() ?? "none"
+        return "\(entry.id.uuidString)-\(sourcePath)-\(sourceBookmark)"
+    }
+
+    private func loadOutputImage() {
+        switch AppPaths.loadImageData(
+            bookmark: entry.outputImageBookmark,
+            fallbackPath: entry.outputImagePath
+        ) {
+        case let .success(data, refreshedBookmark):
+            outputImage = NSImage(data: data)
+            outputAccessDenied = false
+            if let refreshedBookmark {
+                historyManager.updateBookmarks(
+                    for: entry.id,
+                    outputBookmark: refreshedBookmark,
+                    sourceBookmarks: entry.sourceImageBookmarks
+                )
+            }
+        case let .fallbackUsed(data):
+            outputImage = NSImage(data: data)
+            outputAccessDenied = false
+        case .accessDenied:
+            outputImage = nil
+            outputAccessDenied = true
+        }
+    }
+
+    private func loadSourceImage() {
+        guard let sourcePath = entry.sourceImagePaths.first, !sourcePath.isEmpty else {
+            inputImage = nil
+            sourceAccessDenied = false
+            return
+        }
+
+        switch AppPaths.loadImageData(
+            bookmark: entry.sourceImageBookmarks?.first,
+            fallbackPath: sourcePath
+        ) {
+        case let .success(data, refreshedBookmark):
+            inputImage = NSImage(data: data)
+            sourceAccessDenied = false
+            if let refreshedBookmark {
+                persistRefreshedSourceBookmark(refreshedBookmark, at: 0)
+            }
+        case let .fallbackUsed(data):
+            inputImage = NSImage(data: data)
+            sourceAccessDenied = false
+        case .accessDenied:
+            inputImage = nil
+            sourceAccessDenied = true
+        }
+    }
+
+    private func openFile() {
+        switch AppPaths.openFile(
+            bookmark: entry.outputImageBookmark,
+            fallbackPath: entry.outputImagePath
+        ) {
+        case let .success(_, refreshedBookmark):
+            if let refreshedBookmark {
+                historyManager.updateBookmarks(
+                    for: entry.id,
+                    outputBookmark: refreshedBookmark,
+                    sourceBookmarks: entry.sourceImageBookmarks
+                )
+            }
+        case .fallbackUsed:
+            break
+        case .accessDenied:
+            reauthorizeOutput()
+        }
+    }
+
+    private func revealFile() {
+        switch AppPaths.revealInFinder(
+            bookmark: entry.outputImageBookmark,
+            fallbackPath: entry.outputImagePath
+        ) {
+        case let .success(_, refreshedBookmark):
+            if let refreshedBookmark {
+                historyManager.updateBookmarks(
+                    for: entry.id,
+                    outputBookmark: refreshedBookmark,
+                    sourceBookmarks: entry.sourceImageBookmarks
+                )
+            }
+        case .fallbackUsed:
+            break
+        case .accessDenied:
+            reauthorizeOutput()
+        }
+    }
+
+    private func reauthorizeOutput() {
+        BookmarkReauthorization.reauthorizeOutputFolder(
+            for: project,
+            projectManager: projectManager,
+            historyManager: historyManager
+        )
+    }
+
+    private func reauthorizeSource() {
+        let suggestedFolderURL = entry.sourceImagePaths.first.map {
+            URL(fileURLWithPath: $0).deletingLastPathComponent()
+        }
+        BookmarkReauthorization.reauthorizeSourceFolder(
+            entryIds: [entry.id],
+            suggestedFolderURL: suggestedFolderURL,
+            historyManager: historyManager
+        )
+    }
+
+    private func persistRefreshedSourceBookmark(_ refreshedBookmark: Data, at index: Int) {
+        guard var updatedSourceBookmarks = entry.sourceImageBookmarks,
+              updatedSourceBookmarks.indices.contains(index) else {
+            return
+        }
+
+        updatedSourceBookmarks[index] = refreshedBookmark
+        historyManager.updateBookmarks(
+            for: entry.id,
+            outputBookmark: entry.outputImageBookmark,
+            sourceBookmarks: updatedSourceBookmarks
+        )
     }
 }
 
@@ -174,17 +404,15 @@ struct ComparisonView: View {
     let before: NSImage
     let after: NSImage
     @State private var sliderValue: CGFloat = 0.5
-    
+
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                // Background (After Image)
                 Image(nsImage: after)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(width: geometry.size.width, height: geometry.size.height)
-                
-                // Foreground (Before Image) - Masked
+
                 Image(nsImage: before)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
@@ -196,8 +424,7 @@ struct ComparisonView: View {
                             Spacer()
                         }
                     )
-                
-                // Slider Handle
+
                 Rectangle()
                     .fill(.white)
                     .frame(width: 2)
@@ -220,8 +447,7 @@ struct ComparisonView: View {
                                 sliderValue = min(max(location / geometry.size.width, 0), 1)
                             }
                     )
-                
-                // Labels
+
                 VStack {
                     Spacer()
                     HStack {
@@ -231,9 +457,9 @@ struct ComparisonView: View {
                             .background(.ultraThinMaterial)
                             .cornerRadius(4)
                             .opacity(sliderValue > 0.1 ? 1 : 0)
-                        
+
                         Spacer()
-                        
+
                         Text("Result")
                             .font(.caption)
                             .padding(4)

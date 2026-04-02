@@ -137,6 +137,97 @@ class HistoryManager {
         allGlobalEntries.removeAll { $0.projectId == projectId }
         saveHistory(for: projectId)
     }
+
+    func updateBookmarks(
+        for entryId: UUID,
+        outputBookmark: Data?,
+        sourceBookmarks: [Data]?
+    ) {
+        guard let projectId = projectID(for: entryId),
+              var projectEntries = loadPersistedEntries(for: projectId),
+              let index = projectEntries.firstIndex(where: { $0.id == entryId }) else {
+            return
+        }
+
+        projectEntries[index].outputImageBookmark = outputBookmark
+        projectEntries[index].sourceImageBookmarks = sourceBookmarks
+        persistProjectEntries(projectEntries, for: projectId)
+        syncCachedEntries(with: projectEntries, for: projectId)
+    }
+
+    func repairOutputBookmarksFromFolder(
+        projectId: UUID,
+        folderURL: URL,
+        bookmarkCreator: (URL) -> Data? = AppPaths.bookmark(for:)
+    ) {
+        guard var projectEntries = loadPersistedEntries(for: projectId) else { return }
+
+        var didRepair = false
+        for index in projectEntries.indices {
+            let outputURL = URL(fileURLWithPath: projectEntries[index].outputImagePath)
+            guard outputURL.path.hasPrefix(folderURL.path),
+                  fileManager.fileExists(atPath: outputURL.path),
+                  let bookmark = bookmarkCreator(outputURL) else {
+                continue
+            }
+
+            projectEntries[index].outputImageBookmark = bookmark
+            didRepair = true
+        }
+
+        guard didRepair else { return }
+        persistProjectEntries(projectEntries, for: projectId)
+        syncCachedEntries(with: projectEntries, for: projectId)
+    }
+
+    func repairSourceBookmarksFromFolder(
+        entryIds: Set<UUID>,
+        folderURL: URL,
+        bookmarkCreator: (URL) -> Data? = AppPaths.bookmark(for:)
+    ) {
+        guard !entryIds.isEmpty else { return }
+
+        let groupedProjectIDs = Dictionary(
+            grouping: allGlobalEntries.filter { entryIds.contains($0.id) },
+            by: \.projectId
+        )
+
+        for (projectId, projectEntriesToRepair) in groupedProjectIDs {
+            guard var persistedEntries = loadPersistedEntries(for: projectId) else { continue }
+            let targetIDs = Set(projectEntriesToRepair.map(\.id))
+            var didRepair = false
+
+            for index in persistedEntries.indices where targetIDs.contains(persistedEntries[index].id) {
+                let entry = persistedEntries[index]
+                let repairedByIndex = repairedSourceBookmarksByIndex(
+                    for: entry,
+                    folderURL: folderURL,
+                    bookmarkCreator: bookmarkCreator
+                )
+                guard !repairedByIndex.isEmpty else { continue }
+
+                let updatedBookmarks: [Data]
+                if let existingBookmarks = alignedSourceBookmarks(for: entry) {
+                    var bookmarks = existingBookmarks
+                    for (sourceIndex, bookmark) in repairedByIndex {
+                        bookmarks[sourceIndex] = bookmark
+                    }
+                    updatedBookmarks = bookmarks
+                } else {
+                    guard repairedByIndex.count == entry.sourceImagePaths.count else { continue }
+                    updatedBookmarks = entry.sourceImagePaths.indices.compactMap { repairedByIndex[$0] }
+                    guard updatedBookmarks.count == entry.sourceImagePaths.count else { continue }
+                }
+
+                persistedEntries[index].sourceImageBookmarks = updatedBookmarks
+                didRepair = true
+            }
+
+            guard didRepair else { continue }
+            persistProjectEntries(persistedEntries, for: projectId)
+            syncCachedEntries(with: persistedEntries, for: projectId)
+        }
+    }
     
     // MARK: - Filtering
     
@@ -165,6 +256,83 @@ class HistoryManager {
         } catch {
             print("Failed to save history: \(error)")
         }
+    }
+
+    private func loadPersistedEntries(for projectId: UUID) -> [HistoryEntry]? {
+        let url = historyURL(for: projectId)
+        guard fileManager.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url),
+              let projectEntries = try? decoder.decode([HistoryEntry].self, from: data) else {
+            return nil
+        }
+        return projectEntries
+    }
+
+    private func persistProjectEntries(_ projectEntries: [HistoryEntry], for projectId: UUID) {
+        let url = historyURL(for: projectId)
+        let directory = url.deletingLastPathComponent()
+        try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        saveEntries(projectEntries, to: url)
+    }
+
+    private func syncCachedEntries(with projectEntries: [HistoryEntry], for projectId: UUID) {
+        let updatedEntriesByID = Dictionary(uniqueKeysWithValues: projectEntries.map { ($0.id, $0) })
+
+        for index in entries.indices {
+            if let updatedEntry = updatedEntriesByID[entries[index].id] {
+                entries[index] = updatedEntry
+            }
+        }
+
+        for index in allGlobalEntries.indices {
+            if let updatedEntry = updatedEntriesByID[allGlobalEntries[index].id] {
+                allGlobalEntries[index] = updatedEntry
+            }
+        }
+
+        allGlobalEntries.sort(by: { $0.timestamp > $1.timestamp })
+
+        if !entries.isEmpty && entries.allSatisfy({ $0.projectId == projectId }) {
+            entries = projectEntries
+        }
+    }
+
+    private func projectID(for entryId: UUID) -> UUID? {
+        if let entry = allGlobalEntries.first(where: { $0.id == entryId }) {
+            return entry.projectId
+        }
+        if let entry = entries.first(where: { $0.id == entryId }) {
+            return entry.projectId
+        }
+        return nil
+    }
+
+    private func alignedSourceBookmarks(for entry: HistoryEntry) -> [Data]? {
+        guard let sourceBookmarks = entry.sourceImageBookmarks,
+              sourceBookmarks.count == entry.sourceImagePaths.count else {
+            return nil
+        }
+        return sourceBookmarks
+    }
+
+    private func repairedSourceBookmarksByIndex(
+        for entry: HistoryEntry,
+        folderURL: URL,
+        bookmarkCreator: (URL) -> Data?
+    ) -> [Int: Data] {
+        var repairedByIndex: [Int: Data] = [:]
+
+        for sourceIndex in entry.sourceImagePaths.indices {
+            let sourceURL = URL(fileURLWithPath: entry.sourceImagePaths[sourceIndex])
+            guard sourceURL.path.hasPrefix(folderURL.path),
+                  fileManager.fileExists(atPath: sourceURL.path),
+                  let bookmark = bookmarkCreator(sourceURL) else {
+                continue
+            }
+            repairedByIndex[sourceIndex] = bookmark
+        }
+
+        return repairedByIndex
     }
 
     @discardableResult

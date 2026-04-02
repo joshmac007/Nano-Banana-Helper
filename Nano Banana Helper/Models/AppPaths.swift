@@ -1,7 +1,14 @@
+import AppKit
 import Foundation
 
 /// Centralized management of application storage paths and data migration
 struct AppPaths {
+    enum AccessResult<T> {
+        case success(T, refreshedBookmark: Data?)
+        case fallbackUsed(T)
+        case accessDenied
+    }
+
     /// The primary application support directory for the current app version
     static let appSupportURL: URL = {
         let fileManager = FileManager.default
@@ -215,5 +222,135 @@ struct AppPaths {
             path: resolved.url.path,
             refreshedBookmarkData: resolved.refreshedBookmarkData
         )
+    }
+
+    static func loadImageData(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies = .live,
+        fileReader: (URL) -> Data? = { try? Data(contentsOf: $0) }
+    ) -> AccessResult<Data> {
+        if let bookmark,
+           let resolved = resolveBookmark(bookmark, dependencies: dependencies) {
+            defer { dependencies.stopAccessing(resolved.url) }
+            if let data = fileReader(resolved.url) {
+                return .success(data, refreshedBookmark: resolved.refreshedBookmarkData)
+            }
+        }
+
+        let fallbackURL = URL(fileURLWithPath: fallbackPath)
+        if let data = fileReader(fallbackURL) {
+            return .fallbackUsed(data)
+        }
+
+        return .accessDenied
+    }
+
+    static func openFile(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies = .live,
+        opener: (URL) -> Bool = { NSWorkspace.shared.open($0) }
+    ) -> AccessResult<Void> {
+        performURLAccess(
+            bookmark: bookmark,
+            fallbackPath: fallbackPath,
+            dependencies: dependencies,
+            operation: opener
+        )
+    }
+
+    static func openDirectory(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies = .live,
+        opener: (URL) -> Bool = { NSWorkspace.shared.open($0) }
+    ) -> AccessResult<Void> {
+        performURLAccess(
+            bookmark: bookmark,
+            fallbackPath: fallbackPath,
+            dependencies: dependencies,
+            operation: opener
+        )
+    }
+
+    static func revealInFinder(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies = .live,
+        revealer: ([URL]) -> Void = { NSWorkspace.shared.activateFileViewerSelecting($0) },
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> AccessResult<Void> {
+        performRevealAccess(
+            bookmark: bookmark,
+            fallbackPath: fallbackPath,
+            dependencies: dependencies,
+            revealer: revealer,
+            fileExists: fileExists
+        )
+    }
+
+    static func revealDirectory(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies = .live,
+        revealer: (String) -> Void = { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: $0) },
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> AccessResult<Void> {
+        performRevealAccess(
+            bookmark: bookmark,
+            fallbackPath: fallbackPath,
+            dependencies: dependencies,
+            revealer: { urls in
+                if let path = urls.first?.path {
+                    revealer(path)
+                }
+            },
+            fileExists: fileExists
+        )
+    }
+
+    private static func performURLAccess(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies,
+        operation: (URL) -> Bool
+    ) -> AccessResult<Void> {
+        if let bookmark,
+           let resolved = resolveBookmark(bookmark, dependencies: dependencies) {
+            defer { dependencies.stopAccessing(resolved.url) }
+            if operation(resolved.url) {
+                return .success((), refreshedBookmark: resolved.refreshedBookmarkData)
+            }
+        }
+
+        let fallbackURL = URL(fileURLWithPath: fallbackPath)
+        if operation(fallbackURL) {
+            return .fallbackUsed(())
+        }
+
+        return .accessDenied
+    }
+
+    private static func performRevealAccess(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies,
+        revealer: ([URL]) -> Void,
+        fileExists: (String) -> Bool
+    ) -> AccessResult<Void> {
+        if let bookmark,
+           let resolved = resolveBookmark(bookmark, dependencies: dependencies) {
+            defer { dependencies.stopAccessing(resolved.url) }
+            revealer([resolved.url])
+            return .success((), refreshedBookmark: resolved.refreshedBookmarkData)
+        }
+
+        guard !fallbackPath.isEmpty, fileExists(fallbackPath) else {
+            return .accessDenied
+        }
+
+        revealer([URL(fileURLWithPath: fallbackPath)])
+        return .fallbackUsed(())
     }
 }

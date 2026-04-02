@@ -50,10 +50,15 @@ struct WorkbenchView: View {
                 case .staging:
                     StagingView(stagingManager: stagingManager)
                 case .results:
-                    ResultsView()
+                    ResultsView(
+                        historyManager: historyManager,
+                        projectManager: projectManager
+                    )
                 case .history:
                     HistoryView(
                         entries: historyManager.allGlobalEntries,
+                        historyManager: historyManager,
+                        projectManager: projectManager,
                         projects: projectManager.projects,
                         initialProjectId: projectManager.currentProject?.id,
                         activeJobIDs: Set(orchestrator.processingJobs.compactMap { $0.externalJobName }),

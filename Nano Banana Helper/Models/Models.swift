@@ -126,16 +126,16 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     var outputImageBookmark: Data?
     
     var sourceURLs: [URL] {
-        // Display-only: use plain path-based URLs. Security scope is not needed
-        // for NSImage thumbnail loading or Finder reveals.
+        // Plain path-based URLs for display and non-file-access contexts only.
+        // Use AppPaths scoped helpers for image loading and Finder operations.
         return sourceImagePaths.map { URL(fileURLWithPath: $0) }
     }
     
     var sourceURL: URL { sourceURLs.first ?? URL(fileURLWithPath: "") }
     
     var outputURL: URL {
-        // Display-only: use plain path-based URL. Security scope is not needed
-        // for NSImage thumbnail loading or Finder reveals.
+        // Plain path-based URL for display and non-file-access contexts only.
+        // Use AppPaths scoped helpers for image loading and Finder operations.
         return URL(fileURLWithPath: outputImagePath)
     }
     

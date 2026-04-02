@@ -16,6 +16,37 @@ struct Nano_Banana_HelperTests {
         return url
     }
 
+    private func makeHistoryEntry(
+        projectId: UUID,
+        sourceImagePaths: [String] = ["/tmp/input.png"],
+        outputImagePath: String = "/tmp/output.png",
+        sourceImageBookmarks: [Data]? = nil,
+        outputImageBookmark: Data? = nil
+    ) -> HistoryEntry {
+        HistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: sourceImagePaths,
+            outputImagePath: outputImagePath,
+            prompt: "prompt",
+            aspectRatio: "16:9",
+            imageSize: "2K",
+            usedBatchTier: false,
+            cost: 1,
+            sourceImageBookmarks: sourceImageBookmarks,
+            outputImageBookmark: outputImageBookmark
+        )
+    }
+
+    private func loadPersistedHistoryEntries(from projectsDirectory: URL, projectId: UUID) throws -> [HistoryEntry] {
+        let fileURL = projectsDirectory
+            .appendingPathComponent(projectId.uuidString)
+            .appendingPathComponent("history.json")
+        let data = try Data(contentsOf: fileURL)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode([HistoryEntry].self, from: data)
+    }
+
     private func makeProject() -> Project {
         Project(name: "Test Project", outputDirectory: "/tmp")
     }
@@ -227,6 +258,257 @@ struct Nano_Banana_HelperTests {
         #expect(resolution?.refreshedBookmarkData == refreshedBookmark)
     }
 
+    @Test func loadImageDataSucceedsWithValidBookmark() {
+        let bookmark = Data("bookmark".utf8)
+        let expectedData = Data("image-data".utf8)
+        let expectedURL = URL(fileURLWithPath: "/tmp/image.png")
+        let dependencies = AppPaths.BookmarkResolutionDependencies(
+            resolveURL: { data in
+                #expect(data == bookmark)
+                return (expectedURL, false)
+            },
+            refreshBookmarkData: { _ in Data() },
+            startAccessing: { _ in true },
+            stopAccessing: { _ in }
+        )
+
+        let result = AppPaths.loadImageData(
+            bookmark: bookmark,
+            fallbackPath: "/tmp/fallback.png",
+            dependencies: dependencies,
+            fileReader: { url in
+                #expect(url == expectedURL)
+                return expectedData
+            }
+        )
+
+        switch result {
+        case let .success(data, refreshedBookmark):
+            #expect(data == expectedData)
+            #expect(refreshedBookmark == nil)
+        default:
+            Issue.record("Expected bookmark-backed image load to succeed")
+        }
+    }
+
+    @Test func loadImageDataRefreshesStaleBookmark() {
+        let bookmark = Data("bookmark".utf8)
+        let refreshedBookmark = Data("refreshed".utf8)
+        let expectedData = Data("image-data".utf8)
+        let expectedURL = URL(fileURLWithPath: "/tmp/image.png")
+        let dependencies = AppPaths.BookmarkResolutionDependencies(
+            resolveURL: { _ in (expectedURL, true) },
+            refreshBookmarkData: { _ in refreshedBookmark },
+            startAccessing: { _ in true },
+            stopAccessing: { _ in }
+        )
+
+        let result = AppPaths.loadImageData(
+            bookmark: bookmark,
+            fallbackPath: "/tmp/fallback.png",
+            dependencies: dependencies,
+            fileReader: { _ in expectedData }
+        )
+
+        switch result {
+        case let .success(data, returnedBookmark):
+            #expect(data == expectedData)
+            #expect(returnedBookmark == refreshedBookmark)
+        default:
+            Issue.record("Expected stale bookmark load to succeed and return refreshed data")
+        }
+    }
+
+    @Test func loadImageDataFallsBackToPathWhenNoBookmark() throws {
+        let directory = try makeTemporaryDirectory()
+        let fallbackURL = directory.appendingPathComponent("fallback.png")
+        let expectedData = Data("fallback-data".utf8)
+        try expectedData.write(to: fallbackURL)
+
+        let result = AppPaths.loadImageData(
+            bookmark: nil,
+            fallbackPath: fallbackURL.path
+        )
+
+        switch result {
+        case let .fallbackUsed(data):
+            #expect(data == expectedData)
+        default:
+            Issue.record("Expected path-based fallback image load to succeed")
+        }
+    }
+
+    @Test func loadImageDataReturnsDeniedWhenBothFail() {
+        let bookmark = Data("bookmark".utf8)
+        let dependencies = AppPaths.BookmarkResolutionDependencies(
+            resolveURL: { _ in throw CocoaError(.fileNoSuchFile) },
+            refreshBookmarkData: { _ in Data() },
+            startAccessing: { _ in true },
+            stopAccessing: { _ in }
+        )
+
+        let result = AppPaths.loadImageData(
+            bookmark: bookmark,
+            fallbackPath: "/tmp/missing-image.png",
+            dependencies: dependencies,
+            fileReader: { _ in nil }
+        )
+
+        if case .accessDenied = result {
+            return
+        }
+        Issue.record("Expected access denial when bookmark resolution and fallback both fail")
+    }
+
+    @Test func openFileUsesBookmarkResolvedURL() {
+        let bookmark = Data("bookmark".utf8)
+        let expectedURL = URL(fileURLWithPath: "/tmp/output.png")
+        let dependencies = AppPaths.BookmarkResolutionDependencies(
+            resolveURL: { _ in (expectedURL, false) },
+            refreshBookmarkData: { _ in Data() },
+            startAccessing: { _ in true },
+            stopAccessing: { _ in }
+        )
+        var openedURL: URL?
+
+        let result = AppPaths.openFile(
+            bookmark: bookmark,
+            fallbackPath: "/tmp/fallback-output.png",
+            dependencies: dependencies,
+            opener: { url in
+                openedURL = url
+                return true
+            }
+        )
+
+        #expect(openedURL == expectedURL)
+        if case .success = result {
+            return
+        }
+        Issue.record("Expected openFile to use the resolved bookmark URL")
+    }
+
+    @Test func openFileFallsBackToPathWhenNoBookmark() {
+        let fallbackPath = "/tmp/fallback-output.png"
+        var openedURL: URL?
+
+        let result = AppPaths.openFile(
+            bookmark: nil,
+            fallbackPath: fallbackPath,
+            opener: { url in
+                openedURL = url
+                return true
+            }
+        )
+
+        #expect(openedURL?.path == fallbackPath)
+        if case .fallbackUsed = result {
+            return
+        }
+        Issue.record("Expected openFile to fall back to the path when no bookmark exists")
+    }
+
+    @Test func openFileReturnsDeniedWhenBothFail() {
+        let fallbackPath = "/tmp/missing-output.png"
+
+        let result = AppPaths.openFile(
+            bookmark: nil,
+            fallbackPath: fallbackPath,
+            opener: { _ in false }
+        )
+
+        if case .accessDenied = result {
+            return
+        }
+        Issue.record("Expected openFile to deny access when both bookmark and fallback fail")
+    }
+
+    @Test func revealInFinderUsesBookmarkResolvedURL() {
+        let bookmark = Data("bookmark".utf8)
+        let expectedURL = URL(fileURLWithPath: "/tmp/output.png")
+        let dependencies = AppPaths.BookmarkResolutionDependencies(
+            resolveURL: { _ in (expectedURL, false) },
+            refreshBookmarkData: { _ in Data() },
+            startAccessing: { _ in true },
+            stopAccessing: { _ in }
+        )
+        var revealedURLs: [URL] = []
+
+        let result = AppPaths.revealInFinder(
+            bookmark: bookmark,
+            fallbackPath: "/tmp/fallback-output.png",
+            dependencies: dependencies,
+            revealer: { urls in revealedURLs = urls }
+        )
+
+        #expect(revealedURLs == [expectedURL])
+        if case .success = result {
+            return
+        }
+        Issue.record("Expected revealInFinder to use the resolved bookmark URL")
+    }
+
+    @Test func revealInFinderFallsBackToPath() throws {
+        let directory = try makeTemporaryDirectory()
+        let fileURL = directory.appendingPathComponent("output.png")
+        try Data("image".utf8).write(to: fileURL)
+        var revealedURLs: [URL] = []
+
+        let result = AppPaths.revealInFinder(
+            bookmark: nil,
+            fallbackPath: fileURL.path,
+            revealer: { urls in revealedURLs = urls }
+        )
+
+        #expect(revealedURLs == [fileURL])
+        if case .fallbackUsed = result {
+            return
+        }
+        Issue.record("Expected revealInFinder to fall back to the raw path")
+    }
+
+    @Test func revealDirectoryUsesBookmarkResolvedURL() {
+        let bookmark = Data("bookmark".utf8)
+        let expectedURL = URL(fileURLWithPath: "/tmp/output-folder")
+        let dependencies = AppPaths.BookmarkResolutionDependencies(
+            resolveURL: { _ in (expectedURL, false) },
+            refreshBookmarkData: { _ in Data() },
+            startAccessing: { _ in true },
+            stopAccessing: { _ in }
+        )
+        var revealedPath: String?
+
+        let result = AppPaths.revealDirectory(
+            bookmark: bookmark,
+            fallbackPath: "/tmp/fallback-folder",
+            dependencies: dependencies,
+            revealer: { path in revealedPath = path }
+        )
+
+        #expect(revealedPath == expectedURL.path)
+        if case .success = result {
+            return
+        }
+        Issue.record("Expected revealDirectory to use the resolved bookmark path")
+    }
+
+    @Test func revealDirectoryReturnsDeniedWhenFallbackMissing() {
+        var revealedPath: String?
+
+        let result = AppPaths.revealDirectory(
+            bookmark: nil,
+            fallbackPath: "/tmp/missing-folder",
+            revealer: { path in revealedPath = path },
+            fileExists: { _ in false }
+        )
+
+        #expect(revealedPath == nil)
+        if case .accessDenied = result {
+            return
+        }
+        Issue.record("Expected revealDirectory to deny access when fallback path is missing")
+    }
+
     @Test func historyManagerPersistsRefreshedBookmarksOnLoad() throws {
         let projectId = UUID()
         let oldSourceBookmark = Data("old-source".utf8)
@@ -291,7 +573,242 @@ struct Nano_Banana_HelperTests {
         #expect(persistedEntries[0].outputImageBookmark == newOutputBookmark)
     }
 
-    @Test func orchestratorResetRemovesPersistedActiveBatchFile() throws {
+    @Test func updateBookmarksUpdatesEntryInMemoryAndOnDisk() throws {
+        let projectId = UUID()
+        let tempProjectsDirectory = try makeTemporaryDirectory()
+        let entry = makeHistoryEntry(projectId: projectId)
+        let outputBookmark = Data("new-output".utf8)
+        let sourceBookmarks = [Data("new-source".utf8)]
+        let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
+        manager.entries = [entry]
+        manager.allGlobalEntries = [entry]
+        manager.saveHistory(for: projectId)
+
+        manager.updateBookmarks(
+            for: entry.id,
+            outputBookmark: outputBookmark,
+            sourceBookmarks: sourceBookmarks
+        )
+
+        #expect(manager.entries.first?.outputImageBookmark == outputBookmark)
+        #expect(manager.entries.first?.sourceImageBookmarks == sourceBookmarks)
+        #expect(manager.allGlobalEntries.first?.outputImageBookmark == outputBookmark)
+        #expect(manager.allGlobalEntries.first?.sourceImageBookmarks == sourceBookmarks)
+
+        let persistedEntries = try loadPersistedHistoryEntries(from: tempProjectsDirectory, projectId: projectId)
+        #expect(persistedEntries.first?.outputImageBookmark == outputBookmark)
+        #expect(persistedEntries.first?.sourceImageBookmarks == sourceBookmarks)
+    }
+
+    @Test func updateBookmarksPersistsNonCurrentProjectEntries() throws {
+        let currentProject = UUID()
+        let targetProject = UUID()
+        let tempProjectsDirectory = try makeTemporaryDirectory()
+        let currentEntry = makeHistoryEntry(projectId: currentProject, outputImagePath: "/tmp/current-output.png")
+        let targetEntry = makeHistoryEntry(projectId: targetProject, outputImagePath: "/tmp/target-output.png")
+        let outputBookmark = Data("target-output".utf8)
+        let sourceBookmarks = [Data("target-source".utf8)]
+        let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
+
+        manager.entries = [currentEntry]
+        manager.saveHistory(for: currentProject)
+        manager.entries = [targetEntry]
+        manager.saveHistory(for: targetProject)
+        manager.entries = [currentEntry]
+        manager.allGlobalEntries = [targetEntry, currentEntry]
+
+        manager.updateBookmarks(
+            for: targetEntry.id,
+            outputBookmark: outputBookmark,
+            sourceBookmarks: sourceBookmarks
+        )
+
+        #expect(manager.entries.first?.id == currentEntry.id)
+        #expect(manager.entries.first?.outputImageBookmark == nil)
+
+        let persistedEntries = try loadPersistedHistoryEntries(from: tempProjectsDirectory, projectId: targetProject)
+        #expect(persistedEntries.first?.outputImageBookmark == outputBookmark)
+        #expect(persistedEntries.first?.sourceImageBookmarks == sourceBookmarks)
+        #expect(manager.allGlobalEntries.first(where: { $0.id == targetEntry.id })?.outputImageBookmark == outputBookmark)
+        #expect(manager.allGlobalEntries.first(where: { $0.id == targetEntry.id })?.sourceImageBookmarks == sourceBookmarks)
+    }
+
+    @Test func updateBookmarksNoOpForUnknownEntryId() throws {
+        let projectId = UUID()
+        let tempProjectsDirectory = try makeTemporaryDirectory()
+        let entry = makeHistoryEntry(projectId: projectId)
+        let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
+        manager.entries = [entry]
+        manager.allGlobalEntries = [entry]
+        manager.saveHistory(for: projectId)
+
+        manager.updateBookmarks(
+            for: UUID(),
+            outputBookmark: Data("new-output".utf8),
+            sourceBookmarks: [Data("new-source".utf8)]
+        )
+
+        let persistedEntries = try loadPersistedHistoryEntries(from: tempProjectsDirectory, projectId: projectId)
+        #expect(persistedEntries.first?.outputImageBookmark == nil)
+        #expect(persistedEntries.first?.sourceImageBookmarks == nil)
+    }
+
+    @Test func repairOutputBookmarksFromFolderUpdatesMatchingEntries() throws {
+        let projectId = UUID()
+        let tempProjectsDirectory = try makeTemporaryDirectory()
+        let outputFolder = tempProjectsDirectory.appendingPathComponent("outputs", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
+        let matchingOutputURL = outputFolder.appendingPathComponent("result.png")
+        let outsideOutputURL = tempProjectsDirectory.appendingPathComponent("elsewhere/result.png")
+        try FileManager.default.createDirectory(at: outsideOutputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("match".utf8).write(to: matchingOutputURL)
+        try Data("outside".utf8).write(to: outsideOutputURL)
+
+        let matchingEntry = makeHistoryEntry(projectId: projectId, outputImagePath: matchingOutputURL.path)
+        let outsideEntry = makeHistoryEntry(projectId: projectId, outputImagePath: outsideOutputURL.path)
+        let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
+        manager.entries = [matchingEntry, outsideEntry]
+        manager.allGlobalEntries = [matchingEntry, outsideEntry]
+        manager.saveHistory(for: projectId)
+
+        manager.repairOutputBookmarksFromFolder(
+            projectId: projectId,
+            folderURL: outputFolder,
+            bookmarkCreator: { url in Data(url.path.utf8) }
+        )
+
+        let persistedEntries = try loadPersistedHistoryEntries(from: tempProjectsDirectory, projectId: projectId)
+        #expect(persistedEntries.first(where: { $0.id == matchingEntry.id })?.outputImageBookmark == Data(matchingOutputURL.path.utf8))
+        #expect(persistedEntries.first(where: { $0.id == outsideEntry.id })?.outputImageBookmark == nil)
+    }
+
+    @Test func repairSourceBookmarksFromFolderUpdatesRequestedEntries() throws {
+        let projectId = UUID()
+        let tempProjectsDirectory = try makeTemporaryDirectory()
+        let sourceFolder = tempProjectsDirectory.appendingPathComponent("sources", isDirectory: true)
+        let otherFolder = tempProjectsDirectory.appendingPathComponent("other", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceFolder, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: otherFolder, withIntermediateDirectories: true)
+
+        let requestedSourceURL = sourceFolder.appendingPathComponent("input-a.png")
+        let secondRequestedSourceURL = sourceFolder.appendingPathComponent("input-b.png")
+        let outsideSourceURL = otherFolder.appendingPathComponent("input-c.png")
+        try Data("a".utf8).write(to: requestedSourceURL)
+        try Data("b".utf8).write(to: secondRequestedSourceURL)
+        try Data("c".utf8).write(to: outsideSourceURL)
+
+        let requestedEntry = makeHistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: [requestedSourceURL.path, secondRequestedSourceURL.path],
+            outputImagePath: "/tmp/requested-output.png"
+        )
+        let skippedEntry = makeHistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: [outsideSourceURL.path],
+            outputImagePath: "/tmp/skipped-output.png"
+        )
+        let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
+        manager.entries = [requestedEntry, skippedEntry]
+        manager.allGlobalEntries = [requestedEntry, skippedEntry]
+        manager.saveHistory(for: projectId)
+
+        manager.repairSourceBookmarksFromFolder(
+            entryIds: [requestedEntry.id],
+            folderURL: sourceFolder,
+            bookmarkCreator: { url in Data(url.path.utf8) }
+        )
+
+        let persistedEntries = try loadPersistedHistoryEntries(from: tempProjectsDirectory, projectId: projectId)
+        #expect(
+            persistedEntries.first(where: { $0.id == requestedEntry.id })?.sourceImageBookmarks ==
+            [Data(requestedSourceURL.path.utf8), Data(secondRequestedSourceURL.path.utf8)]
+        )
+        #expect(persistedEntries.first(where: { $0.id == skippedEntry.id })?.sourceImageBookmarks == nil)
+    }
+
+    @Test func repairSourceBookmarksFromFolderPreservesBookmarkIndexAlignment() throws {
+        let projectId = UUID()
+        let tempProjectsDirectory = try makeTemporaryDirectory()
+        let sourceFolder = tempProjectsDirectory.appendingPathComponent("sources", isDirectory: true)
+        let outsideFolder = tempProjectsDirectory.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceFolder, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outsideFolder, withIntermediateDirectories: true)
+
+        let firstSourceURL = sourceFolder.appendingPathComponent("input-a.png")
+        let secondSourceURL = outsideFolder.appendingPathComponent("input-b.png")
+        let thirdSourceURL = sourceFolder.appendingPathComponent("input-c.png")
+        try Data("a".utf8).write(to: firstSourceURL)
+        try Data("b".utf8).write(to: secondSourceURL)
+        try Data("c".utf8).write(to: thirdSourceURL)
+
+        let oldFirstBookmark = Data("old-a".utf8)
+        let oldSecondBookmark = Data("old-b".utf8)
+        let oldThirdBookmark = Data("old-c".utf8)
+        let entry = makeHistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: [firstSourceURL.path, secondSourceURL.path, thirdSourceURL.path],
+            outputImagePath: "/tmp/output.png",
+            sourceImageBookmarks: [oldFirstBookmark, oldSecondBookmark, oldThirdBookmark]
+        )
+        let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
+        manager.entries = [entry]
+        manager.allGlobalEntries = [entry]
+        manager.saveHistory(for: projectId)
+
+        manager.repairSourceBookmarksFromFolder(
+            entryIds: [entry.id],
+            folderURL: sourceFolder,
+            bookmarkCreator: { url in Data("new:\(url.lastPathComponent)".utf8) }
+        )
+
+        let persistedEntries = try loadPersistedHistoryEntries(from: tempProjectsDirectory, projectId: projectId)
+        #expect(
+            persistedEntries.first?.sourceImageBookmarks ==
+            [
+                Data("new:input-a.png".utf8),
+                oldSecondBookmark,
+                Data("new:input-c.png".utf8)
+            ]
+        )
+    }
+
+    @Test func reauthorizeOutputFolderReturnsWrongFolderSelectedAndShowsError() throws {
+        let tempAppSupportURL = try makeTemporaryDirectory()
+        let projectsListURL = tempAppSupportURL.appendingPathComponent("projects.json")
+        let costSummaryURL = tempAppSupportURL.appendingPathComponent("cost_summary.json")
+        let projectsDirectoryURL = tempAppSupportURL.appendingPathComponent("projects", isDirectory: true)
+        let projectManager = ProjectManager(
+            appSupportURL: tempAppSupportURL,
+            projectsListURL: projectsListURL,
+            costSummaryURL: costSummaryURL,
+            projectsDirectoryURL: projectsDirectoryURL
+        )
+        let historyManager = HistoryManager(projectsDirectoryURL: projectsDirectoryURL)
+        let expectedFolder = tempAppSupportURL.appendingPathComponent("expected", isDirectory: true)
+        let wrongFolder = tempAppSupportURL.appendingPathComponent("wrong", isDirectory: true)
+        let project = Project(name: "Test Project", outputDirectory: expectedFolder.path)
+        projectManager.projects = [project]
+        projectManager.currentProject = project
+        var shownError: String?
+
+        let result = BookmarkReauthorization.reauthorizeOutputFolder(
+            for: project,
+            projectManager: projectManager,
+            historyManager: historyManager,
+            selectedURLOverride: wrongFolder,
+            bookmarkCreator: { _ in
+                Issue.record("Bookmark creation should not run for the wrong folder")
+                return nil
+            },
+            showError: { message in shownError = message }
+        )
+
+        #expect(result == .wrongFolderSelected)
+        #expect(shownError?.contains(expectedFolder.path) == true)
+        #expect(project.outputDirectoryBookmark == nil)
+    }
+
+    @MainActor @Test func orchestratorResetRemovesPersistedActiveBatchFile() throws {
         let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
         let orchestrator = BatchOrchestrator(
             activeBatchURL: activeBatchURL,
@@ -378,7 +895,7 @@ struct Nano_Banana_HelperTests {
         #expect(manager.sessionImageCount == 1)
     }
 
-    @Test func cancelHandlesSubmittingPhaseTasks() throws {
+    @MainActor @Test func cancelHandlesSubmittingPhaseTasks() throws {
         let orchestrator = BatchOrchestrator(
             activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
             autoStartEnqueuedBatches: false
@@ -398,7 +915,7 @@ struct Nano_Banana_HelperTests {
         #expect(task.error == "Cancelled by user")
     }
 
-    @Test func startAllStartsEligibleBatchesConcurrently() async throws {
+    @MainActor @Test func startAllStartsEligibleBatchesConcurrently() async throws {
         let probe = BatchStartProbe()
         let orchestrator = BatchOrchestrator(
             activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),

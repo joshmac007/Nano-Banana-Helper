@@ -4,6 +4,7 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 
 ![MainScreen](https://github.com/joshmac007/Nano-Banana-Helper/blob/main/MainScreen.jpeg)
 
+![Latest Release](https://img.shields.io/github/v/release/joshmac007/Nano-Banana-Helper?color=success&label=Release)
 ![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)
 ![Swift 6.0](https://img.shields.io/badge/Swift-6.0-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
@@ -55,9 +56,18 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 
 ## Installation
 
+### Pre-built App (Recommended)
+
+The easiest way to install Nano Banana Helper is to download the compiled version:
+1. Go to the **Releases** section on the right sidebar of this GitHub repository.
+2. Download the latest `Nano Banana Helper.dmg` file.
+3. Open the `.dmg` and drag the app into your Applications folder.
+
+### Build from Source (Developers)
+
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/froggeric/Nano-Banana-Helper.git
+   git clone https://github.com/joshmac007/Nano-Banana-Helper.git
    cd Nano-Banana-Helper
    ```
 

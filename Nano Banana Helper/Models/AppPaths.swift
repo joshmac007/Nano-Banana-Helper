@@ -230,20 +230,12 @@ struct AppPaths {
         dependencies: BookmarkResolutionDependencies = .live,
         fileReader: (URL) -> Data? = { try? Data(contentsOf: $0) }
     ) -> AccessResult<Data> {
-        if let bookmark,
-           let resolved = resolveBookmark(bookmark, dependencies: dependencies) {
-            defer { dependencies.stopAccessing(resolved.url) }
-            if let data = fileReader(resolved.url) {
-                return .success(data, refreshedBookmark: resolved.refreshedBookmarkData)
-            }
-        }
-
-        let fallbackURL = URL(fileURLWithPath: fallbackPath)
-        if let data = fileReader(fallbackURL) {
-            return .fallbackUsed(data)
-        }
-
-        return .accessDenied
+        withAccessibleURL(
+            bookmark: bookmark,
+            fallbackPath: fallbackPath,
+            dependencies: dependencies,
+            operation: fileReader
+        )
     }
 
     static func openFile(
@@ -310,26 +302,46 @@ struct AppPaths {
         )
     }
 
+    static func withAccessibleURL<T>(
+        bookmark: Data?,
+        fallbackPath: String,
+        dependencies: BookmarkResolutionDependencies = .live,
+        operation: (URL) -> T?
+    ) -> AccessResult<T> {
+        if let bookmark,
+           let resolved = resolveBookmark(bookmark, dependencies: dependencies) {
+            defer { dependencies.stopAccessing(resolved.url) }
+            if let value = operation(resolved.url) {
+                return .success(value, refreshedBookmark: resolved.refreshedBookmarkData)
+            }
+        }
+
+        guard !fallbackPath.isEmpty else {
+            return .accessDenied
+        }
+
+        let fallbackURL = URL(fileURLWithPath: fallbackPath)
+        if let value = operation(fallbackURL) {
+            return .fallbackUsed(value)
+        }
+
+        return .accessDenied
+    }
+
     private static func performURLAccess(
         bookmark: Data?,
         fallbackPath: String,
         dependencies: BookmarkResolutionDependencies,
         operation: (URL) -> Bool
     ) -> AccessResult<Void> {
-        if let bookmark,
-           let resolved = resolveBookmark(bookmark, dependencies: dependencies) {
-            defer { dependencies.stopAccessing(resolved.url) }
-            if operation(resolved.url) {
-                return .success((), refreshedBookmark: resolved.refreshedBookmarkData)
+        withAccessibleURL(
+            bookmark: bookmark,
+            fallbackPath: fallbackPath,
+            dependencies: dependencies,
+            operation: { url in
+                operation(url) ? () : nil
             }
-        }
-
-        let fallbackURL = URL(fileURLWithPath: fallbackPath)
-        if operation(fallbackURL) {
-            return .fallbackUsed(())
-        }
-
-        return .accessDenied
+        )
     }
 
     private static func performRevealAccess(

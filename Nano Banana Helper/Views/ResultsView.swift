@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import SwiftUI
 
 struct ResultsView: View {
@@ -22,6 +23,10 @@ struct ResultsView: View {
 
     private var gridColumns: [GridItem] {
         Array(repeating: GridItem(.flexible(), spacing: 16), count: clampedImagesPerRow)
+    }
+
+    private var activeThumbnailBucket: ThumbnailBucket {
+        ThumbnailBucket(imagesPerRow: clampedImagesPerRow)
     }
 
     private var imagesPerRowBinding: Binding<Double> {
@@ -72,7 +77,8 @@ struct ResultsView: View {
                                     project: project,
                                     historyManager: historyManager,
                                     projectManager: projectManager,
-                                    imageLoader: imageLoader
+                                    imageLoader: imageLoader,
+                                    thumbnailBucket: activeThumbnailBucket
                                 )
                                 .onTapGesture {
                                     selectedEntry = entry
@@ -105,6 +111,7 @@ fileprivate struct ResultCard: View {
     let historyManager: HistoryManager
     let projectManager: ProjectManager
     let imageLoader: ResultsImageLoader
+    let thumbnailBucket: ThumbnailBucket
 
     @State private var outputPhase: ResultsImagePhase = .loading
 
@@ -174,6 +181,7 @@ fileprivate struct ResultCard: View {
         ResultsImageReference(
             entryID: entry.id,
             role: .output,
+            variant: .thumbnail(bucket: thumbnailBucket),
             fallbackPath: entry.outputImagePath,
             bookmark: entry.outputImageBookmark
         )
@@ -328,6 +336,7 @@ fileprivate struct ResultDetailView: View {
         ResultsImageReference(
             entryID: entry.id,
             role: .output,
+            variant: .fullResolution,
             fallbackPath: entry.outputImagePath,
             bookmark: entry.outputImageBookmark
         )
@@ -338,6 +347,7 @@ fileprivate struct ResultDetailView: View {
         return ResultsImageReference(
             entryID: entry.id,
             role: .sourcePrimary,
+            variant: .fullResolution,
             fallbackPath: sourcePath,
             bookmark: entry.sourceImageBookmarks?.first
         )
@@ -496,15 +506,59 @@ private enum ResultsImageRole: String, Sendable {
     case sourcePrimary
 }
 
+private enum ThumbnailBucket: Int, Sendable {
+    case oneUp = 1200
+    case twoUp = 800
+    case threeUp = 600
+    case denseGrid = 400
+
+    init(imagesPerRow: Int) {
+        switch imagesPerRow {
+        case 1:
+            self = .oneUp
+        case 2:
+            self = .twoUp
+        case 3:
+            self = .threeUp
+        default:
+            self = .denseGrid
+        }
+    }
+
+    var maxPixelSize: Int {
+        rawValue
+    }
+
+    var cacheKeyFragment: String {
+        "thumbnail-\(rawValue)"
+    }
+}
+
+private enum ResultsImageVariant: Sendable {
+    case thumbnail(bucket: ThumbnailBucket)
+    case fullResolution
+
+    var cacheKeyFragment: String {
+        switch self {
+        case let .thumbnail(bucket):
+            return bucket.cacheKeyFragment
+        case .fullResolution:
+            return "full-resolution"
+        }
+    }
+}
+
 private struct ResultsImageReference: Sendable {
     let cacheKey: String
     let fallbackPath: String
     let bookmark: Data?
+    let variant: ResultsImageVariant
 
-    init(entryID: UUID, role: ResultsImageRole, fallbackPath: String, bookmark: Data?) {
-        cacheKey = "\(entryID.uuidString)|\(role.rawValue)|\(fallbackPath)"
+    init(entryID: UUID, role: ResultsImageRole, variant: ResultsImageVariant, fallbackPath: String, bookmark: Data?) {
+        cacheKey = "\(entryID.uuidString)|\(role.rawValue)|\(variant.cacheKeyFragment)|\(fallbackPath)"
         self.fallbackPath = fallbackPath
         self.bookmark = bookmark
+        self.variant = variant
     }
 }
 
@@ -547,52 +601,54 @@ private struct ResultsImageLoadOutcome {
     let refreshedBookmark: Data?
 }
 
-private enum ResultsImageReadResult: Sendable {
-    case success(Data, refreshedBookmark: Data?)
-    case fallbackUsed(Data)
-    case accessDenied
+private enum ThumbnailDecodeResult {
+    case decoded(NSImage)
+    case failed
 }
 
 fileprivate final class ResultsImageLoader {
     private let cache = NSCache<NSString, NSImage>()
+    private var inFlight: [String: Task<ResultsImageLoadOutcome, Never>] = [:]
 
     init() {
         cache.countLimit = 120
         cache.totalCostLimit = 256 * 1024 * 1024
     }
 
+    @MainActor
     fileprivate func cachedPhase(for reference: ResultsImageReference) -> ResultsImagePhase? {
         guard let image = cache.object(forKey: reference.cacheKey as NSString) else { return nil }
         return .loaded(image)
     }
 
+    @MainActor
     fileprivate func load(reference: ResultsImageReference) async -> ResultsImageLoadOutcome {
         if let cachedPhase = cachedPhase(for: reference) {
             return ResultsImageLoadOutcome(phase: cachedPhase, refreshedBookmark: nil)
         }
 
-        let readResult = await Task.detached(priority: .utility) {
-            ResultsImageLoader.read(reference: reference)
-        }.value
-
-        switch readResult {
-        case let .success(data, refreshedBookmark):
-            guard let image = NSImage(data: data) else {
-                return ResultsImageLoadOutcome(phase: .failed, refreshedBookmark: refreshedBookmark)
-            }
-            cache(image, for: reference)
-            return ResultsImageLoadOutcome(phase: .loaded(image), refreshedBookmark: refreshedBookmark)
-        case let .fallbackUsed(data):
-            guard let image = NSImage(data: data) else {
-                return ResultsImageLoadOutcome(phase: .failed, refreshedBookmark: nil)
-            }
-            cache(image, for: reference)
-            return ResultsImageLoadOutcome(phase: .loaded(image), refreshedBookmark: nil)
-        case .accessDenied:
-            return ResultsImageLoadOutcome(phase: .accessDenied, refreshedBookmark: nil)
+        if let task = inFlight[reference.cacheKey] {
+            return await task.value
         }
+
+        let task = Task<ResultsImageLoadOutcome, Never>(priority: .utility) { [reference] in
+            let outcome = await Task.detached(priority: .utility) {
+                ResultsImageLoader.read(reference: reference)
+            }.value
+
+            if case let .loaded(image) = outcome.phase {
+                self.cache(image, for: reference)
+            }
+
+            return outcome
+        }
+
+        inFlight[reference.cacheKey] = task
+        defer { inFlight[reference.cacheKey] = nil }
+        return await task.value
     }
 
+    @MainActor
     private func cache(_ image: NSImage, for reference: ResultsImageReference) {
         cache.setObject(
             image,
@@ -601,21 +657,83 @@ fileprivate final class ResultsImageLoader {
         )
     }
 
-    nonisolated private static func read(reference: ResultsImageReference) -> ResultsImageReadResult {
+    nonisolated private static func read(reference: ResultsImageReference) -> ResultsImageLoadOutcome {
+        switch reference.variant {
+        case .fullResolution:
+            return readFullResolution(reference: reference)
+        case let .thumbnail(bucket):
+            return readThumbnail(reference: reference, bucket: bucket)
+        }
+    }
+
+    nonisolated private static func readFullResolution(reference: ResultsImageReference) -> ResultsImageLoadOutcome {
         switch AppPaths.loadImageData(
             bookmark: reference.bookmark,
             fallbackPath: reference.fallbackPath
         ) {
         case let .success(data, refreshedBookmark):
-            return .success(data, refreshedBookmark: refreshedBookmark)
+            guard let image = NSImage(data: data) else {
+                return ResultsImageLoadOutcome(phase: .failed, refreshedBookmark: refreshedBookmark)
+            }
+            return ResultsImageLoadOutcome(phase: .loaded(image), refreshedBookmark: refreshedBookmark)
         case let .fallbackUsed(data):
-            return .fallbackUsed(data)
+            guard let image = NSImage(data: data) else {
+                return ResultsImageLoadOutcome(phase: .failed, refreshedBookmark: nil)
+            }
+            return ResultsImageLoadOutcome(phase: .loaded(image), refreshedBookmark: nil)
         case .accessDenied:
-            return .accessDenied
+            return ResultsImageLoadOutcome(phase: .accessDenied, refreshedBookmark: nil)
         }
     }
-}
 
+    nonisolated private static func readThumbnail(reference: ResultsImageReference, bucket: ThumbnailBucket) -> ResultsImageLoadOutcome {
+        switch AppPaths.withAccessibleURL(
+            bookmark: reference.bookmark,
+            fallbackPath: reference.fallbackPath,
+            operation: { url in
+                decodeThumbnail(at: url, maxPixelSize: bucket.maxPixelSize)
+            }
+        ) {
+        case let .success(result, refreshedBookmark):
+            return thumbnailOutcome(result, refreshedBookmark: refreshedBookmark)
+        case let .fallbackUsed(result):
+            return thumbnailOutcome(result, refreshedBookmark: nil)
+        case .accessDenied:
+            return ResultsImageLoadOutcome(phase: .accessDenied, refreshedBookmark: nil)
+        }
+    }
+
+    nonisolated private static func thumbnailOutcome(
+        _ result: ThumbnailDecodeResult,
+        refreshedBookmark: Data?
+    ) -> ResultsImageLoadOutcome {
+        switch result {
+        case let .decoded(image):
+            return ResultsImageLoadOutcome(phase: .loaded(image), refreshedBookmark: refreshedBookmark)
+        case .failed:
+            return ResultsImageLoadOutcome(phase: .failed, refreshedBookmark: refreshedBookmark)
+        }
+    }
+
+    nonisolated private static func decodeThumbnail(at url: URL, maxPixelSize: Int) -> ThumbnailDecodeResult? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            return .failed
+        }
+
+        let options: CFDictionary = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ] as CFDictionary
+
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else {
+            return .failed
+        }
+
+        let size = NSSize(width: cgImage.width, height: cgImage.height)
+        return .decoded(NSImage(cgImage: cgImage, size: size))
+    }
+}
 private extension NSImage {
     var approximateMemoryCost: Int {
         let width = max(Int(size.width), 1)

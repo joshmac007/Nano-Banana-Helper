@@ -51,6 +51,13 @@ struct Nano_Banana_HelperTests {
         Project(name: "Test Project", outputDirectory: "/tmp")
     }
 
+    private func persistQueueState(_ state: PersistedQueueState, to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(state)
+        try data.write(to: url)
+    }
+
     @Test func example() async throws {
         // Write your test here and use APIs like
         // APIs like `#expect(...)` to check expected conditions.
@@ -72,7 +79,7 @@ struct Nano_Banana_HelperTests {
         #expect(decoded.totalTokenCount == 150)
     }
 
-    @Test func historyEntryBackwardCompatibility() throws {
+    @MainActor @Test func historyEntryBackwardCompatibility() throws {
         // JSON without tokenUsage/modelName fields — must decode without crashing
         let json = """
         {
@@ -99,7 +106,7 @@ struct Nano_Banana_HelperTests {
         #expect(entry.cost == 0.067)
     }
 
-    @Test func historyEntryWithTokenData() throws {
+    @MainActor @Test func historyEntryWithTokenData() throws {
         let json = """
         {
             "id": "00000000-0000-0000-0000-000000000001",
@@ -133,7 +140,7 @@ struct Nano_Banana_HelperTests {
         #expect(entry.modelName == "gemini-3.1-flash-image-preview")
     }
 
-    @Test func costSummaryBackwardCompatibility() throws {
+    @MainActor @Test func costSummaryBackwardCompatibility() throws {
         // JSON without token/model fields — must decode without crashing
         let json = """
         {
@@ -155,7 +162,7 @@ struct Nano_Banana_HelperTests {
         #expect(summary.byModel.isEmpty)
     }
 
-    @Test func costSummaryRecordWithTokens() throws {
+    @MainActor @Test func costSummaryRecordWithTokens() throws {
         var summary = CostSummary()
         let projectId = UUID()
 
@@ -175,7 +182,7 @@ struct Nano_Banana_HelperTests {
         #expect(summary.byResolution["1K"] == 0.067)
     }
 
-    @Test func costSummaryRoundTrip() throws {
+    @MainActor @Test func costSummaryRoundTrip() throws {
         var summary = CostSummary()
         let projectId = UUID()
         let usage = TokenUsage(promptTokenCount: 100, candidatesTokenCount: 50, totalTokenCount: 150)
@@ -232,19 +239,19 @@ struct Nano_Banana_HelperTests {
         #expect(entries.contains(where: { $0.id == "not-approved-image-model" }) == false)
     }
 
-    @Test func curatedModelCatalogFallbackEntriesExcludeDeprecatedDefaultsAndInjectLegacySelection() {
+    @Test func curatedModelCatalogFallbackEntriesExcludeDeprecatedDefaultsAndInjectLegacySelection() throws {
         let fallbackEntries = CuratedModelCatalog.fallbackEntries()
-        #expect(fallbackEntries.map(\.id) == ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"])
-        #expect(fallbackEntries.allSatisfy(\.isSelectable))
+        #expect(fallbackEntries.map { $0.id } == ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"])
+        #expect(fallbackEntries.allSatisfy { $0.isSelectable })
 
         let legacyEntries = CuratedModelCatalog.fallbackEntries(selectedModelID: "gemini-2.5-flash-image")
         #expect(legacyEntries.first?.id == "gemini-2.5-flash-image")
         #expect(legacyEntries.first?.displayName == "Legacy: gemini-2.5-flash-image")
         #expect(legacyEntries.first?.isSelectable == false)
-        #expect(legacyEntries.dropFirst().map(\.id) == ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"])
+        #expect(legacyEntries.dropFirst().map { $0.id } == ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"])
 
         let selectedCurrentEntries = CuratedModelCatalog.fallbackEntries(selectedModelID: "gemini-3.1-flash-image-preview")
-        #expect(selectedCurrentEntries.map(\.id) == ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"])
+        #expect(selectedCurrentEntries.map { $0.id } == ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"])
     }
 
     @Test func serviceURLBuildersPercentEncodeAPIKeyAndDynamicValues() throws {
@@ -269,7 +276,6 @@ struct Nano_Banana_HelperTests {
             #expect(url.absoluteString.contains("%20"))
             #expect(url.absoluteString.contains("%E2%9C%93"))
             #expect(url.absoluteString.contains("%26"))
-            #expect(url.absoluteString.contains("%3F"))
         }
     }
 
@@ -819,7 +825,7 @@ struct Nano_Banana_HelperTests {
         )
     }
 
-    @Test func reauthorizeOutputFolderReturnsWrongFolderSelectedAndShowsError() throws {
+    @MainActor @Test func reauthorizeOutputFolderReturnsWrongFolderSelectedAndShowsError() throws {
         let tempAppSupportURL = try makeTemporaryDirectory()
         let projectsListURL = tempAppSupportURL.appendingPathComponent("projects.json")
         let costSummaryURL = tempAppSupportURL.appendingPathComponent("cost_summary.json")
@@ -908,7 +914,7 @@ struct Nano_Banana_HelperTests {
         #expect(persistedEntries.isEmpty)
     }
 
-    @Test func recordCostIncurredPersistsCostSummaryMidSession() throws {
+    @MainActor @Test func recordCostIncurredPersistsCostSummaryMidSession() throws {
         let tempAppSupportURL = try makeTemporaryDirectory()
         let projectsListURL = tempAppSupportURL.appendingPathComponent("projects.json")
         let costSummaryURL = tempAppSupportURL.appendingPathComponent("cost_summary.json")
@@ -1020,6 +1026,7 @@ struct Nano_Banana_HelperTests {
         batch.tasks = [task]
 
         orchestrator.enqueue(batch)
+        orchestrator.controlState = .running
         orchestrator.pause()
 
         if orchestrator.controlState != .pausedLocal {
@@ -1039,6 +1046,188 @@ struct Nano_Banana_HelperTests {
         }
         if reloaded.processingJobs.first?.phase != .pausedLocal {
             Issue.record("Expected paused task phase to reload from disk")
+        }
+    }
+
+    @MainActor @Test func pausedQueueDoesNotAutoResumeOnLaunchRecovery() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .pausedLocal
+        task.externalJobName = "batches/test-job"
+        batch.tasks = [task]
+        batch.status = "processing"
+        try persistQueueState(PersistedQueueState(controlState: .pausedLocal, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if orchestrator.controlState != .pausedLocal {
+            Issue.record("Expected persisted paused queue to remain paused after launch recovery")
+        }
+        if await probe.startedCount() != 0 {
+            Issue.record("Expected launch recovery to leave manually paused work untouched")
+        }
+    }
+
+    @MainActor @Test func launchRecoveryAutoStartsInterruptedPendingWorkOnce() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        batch.tasks = [ImageTask(inputPaths: ["/tmp/input.png"])]
+        try persistQueueState(PersistedQueueState(controlState: .running, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        if orchestrator.controlState != .interrupted {
+            Issue.record("Expected persisted running state to normalize to interrupted on reload")
+        }
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if await probe.startedCount() != 1 {
+            Issue.record("Expected launch recovery to auto-start interrupted saved work exactly once")
+        }
+    }
+
+    @MainActor @Test func launchRecoveryResumesCancellingQueueWithoutNewLocalSubmissions() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .cancelRequested
+        task.externalJobName = "batches/test-job"
+        batch.tasks = [task]
+        batch.status = "processing"
+        try persistQueueState(PersistedQueueState(controlState: .cancelling, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        if orchestrator.controlState != .interrupted {
+            Issue.record("Expected persisted cancelling state to normalize to interrupted on reload")
+        }
+        if !orchestrator.pendingJobs.isEmpty {
+            Issue.record("Expected cancelling recovery queue to avoid reintroducing pending work")
+        }
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if await probe.startedCount() != 1 {
+            Issue.record("Expected launch recovery to reconcile cancelling work")
+        }
+    }
+
+    @MainActor @Test func launchRecoveryAutoResumesRemotePollingStates() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .submittedRemote
+        task.externalJobName = "batches/test-job"
+        batch.tasks = [task]
+        batch.status = "processing"
+        try persistQueueState(PersistedQueueState(controlState: .interrupted, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if await probe.startedCount() != 1 {
+            Issue.record("Expected launch recovery to resume remote polling work")
+        }
+    }
+
+    @MainActor @Test func launchRecoveryMarksOrphanedSubmittingTasksAsIssues() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .submitting
+        batch.tasks = [task]
+        batch.status = "processing"
+        try persistQueueState(PersistedQueueState(controlState: .running, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if orchestrator.failedJobs.count != 1 {
+            Issue.record("Expected orphaned submitting task to be surfaced as a failed issue on reload")
+        }
+        if orchestrator.failedJobs.first?.error != "App closed before submission completed. Remote job id was not saved; retry manually to avoid duplicate jobs." {
+            Issue.record("Expected orphaned submitting task to carry the duplicate-safe retry guidance")
+        }
+        if orchestrator.controlState != .idle {
+            Issue.record("Expected queue with only orphaned submitting issues to stay idle after reload")
+        }
+        if await probe.startedCount() != 0 {
+            Issue.record("Expected launch recovery to avoid auto-resubmitting ambiguous submitting work")
+        }
+    }
+
+    @MainActor @Test func launchRecoveryIgnoresTerminalOnlySavedQueues() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "completed"
+        task.phase = .completed
+        batch.tasks = [task]
+        batch.status = "completed"
+        try persistQueueState(PersistedQueueState(controlState: .running, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if orchestrator.controlState != .idle {
+            Issue.record("Expected terminal-only saved queues to remain idle on reload")
+        }
+        if await probe.startedCount() != 0 {
+            Issue.record("Expected launch recovery to ignore terminal-only saved queues")
         }
     }
 

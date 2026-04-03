@@ -24,9 +24,16 @@ struct BatchSettings: Sendable {
     }
 }
 
-private struct PersistedQueueState: Codable {
+struct PersistedQueueState: Codable {
     let controlState: QueueControlState
     let batches: [BatchJob]
+}
+
+private struct StartupRecoveryNormalizationResult {
+    let controlState: QueueControlState
+    let shouldAutoResume: Bool
+    let hadAmbiguousSubmittingTasks: Bool
+    let didChangePersistedState: Bool
 }
 
 /// Orchestrates batch processing of image editing tasks
@@ -89,11 +96,19 @@ final class BatchOrchestrator {
     private let bookmarkDependencies: AppPaths.BookmarkResolutionDependencies
     private let autoStartEnqueuedBatches: Bool
     private let processQueueOverride: ProcessQueueOverride?
+    private var activeBatchRunIDs: Set<UUID> = []
+    private var startAllTask: Task<Void, Never>?
+    private var startupRecoveryTask: Task<Void, Never>?
+    private var didAttemptStartupRecovery = false
+    private var shouldAutoResumeRecoveredQueueOnLaunch = false
+    private var startupRecoveryHadAmbiguousSubmittingTasks = false
 
     var onImageCompleted: ((HistoryEntry) -> Void)?
     var onCostIncurred: ((Double, String, UUID, TokenUsage?, String?) -> Void)?
     var onHistoryEntryUpdated: ((String, HistoryEntry) -> Void)?
     var onRestoreSettings: ((HistoryEntry) -> Void)?
+
+    private let ambiguousSubmittingRecoveryMessage = "App closed before submission completed. Remote job id was not saved; retry manually to avoid duplicate jobs."
 
     init(
         service: NanoBananaService = NanoBananaService(),
@@ -155,12 +170,16 @@ final class BatchOrchestrator {
     }
 
     func start(batch: BatchJob) async {
+        guard !activeBatchRunIDs.contains(batch.id) else { return }
         guard batch.tasks.contains(where: { !$0.isTerminal }) else {
             normalizeBatchStatus(batch)
             await refreshControlStateAfterWork()
             return
         }
         guard controlState != .pausedLocal else { return }
+
+        activeBatchRunIDs.insert(batch.id)
+        defer { activeBatchRunIDs.remove(batch.id) }
 
         if !isTesting && Bundle.main.bundleIdentifier != nil {
             _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
@@ -193,6 +212,20 @@ final class BatchOrchestrator {
     }
 
     func startAll() async {
+        if let startAllTask {
+            await startAllTask.value
+            return
+        }
+
+        let task = Task { @MainActor in
+            await self.performStartAll()
+        }
+        startAllTask = task
+        await task.value
+        startAllTask = nil
+    }
+
+    private func performStartAll() async {
         guard !activeBatches.isEmpty else {
             controlState = .idle
             statusMessage = "Ready"
@@ -224,6 +257,36 @@ final class BatchOrchestrator {
         await refreshControlStateAfterWork()
         saveActiveBatches()
         updateProgress()
+    }
+
+    func recoverSavedQueueOnLaunchIfNeeded() async {
+        if let startupRecoveryTask {
+            await startupRecoveryTask.value
+            return
+        }
+
+        if let startAllTask {
+            didAttemptStartupRecovery = true
+            shouldAutoResumeRecoveredQueueOnLaunch = false
+            await startAllTask.value
+            return
+        }
+
+        guard !didAttemptStartupRecovery else { return }
+        didAttemptStartupRecovery = true
+
+        guard shouldAutoResumeRecoveredQueueOnLaunch else { return }
+
+        let task = Task { @MainActor in
+            guard self.shouldAutoResumeRecoveredQueueOnLaunch else { return }
+            self.statusMessage = "Recovering saved queue..."
+            self.saveActiveBatches()
+            await self.startAll()
+            self.shouldAutoResumeRecoveredQueueOnLaunch = false
+        }
+        startupRecoveryTask = task
+        await task.value
+        startupRecoveryTask = nil
     }
 
     func pause() {
@@ -994,6 +1057,10 @@ final class BatchOrchestrator {
     }
 
     private func refreshControlStateAfterWork() async {
+        recomputeControlStateAfterWork()
+    }
+
+    private func recomputeControlStateAfterWork() {
         if activeBatches.isEmpty {
             controlState = .idle
             statusMessage = "Ready"
@@ -1137,15 +1204,34 @@ final class BatchOrchestrator {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
 
+            let persistedControlState: QueueControlState
+
             if let persistedState = try? decoder.decode(PersistedQueueState.self, from: data) {
                 activeBatches = persistedState.batches
-                controlState = persistedState.controlState
+                persistedControlState = persistedState.controlState
             } else if let batches = try? decoder.decode([BatchJob].self, from: data) {
                 activeBatches = batches
-                controlState = inferredControlState(from: batches)
+                persistedControlState = inferredControlState(from: batches)
             } else if let singleBatch = try? decoder.decode(BatchJob.self, from: data) {
                 activeBatches = [singleBatch]
-                controlState = inferredControlState(from: [singleBatch])
+                persistedControlState = inferredControlState(from: [singleBatch])
+            } else {
+                return
+            }
+
+            let normalization = normalizeLoadedQueueState(persistedControlState: persistedControlState)
+            controlState = normalization.controlState
+            shouldAutoResumeRecoveredQueueOnLaunch = normalization.shouldAutoResume
+            startupRecoveryHadAmbiguousSubmittingTasks = normalization.hadAmbiguousSubmittingTasks
+
+            recomputeControlStateAfterWork()
+
+            if startupRecoveryHadAmbiguousSubmittingTasks && !activeBatches.contains(where: { $0.tasks.contains(where: { !$0.isTerminal }) }) {
+                statusMessage = "Saved queue has submission issues. Retry failed items manually."
+            } else if controlState == .pausedLocal {
+                statusMessage = "Paused locally"
+            } else if shouldAutoResumeRecoveredQueueOnLaunch {
+                statusMessage = "Recovered queue is ready to resume"
             }
 
             Task {
@@ -1154,13 +1240,57 @@ final class BatchOrchestrator {
                 }
             }
 
-            if !activeBatches.isEmpty, statusMessage == "Ready" {
-                statusMessage = controlState == .pausedLocal ? "Paused locally" : "Resumed sessions"
+            if normalization.didChangePersistedState {
+                saveActiveBatches()
             }
             updateProgress()
         } catch {
             print("Failed to load active batches: \(error)")
         }
+    }
+
+    private func normalizeLoadedQueueState(persistedControlState: QueueControlState) -> StartupRecoveryNormalizationResult {
+        var didChangePersistedState = false
+        var hadAmbiguousSubmittingTasks = false
+
+        for batch in activeBatches {
+            for task in batch.tasks {
+                if task.phase == .submitting && task.externalJobName == nil {
+                    task.status = "failed"
+                    task.phase = .failed
+                    task.error = ambiguousSubmittingRecoveryMessage
+                    task.cancelRequestedAt = nil
+                    task.stalledAt = nil
+                    hadAmbiguousSubmittingTasks = true
+                    didChangePersistedState = true
+                } else if task.phase == .submitting && task.externalJobName != nil {
+                    task.phase = .submittedRemote
+                    didChangePersistedState = true
+                }
+            }
+            normalizeBatchStatus(batch)
+        }
+
+        let normalizedControlState: QueueControlState
+        switch persistedControlState {
+        case .pausedLocal, .idle:
+            normalizedControlState = persistedControlState
+        case .running, .resuming, .cancelling, .interrupted:
+            normalizedControlState = .interrupted
+            if persistedControlState != .interrupted {
+                didChangePersistedState = true
+            }
+        }
+
+        let hasNonTerminalTasks = activeBatches.contains { $0.tasks.contains(where: { !$0.isTerminal }) }
+        let shouldAutoResume = normalizedControlState != .pausedLocal && hasNonTerminalTasks
+
+        return StartupRecoveryNormalizationResult(
+            controlState: hasNonTerminalTasks ? normalizedControlState : .idle,
+            shouldAutoResume: shouldAutoResume,
+            hadAmbiguousSubmittingTasks: hadAmbiguousSubmittingTasks,
+            didChangePersistedState: didChangePersistedState
+        )
     }
 
     private func inferredControlState(from batches: [BatchJob]) -> QueueControlState {

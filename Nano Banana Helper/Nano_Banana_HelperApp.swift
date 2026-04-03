@@ -9,12 +9,19 @@ import SwiftUI
 
 @main
 struct Nano_Banana_HelperApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var orchestrator = BatchOrchestrator()
     
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environment(orchestrator)
+        }
+        .onChange(of: scenePhase) { _, newValue in
+            guard newValue == .active else { return }
+            Task {
+                await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+            }
         }
         .commands {
             CommandGroup(after: .newItem) {

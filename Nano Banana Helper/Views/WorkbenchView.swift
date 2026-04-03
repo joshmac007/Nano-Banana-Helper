@@ -89,18 +89,7 @@ struct WorkbenchView: View {
     }
 
     private func reuseEntry(_ entry: HistoryEntry) {
-        stagingManager.prompt = entry.prompt
-        stagingManager.systemPrompt = entry.systemPrompt ?? ""
-        stagingManager.aspectRatio = entry.aspectRatio
-        stagingManager.imageSize = entry.imageSize
-        stagingManager.isBatchTier = entry.usedBatchTier
+        stagingManager.restore(from: entry)
         selectedTab = .staging
-
-        for path in entry.sourceImagePaths {
-            let url = URL(fileURLWithPath: path)
-            if FileManager.default.fileExists(atPath: path) {
-                stagingManager.addFiles([url])
-            }
-        }
     }
 }

@@ -18,9 +18,15 @@ struct BatchSettings: Sendable {
     let outputDirectory: String
     let useBatchTier: Bool
     let projectId: UUID?
+    let modelName: String?
 
     func cost(inputCount: Int) -> Double {
-        ImageSize.calculateCost(imageSize: imageSize, inputCount: inputCount, isBatchTier: useBatchTier)
+        ImageSize.calculateCost(
+            imageSize: imageSize,
+            inputCount: inputCount,
+            isBatchTier: useBatchTier,
+            modelName: modelName
+        )
     }
 }
 
@@ -160,7 +166,8 @@ final class BatchOrchestrator {
             imageSize: imageSize,
             outputDirectory: outputDirectory,
             useBatchTier: useBatchTier,
-            projectId: projectId
+            projectId: projectId,
+            modelName: AppConfig.load().modelName ?? AppPricing.defaultModelName
         )
         batch.isTextMode = true
         batch.tasks = (0..<imageCount).map { _ in
@@ -416,7 +423,8 @@ final class BatchOrchestrator {
             imageSize: batch.imageSize,
             outputDirectory: batch.outputDirectory,
             useBatchTier: batch.useBatchTier,
-            projectId: batch.projectId
+            projectId: batch.projectId,
+            modelName: batch.modelName
         )
 
         if controlState != .cancelling {
@@ -616,7 +624,7 @@ final class BatchOrchestrator {
                         cost: 0,
                         status: "processing",
                         externalJobName: jobInfo.jobName,
-                        modelName: AppConfig.load().modelName,
+                        modelName: settings.modelName,
                         systemPrompt: settings.systemPrompt
                     )
                     onImageCompleted?(entry)
@@ -782,7 +790,6 @@ final class BatchOrchestrator {
             job.cancelRequestedAt = nil
 
             let cost = settings.cost(inputCount: job.inputPaths.count)
-            let currentModelName = await service.getModelName()
             if let projectId = settings.projectId {
                 let sourceBookmarks = job.inputBookmarks ?? []
                 let outputBookmark = AppPaths.bookmark(for: outputURL)
@@ -798,10 +805,10 @@ final class BatchOrchestrator {
                     sourceImageBookmarks: sourceBookmarks.isEmpty ? nil : sourceBookmarks,
                     outputImageBookmark: outputBookmark,
                     tokenUsage: response.tokenUsage,
-                    modelName: currentModelName
+                    modelName: settings.modelName
                 )
                 persistHistoryEntry(historyEntry, externalJobName: jobName)
-                onCostIncurred?(cost, settings.imageSize, projectId, response.tokenUsage, currentModelName)
+                onCostIncurred?(cost, settings.imageSize, projectId, response.tokenUsage, settings.modelName)
             }
 
             if completedDespiteCancel {
@@ -837,7 +844,7 @@ final class BatchOrchestrator {
                 sourceImageBookmarks: nil,
                 outputImageBookmark: nil,
                 tokenUsage: nil,
-                modelName: await service.getModelName()
+                modelName: settings.modelName
             )
             persistHistoryEntry(historyEntry, externalJobName: job.externalJobName ?? jobName)
         }
@@ -868,7 +875,7 @@ final class BatchOrchestrator {
                 sourceImageBookmarks: nil,
                 outputImageBookmark: nil,
                 tokenUsage: nil,
-                modelName: await service.getModelName()
+                modelName: settings.modelName
             )
             persistHistoryEntry(historyEntry, externalJobName: job.externalJobName ?? jobName)
         }
@@ -900,7 +907,7 @@ final class BatchOrchestrator {
                 sourceImageBookmarks: nil,
                 outputImageBookmark: nil,
                 tokenUsage: nil,
-                modelName: await service.getModelName()
+                modelName: settings.modelName
             )
             persistHistoryEntry(historyEntry, externalJobName: job.externalJobName)
         }
@@ -972,7 +979,7 @@ final class BatchOrchestrator {
                 status: "cancelled",
                 error: "Cancelled by user",
                 externalJobName: job.externalJobName,
-                modelName: AppConfig.load().modelName,
+                modelName: batch?.modelName,
                 systemPrompt: batch?.systemPrompt
             )
             persistHistoryEntry(entry, externalJobName: job.externalJobName)
@@ -1084,7 +1091,13 @@ final class BatchOrchestrator {
 
         if activeBatches.contains(where: { batch in
             batch.tasks.contains { task in
-                task.hasRemoteJob && !task.isTerminal && (task.phase == .stalled || task.phase == .reconnecting)
+                task.hasRemoteJob && !task.isTerminal && (
+                    task.phase == .stalled || 
+                    task.phase == .reconnecting || 
+                    task.phase == .cancelRequested || 
+                    task.phase == .submittedRemote || 
+                    task.phase == .pausedLocal
+                )
             }
         }) {
             controlState = .interrupted
@@ -1190,7 +1203,9 @@ final class BatchOrchestrator {
             return
         }
         do {
-            let data = try JSONEncoder().encode(PersistedQueueState(controlState: controlState, batches: activeBatches))
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(PersistedQueueState(controlState: controlState, batches: activeBatches))
             try data.write(to: activeBatchURL)
         } catch {
             print("Failed to save active batches: \(error)")
@@ -1378,11 +1393,13 @@ final class BatchOrchestrator {
 
         let batch = BatchJob(
             prompt: entry.prompt,
+            systemPrompt: entry.systemPrompt,
             aspectRatio: entry.aspectRatio,
             imageSize: entry.imageSize,
             outputDirectory: outputDir,
             useBatchTier: entry.usedBatchTier,
-            projectId: entry.projectId
+            projectId: entry.projectId,
+            modelName: entry.modelName
         )
         batch.tasks = [task]
         batch.status = "pending"

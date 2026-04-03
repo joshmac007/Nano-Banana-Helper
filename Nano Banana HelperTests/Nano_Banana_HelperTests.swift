@@ -51,11 +51,80 @@ struct Nano_Banana_HelperTests {
         Project(name: "Test Project", outputDirectory: "/tmp")
     }
 
+    private func makeTemporaryFile(in directory: URL, named name: String, contents: Data = Data()) throws -> URL {
+        let url = directory.appendingPathComponent(name)
+        guard FileManager.default.createFile(atPath: url.path, contents: contents) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        return url
+    }
+
+    private func makeRestoreEntry(
+        projectId: UUID = UUID(),
+        sourceImagePaths: [String],
+        sourceImageBookmarks: [Data]? = nil,
+        prompt: String = "prompt",
+        systemPrompt: String? = "system",
+        aspectRatio: String = "16:9",
+        imageSize: String = "2K",
+        usedBatchTier: Bool = false
+    ) -> HistoryEntry {
+        HistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: sourceImagePaths,
+            outputImagePath: "/tmp/output.png",
+            prompt: prompt,
+            aspectRatio: aspectRatio,
+            imageSize: imageSize,
+            usedBatchTier: usedBatchTier,
+            cost: 1,
+            sourceImageBookmarks: sourceImageBookmarks,
+            systemPrompt: systemPrompt
+        )
+    }
+
+    @MainActor
     private func persistQueueState(_ state: PersistedQueueState, to url: URL) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(state)
         try data.write(to: url)
+    }
+
+    private func loadPersistedQueueState(from url: URL) throws -> PersistedQueueState {
+        let data = try Data(contentsOf: url)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(PersistedQueueState.self, from: data)
+    }
+
+    @MainActor
+    private func withStoredModelName<T>(
+        _ modelName: String?,
+        perform: () async throws -> T
+    ) async rethrows -> T {
+        let fileManager = FileManager.default
+        let configURL = AppConfig.fileURL
+        let originalData = try? Data(contentsOf: configURL)
+
+        try? fileManager.createDirectory(
+            at: configURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        var config = AppConfig.load()
+        config.modelName = modelName
+        config.save()
+
+        defer {
+            if let originalData {
+                try? originalData.write(to: configURL)
+            } else {
+                try? fileManager.removeItem(at: configURL)
+            }
+        }
+
+        return try await perform()
     }
 
     @Test func example() async throws {
@@ -138,6 +207,245 @@ struct Nano_Banana_HelperTests {
         #expect(entry.tokenUsage?.candidatesTokenCount == 80)
         #expect(entry.tokenUsage?.totalTokenCount == 280)
         #expect(entry.modelName == "gemini-3.1-flash-image-preview")
+    }
+
+    @Test func appPricingResolvesKnownAliasAndFallbackModels() {
+        let pro = AppPricing.pricing(for: "gemini-3-pro-image-preview")
+        #expect(pro.pricingModelName == "gemini-3-pro-image-preview")
+        #expect(pro.pricingDisplayName == "Nano Banana Pro")
+        #expect(pro.isFallback == false)
+
+        let alias = AppPricing.pricing(for: "gemini-3.1-flash-image-preview")
+        #expect(alias.pricingModelName == "gemini-2.5-flash-image")
+        #expect(alias.pricingDisplayName == "Nano Banana")
+        #expect(alias.isFallback == false)
+
+        let unknown = AppPricing.pricing(for: "legacy-image-model")
+        #expect(unknown.pricingModelName == "gemini-2.5-flash-image")
+        #expect(unknown.isFallback)
+
+        let missing = AppPricing.pricing(for: nil)
+        #expect(missing.pricingModelName == "gemini-2.5-flash-image")
+        #expect(missing.isFallback)
+    }
+
+    @Test func appPricingUsesModelAwareRates() {
+        #expect(AppPricing.inputRate(modelName: "gemini-3-pro-image-preview", isBatchTier: false) == 0.0011)
+        #expect(AppPricing.inputRate(modelName: "gemini-3-pro-image-preview", isBatchTier: true) == 0.0006)
+        #expect(AppPricing.outputRate(for: .size4K, modelName: "gemini-3-pro-image-preview", isBatchTier: false) == 0.24)
+        #expect(AppPricing.outputRate(for: .size2K, modelName: "gemini-3-pro-image-preview", isBatchTier: true) == 0.067)
+
+        #expect(AppPricing.inputRate(modelName: "gemini-2.5-flash-image", isBatchTier: false) == 0.000168)
+        #expect(AppPricing.inputRate(modelName: "gemini-2.5-flash-image", isBatchTier: true) == 0.000084)
+        #expect(AppPricing.outputRate(for: .size1K, modelName: "gemini-2.5-flash-image", isBatchTier: false) == 0.039)
+        #expect(AppPricing.outputRate(for: .size1K, modelName: "gemini-2.5-flash-image", isBatchTier: true) == 0.0195)
+
+        #expect(AppPricing.outputFallbackRate(modelName: "legacy-image-model", isBatchTier: false) == 0.039)
+    }
+
+    @Test func imageSizeCostCalculationsUseSelectedModelRates() {
+        let proImageCost = ImageSize.calculateCost(
+            imageSize: "2K",
+            inputCount: 2,
+            isBatchTier: false,
+            modelName: "gemini-3-pro-image-preview"
+        )
+        let flashImageCost = ImageSize.calculateCost(
+            imageSize: "2K",
+            inputCount: 2,
+            isBatchTier: false,
+            modelName: "gemini-2.5-flash-image"
+        )
+        let flashTextCost = ImageSize.calculateTextModeCost(
+            imageSize: "1K",
+            outputCount: 3,
+            isBatchTier: true,
+            modelName: "gemini-2.5-flash-image"
+        )
+
+        #expect(proImageCost == 0.1362)
+        #expect(flashImageCost == 0.078336)
+        #expect(flashTextCost == 0.0585)
+        #expect(proImageCost > flashImageCost)
+    }
+
+    @Test func batchJobBackwardCompatibilityDecodesMissingModelName() throws {
+        let json = """
+        {
+            "id": "00000000-0000-0000-0000-000000000011",
+            "createdAt": "2026-01-15T10:00:00Z",
+            "projectId": "00000000-0000-0000-0000-000000000022",
+            "prompt": "test prompt",
+            "systemPrompt": "system",
+            "aspectRatio": "16:9",
+            "imageSize": "2K",
+            "outputDirectory": "/tmp",
+            "useBatchTier": true,
+            "status": "pending",
+            "tasks": [],
+            "isTextMode": false
+        }
+        """.data(using: .utf8)!
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let batch = try decoder.decode(BatchJob.self, from: json)
+
+        #expect(batch.modelName == nil)
+        #expect(batch.imageSize == "2K")
+        #expect(batch.useBatchTier)
+    }
+
+    @Test func batchJobRoundTripsModelName() throws {
+        let batch = BatchJob(
+            prompt: "prompt",
+            systemPrompt: "system",
+            aspectRatio: "1:1",
+            imageSize: "4K",
+            outputDirectory: "/tmp",
+            useBatchTier: true,
+            projectId: UUID(),
+            modelName: "gemini-3-pro-image-preview"
+        )
+        batch.isTextMode = true
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(batch)
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(BatchJob.self, from: data)
+
+        #expect(decoded.modelName == "gemini-3-pro-image-preview")
+        #expect(decoded.isTextMode)
+        #expect(decoded.systemPrompt == "system")
+    }
+
+    @MainActor @Test func stagingRestoreImageEntryRestoresImageModeSettingsAndFiles() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "input.png")
+        let bookmark = Data("bookmark-a".utf8)
+        let entry = makeRestoreEntry(
+            sourceImagePaths: [sourceURL.path],
+            sourceImageBookmarks: [bookmark],
+            prompt: "new prompt",
+            systemPrompt: "new system",
+            aspectRatio: "Auto",
+            imageSize: "4K",
+            usedBatchTier: true
+        )
+
+        let manager = BatchStagingManager()
+        manager.generationMode = .text
+        manager.textImageCount = 4
+        manager.prompt = "old prompt"
+        manager.stagedFiles = [URL(fileURLWithPath: "/tmp/stale.png")]
+        manager.stagedBookmarks = [URL(fileURLWithPath: "/tmp/stale.png"): Data("stale".utf8)]
+
+        manager.restore(from: entry)
+
+        #expect(manager.generationMode == .image)
+        #expect(manager.prompt == "new prompt")
+        #expect(manager.systemPrompt == "new system")
+        #expect(manager.aspectRatio == "Auto")
+        #expect(manager.imageSize == "4K")
+        #expect(manager.isBatchTier)
+        #expect(manager.textImageCount == 1)
+        #expect(manager.stagedFiles == [sourceURL])
+        #expect(manager.stagedBookmarks[sourceURL] == bookmark)
+        #expect(manager.isMultiInput == false)
+    }
+
+    @MainActor @Test func stagingRestoreImageEntryEnablesMultiInputForMultipleSources() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "first.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "second.png")
+        let entry = makeRestoreEntry(sourceImagePaths: [firstURL.path, secondURL.path])
+
+        let manager = BatchStagingManager()
+        manager.restore(from: entry)
+
+        #expect(manager.generationMode == .image)
+        #expect(manager.stagedFiles == [firstURL, secondURL])
+        #expect(manager.isMultiInput)
+    }
+
+    @MainActor @Test func stagingRestoreTextEntryClearsFilesAndSwitchesToTextMode() {
+        let manager = BatchStagingManager()
+        let staleURL = URL(fileURLWithPath: "/tmp/stale.png")
+        manager.generationMode = .image
+        manager.textImageCount = 3
+        manager.isMultiInput = true
+        manager.stagedFiles = [staleURL]
+        manager.stagedBookmarks = [staleURL: Data("stale".utf8)]
+
+        manager.restore(from: makeRestoreEntry(sourceImagePaths: [], prompt: "text prompt"))
+
+        #expect(manager.generationMode == .text)
+        #expect(manager.prompt == "text prompt")
+        #expect(manager.stagedFiles.isEmpty)
+        #expect(manager.stagedBookmarks.isEmpty)
+        #expect(manager.isMultiInput == false)
+        #expect(manager.textImageCount == 1)
+    }
+
+    @MainActor @Test func stagingRestoreReplacesPreviousStagedStateInsteadOfAppending() throws {
+        let directory = try makeTemporaryDirectory()
+        let restoredURL = try makeTemporaryFile(in: directory, named: "restored.png")
+        let entry = makeRestoreEntry(sourceImagePaths: [restoredURL.path])
+
+        let manager = BatchStagingManager()
+        let staleURL = URL(fileURLWithPath: "/tmp/stale.png")
+        manager.stagedFiles = [staleURL]
+        manager.stagedBookmarks = [staleURL: Data("stale".utf8)]
+
+        manager.restore(from: entry)
+
+        #expect(manager.stagedFiles == [restoredURL])
+        #expect(manager.stagedBookmarks[staleURL] == nil)
+        #expect(manager.stagedBookmarks.count == 0)
+    }
+
+    @MainActor @Test func stagingRestoreMissingImageSourcesStillRestoresSettings() {
+        let entry = makeRestoreEntry(
+            sourceImagePaths: ["/tmp/does-not-exist.png"],
+            prompt: "restored prompt",
+            systemPrompt: "restored system",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true
+        )
+
+        let manager = BatchStagingManager()
+        manager.restore(from: entry)
+
+        #expect(manager.generationMode == .image)
+        #expect(manager.prompt == "restored prompt")
+        #expect(manager.systemPrompt == "restored system")
+        #expect(manager.aspectRatio == "1:1")
+        #expect(manager.imageSize == "1K")
+        #expect(manager.isBatchTier)
+        #expect(manager.stagedFiles.isEmpty)
+        #expect(manager.isMultiInput == false)
+    }
+
+    @MainActor @Test func stagingRestoreAlignsBookmarksBySourceIndex() throws {
+        let directory = try makeTemporaryDirectory()
+        let restoredURL = try makeTemporaryFile(in: directory, named: "second.png")
+        let firstBookmark = Data("bookmark-a".utf8)
+        let secondBookmark = Data("bookmark-b".utf8)
+        let entry = makeRestoreEntry(
+            sourceImagePaths: ["/tmp/missing-first.png", restoredURL.path],
+            sourceImageBookmarks: [firstBookmark, secondBookmark]
+        )
+
+        let manager = BatchStagingManager()
+        manager.restore(from: entry)
+
+        #expect(manager.stagedFiles == [restoredURL])
+        #expect(manager.stagedBookmarks[restoredURL] == secondBookmark)
+        #expect(manager.stagedBookmarks[restoredURL] != firstBookmark)
     }
 
     @MainActor @Test func costSummaryBackwardCompatibility() throws {
@@ -958,6 +1266,150 @@ struct Nano_Banana_HelperTests {
         if manager.sessionImageCount != 1 {
             Issue.record("Expected sessionImageCount to remain 1")
         }
+    }
+
+    @Test func costEstimatorViewUsesModelAwareTotalsAndFallbackWarning() {
+        let proEstimator = CostEstimatorView(
+            imageCount: 2,
+            imageSize: "2K",
+            isBatchTier: false,
+            isMultiInput: false,
+            generationMode: .image,
+            modelName: "gemini-3-pro-image-preview"
+        )
+        let flashEstimator = CostEstimatorView(
+            imageCount: 2,
+            imageSize: "2K",
+            isBatchTier: false,
+            isMultiInput: false,
+            generationMode: .image,
+            modelName: "gemini-2.5-flash-image"
+        )
+        let fallbackEstimator = CostEstimatorView(
+            imageCount: 1,
+            imageSize: "1K",
+            isBatchTier: true,
+            isMultiInput: false,
+            generationMode: .text,
+            modelName: "legacy-image-model"
+        )
+
+        #expect(proEstimator.totalCost == 0.2704)
+        #expect(flashEstimator.totalCost == 0.156336)
+        #expect(proEstimator.totalCost > flashEstimator.totalCost)
+        #expect(fallbackEstimator.fallbackPricingDescription == "Using Nano Banana pricing fallback.")
+    }
+
+    @MainActor @Test func enqueueTextGenerationLocksConfiguredModelName() async throws {
+        try await withStoredModelName("gemini-3-pro-image-preview") {
+            let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+            let orchestrator = BatchOrchestrator(
+                activeBatchURL: activeBatchURL,
+                autoStartEnqueuedBatches: false
+            )
+
+            orchestrator.enqueueTextGeneration(
+                prompt: "prompt",
+                aspectRatio: "16:9",
+                imageSize: "2K",
+                outputDirectory: "/tmp",
+                useBatchTier: true,
+                imageCount: 2,
+                projectId: UUID()
+            )
+
+            let persistedState = try loadPersistedQueueState(from: activeBatchURL)
+            #expect(persistedState.batches.count == 1)
+            #expect(persistedState.batches.first?.modelName == "gemini-3-pro-image-preview")
+            #expect(persistedState.batches.first?.isTextMode == true)
+        }
+    }
+
+    @MainActor @Test func cancelUsesLockedBatchModelNameInsteadOfCurrentConfig() async throws {
+        try await withStoredModelName("gemini-3-pro-image-preview") {
+            let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+            let orchestrator = BatchOrchestrator(
+                activeBatchURL: activeBatchURL,
+                autoStartEnqueuedBatches: false
+            )
+            let projectId = UUID()
+            let batch = BatchJob(
+                prompt: "prompt",
+                outputDirectory: "/tmp",
+                projectId: projectId,
+                modelName: AppConfig.load().modelName ?? AppPricing.defaultModelName
+            )
+            let task = ImageTask(inputPaths: ["/tmp/input.png"], projectId: projectId)
+            batch.tasks = [task]
+
+            var capturedEntry: HistoryEntry?
+            orchestrator.onImageCompleted = { entry in
+                capturedEntry = entry
+            }
+
+            orchestrator.enqueue(batch)
+
+            var config = AppConfig.load()
+            config.modelName = "gemini-2.5-flash-image"
+            config.save()
+
+            orchestrator.cancel(batch: batch)
+
+            #expect(capturedEntry?.modelName == "gemini-3-pro-image-preview")
+            #expect(capturedEntry?.status == "cancelled")
+        }
+    }
+
+    @MainActor @Test func resumePollingFromHistoryPreservesSavedModelName() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/input.png"],
+            outputImagePath: "/tmp/output.png",
+            prompt: "prompt",
+            aspectRatio: "16:9",
+            imageSize: "2K",
+            usedBatchTier: true,
+            cost: 1,
+            status: "processing",
+            externalJobName: "batches/test-job",
+            modelName: "gemini-3-pro-image-preview"
+        )
+
+        orchestrator.resumePollingFromHistory(for: entry)
+
+        let persistedState = try loadPersistedQueueState(from: activeBatchURL)
+        #expect(persistedState.batches.first?.modelName == "gemini-3-pro-image-preview")
+        #expect(persistedState.batches.first?.systemPrompt == nil)
+    }
+
+    @MainActor @Test func resumePollingFromLegacyHistoryLeavesModelNameNil() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/input.png"],
+            outputImagePath: "/tmp/output.png",
+            prompt: "prompt",
+            aspectRatio: "16:9",
+            imageSize: "2K",
+            usedBatchTier: false,
+            cost: 1,
+            status: "processing",
+            externalJobName: "batches/test-job"
+        )
+
+        orchestrator.resumePollingFromHistory(for: entry)
+
+        let persistedState = try loadPersistedQueueState(from: activeBatchURL)
+        #expect(persistedState.batches.first?.modelName == nil)
     }
 
     @MainActor @Test func cancelHandlesSubmittingPhaseTasks() throws {

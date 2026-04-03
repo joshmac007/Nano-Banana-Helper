@@ -533,6 +533,7 @@ private struct ResultsPromptMetadataView: View {
                     .foregroundStyle(.secondary)
                     .textCase(.uppercase)
                 Spacer()
+                metadataChip(entry.generationDescription, tint: entry.isTextToImage ? .blue : .secondary)
                 if let modelName = entry.modelName {
                     Text(modelName)
                         .font(.caption2)
@@ -540,9 +541,15 @@ private struct ResultsPromptMetadataView: View {
                 }
             }
 
-            Text(entry.prompt)
-                .font(.body)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Prompt")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                Text(entry.prompt)
+                    .font(.body)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             if let systemPrompt = entry.systemPrompt, !systemPrompt.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
@@ -579,6 +586,16 @@ private struct ResultsPromptMetadataView: View {
                 .fontWeight(.medium)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func metadataChip(_ text: String, tint: Color) -> some View {
+        Text(text)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(tint.opacity(0.12))
+            .clipShape(Capsule())
     }
 }
 

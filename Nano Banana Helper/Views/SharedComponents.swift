@@ -28,13 +28,19 @@ struct CostEstimatorView: View {
     let generationMode: GenerationMode
     let modelName: String?
     
-    private var inputCostPerImage: Double { AppPricing.inputRate(isBatchTier: isBatchTier) }
+    var pricingResolution: AppPricing.PricingResolution {
+        AppPricing.pricing(for: modelName)
+    }
+
+    var inputCostPerImage: Double {
+        AppPricing.inputRate(modelName: modelName, isBatchTier: isBatchTier)
+    }
     
-    private var outputCostPerImage: Double {
+    var outputCostPerImage: Double {
         guard let size = ImageSize(rawValue: imageSize) else {
-            return AppPricing.outputFallbackRate(isBatchTier: isBatchTier)
+            return AppPricing.outputFallbackRate(modelName: modelName, isBatchTier: isBatchTier)
         }
-        return size.cost(isBatchTier: isBatchTier)
+        return size.cost(modelName: modelName, isBatchTier: isBatchTier)
     }
     
     /// Number of output images: 1 if Multi-Input, otherwise same as input count
@@ -42,7 +48,7 @@ struct CostEstimatorView: View {
         isMultiInput ? 1 : imageCount
     }
     
-    private var totalCost: Double {
+    var totalCost: Double {
         switch generationMode {
         case .image:
             // Input cost: charged per input image
@@ -56,7 +62,7 @@ struct CostEstimatorView: View {
         }
     }
 
-    private var inputTotalCost: Double {
+    var inputTotalCost: Double {
         switch generationMode {
         case .image:
             return Double(imageCount) * inputCostPerImage
@@ -65,13 +71,18 @@ struct CostEstimatorView: View {
         }
     }
 
-    private var outputTotalCost: Double {
+    var outputTotalCost: Double {
         switch generationMode {
         case .image:
             return Double(outputCount) * outputCostPerImage
         case .text:
             return Double(imageCount) * outputCostPerImage
         }
+    }
+
+    var fallbackPricingDescription: String? {
+        guard pricingResolution.isFallback else { return nil }
+        return "Using \(pricingResolution.pricingDisplayName) pricing fallback."
     }
     
     var body: some View {
@@ -134,6 +145,12 @@ struct CostEstimatorView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
+            }
+
+            if let fallbackPricingDescription {
+                Text(fallbackPricingDescription)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
             }
         }
         .padding(12)

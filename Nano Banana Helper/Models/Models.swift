@@ -138,6 +138,18 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         // Use AppPaths scoped helpers for image loading and Finder operations.
         return URL(fileURLWithPath: outputImagePath)
     }
+
+    var hasSourceImages: Bool {
+        sourceImagePaths.contains { !$0.isEmpty }
+    }
+
+    var isTextToImage: Bool {
+        !hasSourceImages
+    }
+
+    var generationDescription: String {
+        isTextToImage ? "Text to Image" : "Image to Image"
+    }
     
     enum CodingKeys: String, CodingKey {
         case id, projectId, timestamp, sourceImagePaths, outputImagePath
@@ -371,6 +383,7 @@ class BatchJob: Identifiable, Codable {
     let id: UUID
     let createdAt: Date
     var projectId: UUID?
+    var modelName: String?
     var prompt: String
     var systemPrompt: String? // Added
     var aspectRatio: String
@@ -382,7 +395,7 @@ class BatchJob: Identifiable, Codable {
     var isTextMode: Bool = false // For text-to-image generation
 
     enum CodingKeys: String, CodingKey {
-        case id, createdAt, projectId, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, useBatchTier, status, tasks, isTextMode
+        case id, createdAt, projectId, modelName, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, useBatchTier, status, tasks, isTextMode
     }
 
     required init(from decoder: Decoder) throws {
@@ -390,6 +403,7 @@ class BatchJob: Identifiable, Codable {
         id = try container.decode(UUID.self, forKey: .id)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         projectId = try container.decodeIfPresent(UUID.self, forKey: .projectId)
+        modelName = try container.decodeIfPresent(String.self, forKey: .modelName)
         prompt = try container.decode(String.self, forKey: .prompt)
         systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt) // Decode if present
         aspectRatio = try container.decode(String.self, forKey: .aspectRatio)
@@ -406,6 +420,7 @@ class BatchJob: Identifiable, Codable {
         try container.encode(id, forKey: .id)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(projectId, forKey: .projectId)
+        try container.encodeIfPresent(modelName, forKey: .modelName)
         try container.encode(prompt, forKey: .prompt)
         try container.encode(systemPrompt, forKey: .systemPrompt)
         try container.encode(aspectRatio, forKey: .aspectRatio)
@@ -424,11 +439,13 @@ class BatchJob: Identifiable, Codable {
         imageSize: String = "4K",
         outputDirectory: String,
         useBatchTier: Bool = false,
-        projectId: UUID? = nil
+        projectId: UUID? = nil,
+        modelName: String? = nil
     ) {
         self.id = UUID()
         self.createdAt = Date()
         self.projectId = projectId
+        self.modelName = modelName
         self.prompt = prompt
         self.systemPrompt = systemPrompt
         self.aspectRatio = aspectRatio
@@ -453,10 +470,16 @@ class BatchJob: Identifiable, Codable {
             return ImageSize.calculateTextModeCost(
                 imageSize: imageSize,
                 outputCount: 1,
-                isBatchTier: useBatchTier
+                isBatchTier: useBatchTier,
+                modelName: modelName
             )
         }
-        return ImageSize.calculateCost(imageSize: imageSize, inputCount: task.inputPaths.count, isBatchTier: useBatchTier)
+        return ImageSize.calculateCost(
+            imageSize: imageSize,
+            inputCount: task.inputPaths.count,
+            isBatchTier: useBatchTier,
+            modelName: modelName
+        )
     }
 }
 
@@ -669,36 +692,36 @@ enum ImageSize: String, CaseIterable, Identifiable {
     
     /// Output cost per image for standard tier
     var standardCost: Double {
-        AppPricing.outputRate(for: self, isBatchTier: false)
+        AppPricing.outputRate(for: self, modelName: nil, isBatchTier: false)
     }
     
     /// Output cost per image for batch tier (50% off)
     var batchCost: Double {
-        AppPricing.outputRate(for: self, isBatchTier: true)
+        AppPricing.outputRate(for: self, modelName: nil, isBatchTier: true)
     }
     
     /// Get cost for given tier
-    func cost(isBatchTier: Bool) -> Double {
-        isBatchTier ? batchCost : standardCost
+    func cost(modelName: String?, isBatchTier: Bool) -> Double {
+        AppPricing.outputRate(for: self, modelName: modelName, isBatchTier: isBatchTier)
     }
     
     /// Calculate total cost including input images
-    static func calculateCost(imageSize: String, inputCount: Int, isBatchTier: Bool) -> Double {
-        let inputRate = AppPricing.inputRate(isBatchTier: isBatchTier)
+    static func calculateCost(imageSize: String, inputCount: Int, isBatchTier: Bool, modelName: String?) -> Double {
+        let inputRate = AppPricing.inputRate(modelName: modelName, isBatchTier: isBatchTier)
         let inputCost = inputRate * Double(max(1, inputCount))
         
         guard let size = ImageSize(rawValue: imageSize) else {
-            return inputCost + AppPricing.outputFallbackRate(isBatchTier: isBatchTier)
+            return inputCost + AppPricing.outputFallbackRate(modelName: modelName, isBatchTier: isBatchTier)
         }
         
-        return inputCost + size.cost(isBatchTier: isBatchTier)
+        return inputCost + size.cost(modelName: modelName, isBatchTier: isBatchTier)
     }
     
     /// Calculate cost for text-to-image generation (no input images)
-    static func calculateTextModeCost(imageSize: String, outputCount: Int, isBatchTier: Bool) -> Double {
+    static func calculateTextModeCost(imageSize: String, outputCount: Int, isBatchTier: Bool, modelName: String?) -> Double {
         guard let size = ImageSize(rawValue: imageSize) else {
-            return Double(outputCount) * AppPricing.outputFallbackRate(isBatchTier: isBatchTier)
+            return Double(outputCount) * AppPricing.outputFallbackRate(modelName: modelName, isBatchTier: isBatchTier)
         }
-        return Double(outputCount) * size.cost(isBatchTier: isBatchTier)
+        return Double(outputCount) * size.cost(modelName: modelName, isBatchTier: isBatchTier)
     }
 }

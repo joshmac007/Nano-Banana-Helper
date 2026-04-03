@@ -119,6 +119,46 @@ class BatchStagingManager {
     func bookmark(for url: URL) -> Data? {
         stagedBookmarks[url]
     }
+
+    func restore(from entry: HistoryEntry) {
+        clearAll()
+
+        prompt = entry.prompt
+        systemPrompt = entry.systemPrompt ?? ""
+        aspectRatio = entry.aspectRatio
+        imageSize = entry.imageSize
+        isBatchTier = entry.usedBatchTier
+        textImageCount = 1
+
+        guard !entry.isTextToImage else {
+            generationMode = .text
+            isMultiInput = false
+            return
+        }
+
+        generationMode = .image
+
+        var restoredFiles: [URL] = []
+        var restoredBookmarks: [URL: Data] = [:]
+        let sourceBookmarks = entry.sourceImageBookmarks ?? []
+
+        for (index, path) in entry.sourceImagePaths.enumerated() {
+            guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
+                continue
+            }
+
+            let url = URL(fileURLWithPath: path)
+            restoredFiles.append(url)
+
+            if sourceBookmarks.indices.contains(index) {
+                restoredBookmarks[url] = sourceBookmarks[index]
+            }
+        }
+
+        stagedFiles = restoredFiles
+        stagedBookmarks = restoredBookmarks
+        isMultiInput = restoredFiles.count > 1
+    }
     
     func updateSettings(prompt: String? = nil, systemPrompt: String? = nil, ratio: String? = nil, size: String? = nil, batch: Bool? = nil, multiInput: Bool? = nil) {
         if let p = prompt { self.prompt = p }

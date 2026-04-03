@@ -205,7 +205,8 @@ struct InspectorView: View {
             imageSize: stagingManager.imageSize,
             outputDirectory: project.outputDirectory,
             useBatchTier: stagingManager.isBatchTier,
-            projectId: project.id
+            projectId: project.id,
+            modelName: AppConfig.load().modelName ?? AppPricing.defaultModelName
         )
 
         // Handle Multi-Input vs Standard Batch

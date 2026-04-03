@@ -7,6 +7,14 @@ struct CostReportView: View {
     @Environment(ProjectManager.self) private var projectManager
     @Environment(\.dismiss) var dismiss
     @State private var exportStatusMessage: String?
+
+    var selectedModelName: String? {
+        AppConfig.load().modelName
+    }
+
+    var pricingResolution: AppPricing.PricingResolution {
+        AppPricing.pricing(for: selectedModelName)
+    }
     
     var body: some View {
         VStack(spacing: 0) {
@@ -225,6 +233,18 @@ struct CostReportView: View {
                         Text("Estimated Pricing Reference")
                             .font(.subheadline)
                             .fontWeight(.medium)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(selectedModelName ?? AppPricing.defaultModelName)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            if pricingResolution.isFallback {
+                                Text("Using \(pricingResolution.pricingDisplayName) pricing fallback.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                            }
+                        }
                         
                         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
                             GridRow {
@@ -242,17 +262,17 @@ struct CostReportView: View {
                             
                             GridRow {
                                 Text("Standard")
-                                Text("$\(AppPricing.inputRate(isBatchTier: false), specifier: "%.4f")")
-                                Text("$\(ImageSize.size4K.cost(isBatchTier: false), specifier: "%.3f")")
-                                Text("$\(ImageSize.size2K.cost(isBatchTier: false), specifier: "%.3f")")
+                                Text("$\(AppPricing.inputRate(modelName: selectedModelName, isBatchTier: false), specifier: "%.4f")")
+                                Text("$\(ImageSize.size4K.cost(modelName: selectedModelName, isBatchTier: false), specifier: "%.3f")")
+                                Text("$\(ImageSize.size2K.cost(modelName: selectedModelName, isBatchTier: false), specifier: "%.3f")")
                             }
                             .font(.caption)
                             
                             GridRow {
                                 Text("Batch")
-                                Text("$\(AppPricing.inputRate(isBatchTier: true), specifier: "%.4f")")
-                                Text("$\(ImageSize.size4K.cost(isBatchTier: true), specifier: "%.3f")")
-                                Text("$\(ImageSize.size2K.cost(isBatchTier: true), specifier: "%.3f")")
+                                Text("$\(AppPricing.inputRate(modelName: selectedModelName, isBatchTier: true), specifier: "%.4f")")
+                                Text("$\(ImageSize.size4K.cost(modelName: selectedModelName, isBatchTier: true), specifier: "%.3f")")
+                                Text("$\(ImageSize.size2K.cost(modelName: selectedModelName, isBatchTier: true), specifier: "%.3f")")
                             }
                             .font(.caption)
                         }

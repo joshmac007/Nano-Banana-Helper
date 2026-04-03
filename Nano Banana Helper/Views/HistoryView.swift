@@ -639,6 +639,7 @@ struct HistoryRowView: View {
         switch entry.status {
         case "completed": return .green
         case "cancelled": return .orange
+        case "expired": return .orange
         case "failed": return .red
         default: return .secondary
         }
@@ -649,6 +650,7 @@ struct HistoryRowView: View {
         case "completed": return "checkmark.circle"
         case "processing": return "pause.circle"
         case "cancelled": return "xmark.circle"
+        case "expired": return "clock.badge.exclamationmark"
         case "failed": return "exclamationmark.triangle"
         default: return "questionmark"
         }

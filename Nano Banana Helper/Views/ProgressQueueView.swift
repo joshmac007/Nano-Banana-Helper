@@ -19,15 +19,6 @@ struct ProgressQueueView: View {
 
                     Spacer()
 
-                    if orchestrator.hasInterruptedJobs {
-                        Button("Resume Batch") {
-                            Task { await orchestrator.resumeInterruptedJobs() }
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(.orange)
-                        .controlSize(.small)
-                    }
-
                     Button(action: { withAnimation { isLogVisible.toggle() } }) {
                         Label(isLogVisible ? "Hide Logs" : "Show Logs", systemImage: "list.bullet.rectangle")
                     }
@@ -51,12 +42,13 @@ struct ProgressQueueView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                    } else if orchestrator.isPaused {
+                    } else if orchestrator.isPaused || orchestrator.hasInterruptedJobs {
                         Button(action: { Task { await orchestrator.startAll() } }) {
                             Label("Resume", systemImage: "play.fill")
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
+                        .tint(.orange)
 
                         Button(role: .destructive, action: { orchestrator.cancel() }) {
                             Label("Cancel", systemImage: "xmark.circle")
@@ -67,7 +59,7 @@ struct ProgressQueueView: View {
                 }
 
                 HStack {
-                    Text("Reprioritize tasks in Staging before submission. Live queue reordering is not available.")
+                    Text(headerSubtitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -121,10 +113,10 @@ struct ProgressQueueView: View {
                         }
                     }
                     
-                    // Failed
+                    // Issues
                     if !orchestrator.failedJobs.isEmpty {
                         let count = orchestrator.failedJobs.count
-                        Section("Failed (\(count) error\(count == 1 ? "" : "s"))") {
+                        Section("Issues (\(count))") {
                             ForEach(orchestrator.failedJobs, id: \.id) { task in
                                 TaskRowView(task: task)
                             }
@@ -205,9 +197,23 @@ struct ProgressQueueView: View {
     }
     
     private var progressColor: Color {
+        if orchestrator.controlState == .cancelling { return .orange }
         if orchestrator.isPaused { return .yellow }
         if !orchestrator.failedJobs.isEmpty { return .orange }
         return .accentColor
+    }
+
+    private var headerSubtitle: String {
+        switch orchestrator.controlState {
+        case .pausedLocal:
+            return "Paused locally. Gemini may still finish already-submitted work remotely."
+        case .cancelling:
+            return "Cancelling remotely where possible and reconciling final job states."
+        case .interrupted:
+            return "Queue recovery required. Resume reconciles remote jobs before submitting new work."
+        default:
+            return "Reprioritize tasks in Staging before submission. Live queue reordering is not available."
+        }
     }
     
     private func openOutputFolder() {
@@ -237,8 +243,7 @@ struct ProgressQueueView: View {
 }
 
 struct StatusIndicator: View {
-    let isRunning: Bool
-    let isPaused: Bool
+    let controlState: QueueControlState
     
     var body: some View {
         HStack(spacing: 6) {
@@ -246,12 +251,12 @@ struct StatusIndicator: View {
                 .fill(statusColor)
                 .frame(width: 8, height: 8)
                 .overlay {
-                    if isRunning {
+                    if controlState == .running || controlState == .resuming || controlState == .cancelling {
                         Circle()
                             .stroke(statusColor.opacity(0.5), lineWidth: 2)
                             .scaleEffect(1.5)
                             .opacity(0.5)
-                            .animation(.easeInOut(duration: 1).repeatForever(autoreverses: true), value: isRunning)
+                            .animation(.easeInOut(duration: 1).repeatForever(autoreverses: true), value: controlState)
                     }
                 }
             
@@ -262,15 +267,18 @@ struct StatusIndicator: View {
     }
     
     private var statusColor: Color {
-        if isRunning { return .green }
-        if isPaused { return .yellow }
-        return .gray
+        switch controlState {
+        case .running: return .green
+        case .resuming: return .orange
+        case .cancelling: return .orange
+        case .pausedLocal: return .yellow
+        case .interrupted: return .orange
+        case .idle: return .gray
+        }
     }
     
     private var statusText: String {
-        if isRunning { return "Running" }
-        if isPaused { return "Paused" }
-        return "Idle"
+        controlState.displayName
     }
 }
 
@@ -301,14 +309,13 @@ struct TaskRowView: View {
                     }
                 }
                 
-                // Phase-based status for processing jobs
-                if task.status == "processing" {
+                if shouldShowPhaseMetadata {
                     HStack(spacing: 4) {
                         Text(task.phase.displayName)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(phaseColor)
                         
-                        if (task.phase == .polling || task.phase == .stalled) && task.pollCount > 0 {
+                        if pollStateSupported && task.pollCount > 0 {
                             Text("#\(task.pollCount)")
                                 .font(.caption)
                                 .fontWeight(.medium)
@@ -316,7 +323,7 @@ struct TaskRowView: View {
                         }
 
                         if let lastPollState = task.lastPollState,
-                           (task.phase == .polling || task.phase == .stalled || task.phase == .reconnecting) {
+                           pollStateSupported {
                             Text("• \(formattedPollState(lastPollState))")
                                 .font(.caption)
                                 .foregroundStyle(task.phase == .stalled ? .orange : .secondary)
@@ -335,18 +342,26 @@ struct TaskRowView: View {
                         }
                     }
                     if task.phase == .stalled {
-                        Text("Polling paused locally. Use Resume Batch to continue.")
+                        Text("Polling paused locally. Use Resume to continue.")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    } else if task.phase == .pausedLocal {
+                        Text(task.hasRemoteJob ? "Paused locally. Resume to reconcile remote status." : "Paused locally. Resume to continue.")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    } else if task.phase == .cancelRequested {
+                        Text("Cancel requested. Waiting for the final remote status.")
                             .font(.caption)
                             .foregroundStyle(.orange)
                     }
                 } else if task.phase == .stalled {
-                    Text("Polling paused locally. Use Resume Batch to continue.")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                    Text("Polling paused locally. Use Resume to continue.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
                 } else if let error = task.errorMessage {
                     Text(error)
                         .font(.caption)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(errorColor)
                         .lineLimit(2)
                 } else if let duration = task.duration {
                     Text(String(format: "%.1fs", duration))
@@ -397,6 +412,38 @@ struct TaskRowView: View {
             .replacingOccurrences(of: "_", with: " ")
             .lowercased()
     }
+
+    private var shouldShowPhaseMetadata: Bool {
+        task.status == "processing" || task.phase == .pausedLocal || task.phase == .cancelRequested || task.phase == .stalled
+    }
+
+    private var pollStateSupported: Bool {
+        task.phase == .polling || task.phase == .reconnecting || task.phase == .stalled || task.phase == .cancelRequested
+    }
+
+    private var phaseColor: Color {
+        switch task.phase {
+        case .pausedLocal, .stalled, .cancelRequested, .expired:
+            return .orange
+        case .cancelled:
+            return .orange
+        case .failed:
+            return .red
+        case .completed:
+            return .green
+        default:
+            return .secondary
+        }
+    }
+
+    private var errorColor: Color {
+        switch task.status {
+        case "cancelled", "expired":
+            return .orange
+        default:
+            return .red
+        }
+    }
     
     @ViewBuilder
     private var statusIcon: some View {
@@ -407,10 +454,19 @@ struct TaskRowView: View {
         case .submitting:
             ProgressView()
                 .scaleEffect(0.7)
+        case .submittedRemote:
+            Image(systemName: task.phase.icon)
+                .foregroundStyle(.orange)
         case .polling:
             Image(systemName: task.phase.icon)
                 .foregroundStyle(.orange)
         case .reconnecting:
+            Image(systemName: task.phase.icon)
+                .foregroundStyle(.orange)
+        case .pausedLocal:
+            Image(systemName: task.phase.icon)
+                .foregroundStyle(.yellow)
+        case .cancelRequested:
             Image(systemName: task.phase.icon)
                 .foregroundStyle(.orange)
         case .stalled:
@@ -422,6 +478,12 @@ struct TaskRowView: View {
         case .completed:
             Image(systemName: task.phase.icon)
                 .foregroundStyle(.green)
+        case .cancelled:
+            Image(systemName: task.phase.icon)
+                .foregroundStyle(.orange)
+        case .expired:
+            Image(systemName: task.phase.icon)
+                .foregroundStyle(.orange)
         case .failed:
             Image(systemName: task.phase.icon)
                 .foregroundStyle(.red)

@@ -5,7 +5,7 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 ![MainScreen](https://github.com/joshmac007/Nano-Banana-Helper/blob/main/MainScreen.jpeg)
 
 ![Latest Release](https://img.shields.io/github/v/release/joshmac007/Nano-Banana-Helper?color=success&label=Release)
-![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)
+![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)
 ![Swift 6.0](https://img.shields.io/badge/Swift-6.0-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -18,6 +18,7 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 - **Text-to-Image**: Generate images from text prompts without input images. Create 1-4 variations per request.
 - **Multi-Input Mode**: Merge multiple input images into a single output using advanced prompt instructions.
 - **Cost Estimation**: Real-time cost calculation based on image size, count, and selected model tier.
+- **Usage Analytics**: Track token usage and estimated spend over time using rich dashboard charts, filtering by session, models, or specific time ranges.
 - **Model Selection**: Choose between Nano Banana 2 (fastest), Nano Banana (stable), or Nano Banana Pro (highest quality) in Settings.
 
 ### 🛠️ Advanced Tools

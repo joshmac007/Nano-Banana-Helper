@@ -243,12 +243,12 @@ struct SettingsView: View {
         Form {
             Section("About Nano Banana Helper") {
                 LabeledContent("Version") {
-                    Text("1.3.5")
+                    Text("1.4.0")
                         .fontWeight(.bold)
                 }
 
                 LabeledContent("Build") {
-                    Text("March 2026")
+                    Text("April 2026")
                 }
 
                 LabeledContent("Copyright") {

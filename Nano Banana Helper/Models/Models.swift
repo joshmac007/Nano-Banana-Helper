@@ -345,6 +345,26 @@ class LogManager {
 
 // MARK: - Batch Job
 
+enum QueueControlState: String, Codable {
+    case idle
+    case running
+    case pausedLocal
+    case resuming
+    case cancelling
+    case interrupted
+
+    var displayName: String {
+        switch self {
+        case .idle: return "Idle"
+        case .running: return "Running"
+        case .pausedLocal: return "Paused locally"
+        case .resuming: return "Resuming"
+        case .cancelling: return "Cancelling"
+        case .interrupted: return "Interrupted"
+        }
+    }
+}
+
 /// A batch editing job containing multiple image tasks
 @Observable
 class BatchJob: Identifiable, Codable {
@@ -421,7 +441,7 @@ class BatchJob: Identifiable, Codable {
     
     var pendingCount: Int { tasks.filter { $0.status == "pending" }.count }
     var completedCount: Int { tasks.filter { $0.status == "completed" }.count }
-    var failedCount: Int { tasks.filter { $0.status == "failed" }.count }
+    var failedCount: Int { tasks.filter { ImageTask.issueStatuses.contains($0.status) }.count }
     var progress: Double {
         guard !tasks.isEmpty else { return 0 }
         return Double(completedCount + failedCount) / Double(tasks.count)
@@ -446,22 +466,32 @@ class BatchJob: Identifiable, Codable {
 enum JobPhase: String, Codable {
     case pending
     case submitting
+    case submittedRemote
     case polling
     case reconnecting
+    case pausedLocal
+    case cancelRequested
     case stalled
     case downloading
     case completed
+    case cancelled
+    case expired
     case failed
     
     var displayName: String {
         switch self {
         case .pending: return "Pending"
         case .submitting: return "Submitting"
+        case .submittedRemote: return "Submitted"
         case .polling: return "Waiting"
         case .reconnecting: return "Reconnecting"
-        case .stalled: return "Stalled"
+        case .pausedLocal: return "Paused locally"
+        case .cancelRequested: return "Cancel requested"
+        case .stalled: return "Paused locally"
         case .downloading: return "Downloading"
         case .completed: return "Completed"
+        case .cancelled: return "Cancelled"
+        case .expired: return "Expired"
         case .failed: return "Failed"
         }
     }
@@ -470,11 +500,16 @@ enum JobPhase: String, Codable {
         switch self {
         case .pending: return "circle"
         case .submitting: return "arrow.up.circle"
+        case .submittedRemote: return "tray.and.arrow.up"
         case .polling: return "clock.arrow.circlepath"
         case .reconnecting: return "arrow.triangle.2.circlepath"
+        case .pausedLocal: return "pause.circle"
+        case .cancelRequested: return "xmark.circle"
         case .stalled: return "pause.circle"
         case .downloading: return "arrow.down.circle"
         case .completed: return "checkmark.circle.fill"
+        case .cancelled: return "xmark.circle.fill"
+        case .expired: return "clock.badge.exclamationmark"
         case .failed: return "exclamationmark.circle.fill"
         }
     }
@@ -485,6 +520,9 @@ enum JobPhase: String, Codable {
 /// A single image editing task within a batch (can have multiple input images)
 @Observable
 class ImageTask: Identifiable, Codable {
+    static let terminalStatuses: Set<String> = ["completed", "failed", "cancelled", "expired"]
+    static let issueStatuses: Set<String> = ["failed", "cancelled", "expired"]
+
     let id: UUID
     let inputPaths: [String] // Changed to array for multimodal support
     var inputBookmarks: [Data]? // Security-scoped bookmarks for file picker selections
@@ -501,11 +539,12 @@ class ImageTask: Identifiable, Codable {
     var completedAt: Date?
     var externalJobName: String? // Store Gemini API job ID
     var projectId: UUID? // Added for filtering results by project
+    var cancelRequestedAt: Date?
 
     enum CodingKeys: String, CodingKey {
         case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount
         case lastPollState, lastPollUpdatedAt, stalledAt
-        case error, startedAt, submittedAt, completedAt, externalJobName, projectId
+        case error, startedAt, submittedAt, completedAt, externalJobName, projectId, cancelRequestedAt
     }
 
     required init(from decoder: Decoder) throws {
@@ -526,6 +565,7 @@ class ImageTask: Identifiable, Codable {
         completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
         projectId = try container.decodeIfPresent(UUID.self, forKey: .projectId)
+        cancelRequestedAt = try container.decodeIfPresent(Date.self, forKey: .cancelRequestedAt)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -546,6 +586,7 @@ class ImageTask: Identifiable, Codable {
         try container.encode(completedAt, forKey: .completedAt)
         try container.encode(externalJobName, forKey: .externalJobName)
         try container.encode(projectId, forKey: .projectId)
+        try container.encodeIfPresent(cancelRequestedAt, forKey: .cancelRequestedAt)
     }
     
     init(inputPaths: [String], projectId: UUID? = nil, inputBookmarks: [Data]? = nil) {
@@ -559,6 +600,7 @@ class ImageTask: Identifiable, Codable {
         self.lastPollUpdatedAt = nil
         self.stalledAt = nil
         self.projectId = projectId
+        self.cancelRequestedAt = nil
     }
     
     init(inputPath: String, projectId: UUID? = nil, inputBookmark: Data? = nil) {
@@ -572,6 +614,7 @@ class ImageTask: Identifiable, Codable {
         self.lastPollUpdatedAt = nil
         self.stalledAt = nil
         self.projectId = projectId
+        self.cancelRequestedAt = nil
     }
     
     // Backward compatibility for single input path
@@ -596,6 +639,18 @@ class ImageTask: Identifiable, Codable {
     var duration: TimeInterval? {
         guard let start = startedAt, let end = completedAt else { return nil }
         return end.timeIntervalSince(start)
+    }
+
+    var isTerminal: Bool {
+        Self.terminalStatuses.contains(status)
+    }
+
+    var isIssue: Bool {
+        Self.issueStatuses.contains(status)
+    }
+
+    var hasRemoteJob: Bool {
+        externalJobName != nil
     }
 }
 

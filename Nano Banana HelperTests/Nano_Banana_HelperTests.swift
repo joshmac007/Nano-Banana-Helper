@@ -587,7 +587,7 @@ struct Nano_Banana_HelperTests {
             projectsDirectoryURL: tempProjectsDirectory,
             bookmarkDependencies: dependencies
         )
-        initialManager.entries = [
+        initialManager.allGlobalEntries = [
             HistoryEntry(
                 projectId: projectId,
                 sourceImagePaths: ["/tmp/input.png"],
@@ -609,9 +609,9 @@ struct Nano_Banana_HelperTests {
         )
         loadedManager.loadHistory(for: projectId)
 
-        #expect(loadedManager.entries.count == 1)
-        #expect(loadedManager.entries[0].sourceImageBookmarks == [newSourceBookmark])
-        #expect(loadedManager.entries[0].outputImageBookmark == newOutputBookmark)
+        #expect(loadedManager.allGlobalEntries.count == 1)
+        #expect(loadedManager.allGlobalEntries[0].sourceImageBookmarks == [newSourceBookmark])
+        #expect(loadedManager.allGlobalEntries[0].outputImageBookmark == newOutputBookmark)
 
         let fileURL = tempProjectsDirectory
             .appendingPathComponent(projectId.uuidString)
@@ -632,7 +632,6 @@ struct Nano_Banana_HelperTests {
         let outputBookmark = Data("new-output".utf8)
         let sourceBookmarks = [Data("new-source".utf8)]
         let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
-        manager.entries = [entry]
         manager.allGlobalEntries = [entry]
         manager.saveHistory(for: projectId)
 
@@ -642,8 +641,8 @@ struct Nano_Banana_HelperTests {
             sourceBookmarks: sourceBookmarks
         )
 
-        #expect(manager.entries.first?.outputImageBookmark == outputBookmark)
-        #expect(manager.entries.first?.sourceImageBookmarks == sourceBookmarks)
+        #expect(manager.allGlobalEntries.first?.outputImageBookmark == outputBookmark)
+        #expect(manager.allGlobalEntries.first?.sourceImageBookmarks == sourceBookmarks)
         #expect(manager.allGlobalEntries.first?.outputImageBookmark == outputBookmark)
         #expect(manager.allGlobalEntries.first?.sourceImageBookmarks == sourceBookmarks)
 
@@ -662,11 +661,11 @@ struct Nano_Banana_HelperTests {
         let sourceBookmarks = [Data("target-source".utf8)]
         let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
 
-        manager.entries = [currentEntry]
+        manager.allGlobalEntries = [currentEntry]
         manager.saveHistory(for: currentProject)
-        manager.entries = [targetEntry]
+        manager.allGlobalEntries = [targetEntry]
         manager.saveHistory(for: targetProject)
-        manager.entries = [currentEntry]
+        manager.allGlobalEntries = [currentEntry]
         manager.allGlobalEntries = [targetEntry, currentEntry]
 
         manager.updateBookmarks(
@@ -675,8 +674,8 @@ struct Nano_Banana_HelperTests {
             sourceBookmarks: sourceBookmarks
         )
 
-        #expect(manager.entries.first?.id == currentEntry.id)
-        #expect(manager.entries.first?.outputImageBookmark == nil)
+        #expect(manager.allGlobalEntries.first?.id == currentEntry.id)
+        #expect(manager.allGlobalEntries.first?.outputImageBookmark == nil)
 
         let persistedEntries = try loadPersistedHistoryEntries(from: tempProjectsDirectory, projectId: targetProject)
         #expect(persistedEntries.first?.outputImageBookmark == outputBookmark)
@@ -690,7 +689,6 @@ struct Nano_Banana_HelperTests {
         let tempProjectsDirectory = try makeTemporaryDirectory()
         let entry = makeHistoryEntry(projectId: projectId)
         let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
-        manager.entries = [entry]
         manager.allGlobalEntries = [entry]
         manager.saveHistory(for: projectId)
 
@@ -719,7 +717,6 @@ struct Nano_Banana_HelperTests {
         let matchingEntry = makeHistoryEntry(projectId: projectId, outputImagePath: matchingOutputURL.path)
         let outsideEntry = makeHistoryEntry(projectId: projectId, outputImagePath: outsideOutputURL.path)
         let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
-        manager.entries = [matchingEntry, outsideEntry]
         manager.allGlobalEntries = [matchingEntry, outsideEntry]
         manager.saveHistory(for: projectId)
 
@@ -760,7 +757,6 @@ struct Nano_Banana_HelperTests {
             outputImagePath: "/tmp/skipped-output.png"
         )
         let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
-        manager.entries = [requestedEntry, skippedEntry]
         manager.allGlobalEntries = [requestedEntry, skippedEntry]
         manager.saveHistory(for: projectId)
 
@@ -803,7 +799,6 @@ struct Nano_Banana_HelperTests {
             sourceImageBookmarks: [oldFirstBookmark, oldSecondBookmark, oldThirdBookmark]
         )
         let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
-        manager.entries = [entry]
         manager.allGlobalEntries = [entry]
         manager.saveHistory(for: projectId)
 
@@ -893,14 +888,14 @@ struct Nano_Banana_HelperTests {
             cost: 1
         )
 
-        manager.entries = [entry]
+        manager.allGlobalEntries = [entry]
         manager.saveHistory(for: projectId)
         manager.loadHistory(for: projectId)
         manager.loadGlobalHistory(allProjects: [project])
 
         manager.clearHistory(for: projectId)
 
-        #expect(manager.entries.isEmpty)
+        #expect(manager.allGlobalEntries.isEmpty)
         #expect(manager.allGlobalEntries.isEmpty)
 
         let fileURL = tempProjectsDirectory
@@ -939,12 +934,24 @@ struct Nano_Banana_HelperTests {
         let decoder = JSONDecoder()
         let summary = try decoder.decode(CostSummary.self, from: data)
 
-        #expect(summary.totalSpent == 0.5)
-        #expect(summary.imageCount == 1)
-        #expect(summary.byModel["gemini-test"] == 0.5)
-        #expect(manager.sessionCost == 0.5)
-        #expect(manager.sessionTokens == 15)
-        #expect(manager.sessionImageCount == 1)
+        if summary.totalSpent != 0.5 {
+            Issue.record("Expected persisted totalSpent to remain 0.5")
+        }
+        if summary.imageCount != 1 {
+            Issue.record("Expected persisted imageCount to remain 1")
+        }
+        if summary.byModel["gemini-test"] != 0.5 {
+            Issue.record("Expected persisted byModel entry for gemini-test to remain 0.5")
+        }
+        if manager.sessionCost != 0.5 {
+            Issue.record("Expected sessionCost to remain 0.5")
+        }
+        if manager.sessionTokens != 15 {
+            Issue.record("Expected sessionTokens to remain 15")
+        }
+        if manager.sessionImageCount != 1 {
+            Issue.record("Expected sessionImageCount to remain 1")
+        }
     }
 
     @MainActor @Test func cancelHandlesSubmittingPhaseTasks() throws {
@@ -961,10 +968,78 @@ struct Nano_Banana_HelperTests {
         orchestrator.enqueue(batch)
         orchestrator.cancel(batch: batch)
 
-        #expect(batch.status == "cancelled")
-        #expect(task.status == "failed")
-        #expect(task.phase == .failed)
-        #expect(task.error == "Cancelled by user")
+        if batch.status != "processing" {
+            Issue.record("Expected batch to stay active while cancellation is being reconciled")
+        }
+        if task.status != "processing" {
+            Issue.record("Expected submitting task to remain processing while cancellation is pending")
+        }
+        if task.phase != .cancelRequested {
+            Issue.record("Expected submitting task to move into cancelRequested phase")
+        }
+        if task.error != "Cancel requested. Waiting for final status." {
+            Issue.record("Expected cancelRequested copy to be preserved on the task")
+        }
+    }
+
+    @MainActor @Test func cancelPendingTaskMarksCancelledInsteadOfFailed() throws {
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false
+        )
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        batch.tasks = [task]
+
+        orchestrator.enqueue(batch)
+        orchestrator.cancel(batch: batch)
+
+        if task.status != "cancelled" {
+            Issue.record("Expected pending task to be cancelled locally")
+        }
+        if task.phase != .cancelled {
+            Issue.record("Expected pending task to move to cancelled phase")
+        }
+        if task.error != "Cancelled by user" {
+            Issue.record("Expected pending task to retain the local cancellation message")
+        }
+    }
+
+    @MainActor @Test func pauseStatePersistsAcrossReload() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        batch.status = "processing"
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .polling
+        task.externalJobName = "batches/test-job"
+        batch.tasks = [task]
+
+        orchestrator.enqueue(batch)
+        orchestrator.pause()
+
+        if orchestrator.controlState != .pausedLocal {
+            Issue.record("Expected pause to update the queue control state")
+        }
+        if orchestrator.processingJobs.first?.phase != .pausedLocal {
+            Issue.record("Expected active task to be persisted as pausedLocal")
+        }
+
+        let reloaded = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+
+        if reloaded.controlState != .pausedLocal {
+            Issue.record("Expected paused queue control state to reload from disk")
+        }
+        if reloaded.processingJobs.first?.phase != .pausedLocal {
+            Issue.record("Expected paused task phase to reload from disk")
+        }
     }
 
     @MainActor @Test func startAllStartsEligibleBatchesConcurrently() async throws {
@@ -1000,7 +1075,9 @@ struct Nano_Banana_HelperTests {
         await probe.release()
         await task.value
 
-        #expect(startedCount == 2)
+        if startedCount != 2 {
+            Issue.record("Expected startAll() to start both eligible batches")
+        }
     }
 }
 

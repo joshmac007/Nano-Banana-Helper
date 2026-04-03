@@ -5,6 +5,7 @@ struct StagingView: View {
     @Bindable var stagingManager: BatchStagingManager
     @State private var isTargeted = false
     @State private var showingFilePicker = false
+    @State private var draggedURL: URL?
     
     var body: some View {
         ZStack {
@@ -80,6 +81,18 @@ struct StagingView: View {
                         StagedImageCell(url: url) {
                             stagingManager.removeFile(url)
                         }
+                        .onDrag {
+                            draggedURL = url
+                            return NSItemProvider(object: url.path as NSString)
+                        }
+                        .onDrop(
+                            of: [.text],
+                            delegate: StagedImageDropDelegate(
+                                targetURL: url,
+                                stagedManager: stagingManager,
+                                draggedURL: $draggedURL
+                            )
+                        )
                     }
                     
                     // Add More Button
@@ -181,6 +194,32 @@ struct StagingView: View {
             .controlSize(.large)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct StagedImageDropDelegate: DropDelegate {
+    let targetURL: URL
+    let stagedManager: BatchStagingManager
+    @Binding var draggedURL: URL?
+
+    func dropEntered(info: DropInfo) {
+        guard let draggedURL, draggedURL != targetURL else { return }
+        stagedManager.moveFile(draggedURL, before: targetURL)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggedURL = nil
+        return true
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func dropExited(info: DropInfo) {
+        if !info.hasItemsConforming(to: [.text]) {
+            draggedURL = nil
+        }
     }
 }
 

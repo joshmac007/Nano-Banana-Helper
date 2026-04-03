@@ -448,6 +448,7 @@ enum JobPhase: String, Codable {
     case submitting
     case polling
     case reconnecting
+    case stalled
     case downloading
     case completed
     case failed
@@ -458,6 +459,7 @@ enum JobPhase: String, Codable {
         case .submitting: return "Submitting"
         case .polling: return "Waiting"
         case .reconnecting: return "Reconnecting"
+        case .stalled: return "Stalled"
         case .downloading: return "Downloading"
         case .completed: return "Completed"
         case .failed: return "Failed"
@@ -470,6 +472,7 @@ enum JobPhase: String, Codable {
         case .submitting: return "arrow.up.circle"
         case .polling: return "clock.arrow.circlepath"
         case .reconnecting: return "arrow.triangle.2.circlepath"
+        case .stalled: return "pause.circle"
         case .downloading: return "arrow.down.circle"
         case .completed: return "checkmark.circle.fill"
         case .failed: return "exclamationmark.circle.fill"
@@ -489,6 +492,9 @@ class ImageTask: Identifiable, Codable {
     var status: String
     var phase: JobPhase
     var pollCount: Int
+    var lastPollState: String?
+    var lastPollUpdatedAt: Date?
+    var stalledAt: Date?
     var error: String?
     var startedAt: Date?
     var submittedAt: Date?
@@ -497,7 +503,9 @@ class ImageTask: Identifiable, Codable {
     var projectId: UUID? // Added for filtering results by project
 
     enum CodingKeys: String, CodingKey {
-        case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount, error, startedAt, submittedAt, completedAt, externalJobName, projectId
+        case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount
+        case lastPollState, lastPollUpdatedAt, stalledAt
+        case error, startedAt, submittedAt, completedAt, externalJobName, projectId
     }
 
     required init(from decoder: Decoder) throws {
@@ -509,6 +517,9 @@ class ImageTask: Identifiable, Codable {
         status = try container.decode(String.self, forKey: .status)
         phase = try container.decodeIfPresent(JobPhase.self, forKey: .phase) ?? .pending
         pollCount = try container.decodeIfPresent(Int.self, forKey: .pollCount) ?? 0
+        lastPollState = try container.decodeIfPresent(String.self, forKey: .lastPollState)
+        lastPollUpdatedAt = try container.decodeIfPresent(Date.self, forKey: .lastPollUpdatedAt)
+        stalledAt = try container.decodeIfPresent(Date.self, forKey: .stalledAt)
         error = try container.decodeIfPresent(String.self, forKey: .error)
         startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt)
         submittedAt = try container.decodeIfPresent(Date.self, forKey: .submittedAt)
@@ -526,6 +537,9 @@ class ImageTask: Identifiable, Codable {
         try container.encode(status, forKey: .status)
         try container.encode(phase, forKey: .phase)
         try container.encode(pollCount, forKey: .pollCount)
+        try container.encodeIfPresent(lastPollState, forKey: .lastPollState)
+        try container.encodeIfPresent(lastPollUpdatedAt, forKey: .lastPollUpdatedAt)
+        try container.encodeIfPresent(stalledAt, forKey: .stalledAt)
         try container.encode(error, forKey: .error)
         try container.encode(startedAt, forKey: .startedAt)
         try container.encode(submittedAt, forKey: .submittedAt)
@@ -541,6 +555,9 @@ class ImageTask: Identifiable, Codable {
         self.status = "pending"
         self.phase = .pending
         self.pollCount = 0
+        self.lastPollState = nil
+        self.lastPollUpdatedAt = nil
+        self.stalledAt = nil
         self.projectId = projectId
     }
     
@@ -551,6 +568,9 @@ class ImageTask: Identifiable, Codable {
         self.status = "pending"
         self.phase = .pending
         self.pollCount = 0
+        self.lastPollState = nil
+        self.lastPollUpdatedAt = nil
+        self.stalledAt = nil
         self.projectId = projectId
     }
     
@@ -594,17 +614,12 @@ enum ImageSize: String, CaseIterable, Identifiable {
     
     /// Output cost per image for standard tier
     var standardCost: Double {
-        switch self {
-        case .size4K: return 0.24
-        case .size2K: return 0.134
-        case .size1K: return 0.067
-        case .size512: return 0.034
-        }
+        AppPricing.outputRate(for: self, isBatchTier: false)
     }
     
     /// Output cost per image for batch tier (50% off)
     var batchCost: Double {
-        standardCost / 2
+        AppPricing.outputRate(for: self, isBatchTier: true)
     }
     
     /// Get cost for given tier
@@ -614,11 +629,11 @@ enum ImageSize: String, CaseIterable, Identifiable {
     
     /// Calculate total cost including input images
     static func calculateCost(imageSize: String, inputCount: Int, isBatchTier: Bool) -> Double {
-        let inputRate = isBatchTier ? 0.0006 : 0.0011
+        let inputRate = AppPricing.inputRate(isBatchTier: isBatchTier)
         let inputCost = inputRate * Double(max(1, inputCount))
         
         guard let size = ImageSize(rawValue: imageSize) else {
-            return inputCost + (isBatchTier ? 0.067 : 0.134) // fallback to 1K pricing
+            return inputCost + AppPricing.outputFallbackRate(isBatchTier: isBatchTier)
         }
         
         return inputCost + size.cost(isBatchTier: isBatchTier)
@@ -627,8 +642,7 @@ enum ImageSize: String, CaseIterable, Identifiable {
     /// Calculate cost for text-to-image generation (no input images)
     static func calculateTextModeCost(imageSize: String, outputCount: Int, isBatchTier: Bool) -> Double {
         guard let size = ImageSize(rawValue: imageSize) else {
-            // Fallback to 1K pricing
-            return Double(outputCount) * (isBatchTier ? 0.067 : 0.134)
+            return Double(outputCount) * AppPricing.outputFallbackRate(isBatchTier: isBatchTier)
         }
         return Double(outputCount) * size.cost(isBatchTier: isBatchTier)
     }

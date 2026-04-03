@@ -196,6 +196,57 @@ struct Nano_Banana_HelperTests {
         #expect(decoded.byModel["gemini-3-pro"] == 0.50)
     }
 
+    @Test func curatedModelCatalogRequiresBothGenerationMethodsAndIgnoresUncuratedModels() throws {
+        let payload = """
+        {
+          "models": [
+            {
+              "name": "models/gemini-3.1-flash-image-preview",
+              "supportedGenerationMethods": ["generateContent", "batchGenerateContent"]
+            },
+            {
+              "name": "models/gemini-3-pro-image-preview",
+              "supportedGenerationMethods": ["generateContent", "batchGenerateContent"]
+            },
+            {
+              "name": "models/gemini-2.5-flash-image",
+              "supportedGenerationMethods": ["generateContent"]
+            },
+            {
+              "name": "models/not-approved-image-model",
+              "supportedGenerationMethods": ["generateContent", "batchGenerateContent"]
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let entries = try CuratedModelCatalog.entries(
+            from: payload,
+            selectedModelID: "gemini-3-pro-image-preview"
+        )
+
+        #expect(entries.contains(where: { $0.id == "gemini-3.1-flash-image-preview" }))
+        #expect(entries.contains(where: { $0.id == "gemini-3.1-flash-image-preview" && $0.isSelectable }))
+        #expect(entries.contains(where: { $0.id == "gemini-3-pro-image-preview" && $0.isSelectable }))
+        #expect(entries.contains(where: { $0.id == "gemini-2.5-flash-image" }) == false)
+        #expect(entries.contains(where: { $0.id == "not-approved-image-model" }) == false)
+    }
+
+    @Test func curatedModelCatalogFallbackEntriesExcludeDeprecatedDefaultsAndInjectLegacySelection() {
+        let fallbackEntries = CuratedModelCatalog.fallbackEntries()
+        #expect(fallbackEntries.map(\.id) == ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"])
+        #expect(fallbackEntries.allSatisfy(\.isSelectable))
+
+        let legacyEntries = CuratedModelCatalog.fallbackEntries(selectedModelID: "gemini-2.5-flash-image")
+        #expect(legacyEntries.first?.id == "gemini-2.5-flash-image")
+        #expect(legacyEntries.first?.displayName == "Legacy: gemini-2.5-flash-image")
+        #expect(legacyEntries.first?.isSelectable == false)
+        #expect(legacyEntries.dropFirst().map(\.id) == ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"])
+
+        let selectedCurrentEntries = CuratedModelCatalog.fallbackEntries(selectedModelID: "gemini-3.1-flash-image-preview")
+        #expect(selectedCurrentEntries.map(\.id) == ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"])
+    }
+
     @Test func serviceURLBuildersPercentEncodeAPIKeyAndDynamicValues() throws {
         let apiKey = "abc def✓&?"
         let modelName = "gemini model"
@@ -207,7 +258,8 @@ struct Nano_Banana_HelperTests {
             NanoBananaService.batchGenerateContentURL(apiKey: apiKey, modelName: modelName),
             NanoBananaService.batchOperationURL(jobName: jobName, apiKey: apiKey),
             NanoBananaService.downloadResultsURL(fileName: fileName, apiKey: apiKey),
-            NanoBananaService.cancelBatchJobURL(jobName: jobName, apiKey: apiKey)
+            NanoBananaService.cancelBatchJobURL(jobName: jobName, apiKey: apiKey),
+            NanoBananaService.listModelsURL(apiKey: apiKey, pageSize: 100)
         ]
 
         for url in urls {

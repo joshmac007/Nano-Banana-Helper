@@ -54,6 +54,12 @@ struct PollRetryState: Sendable {
     }
 }
 
+struct PollStatusUpdate: Sendable {
+    let attempt: Int
+    let state: String
+    let updatedAt: Date
+}
+
 /// Simple config storage — @MainActor ensures all reads/writes are serialized
 @MainActor
 struct AppConfig: Codable {
@@ -124,13 +130,33 @@ actor NanoBananaService {
     func getModelName() async -> String {
         await MainActor.run { AppConfig.load().modelName } ?? "gemini-3.1-flash-image-preview"
     }
+
+    func fetchAvailableModels(selectedModelID: String? = nil) async throws -> [ModelCatalogEntry] {
+        guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
+            return CuratedModelCatalog.fallbackEntries(selectedModelID: selectedModelID)
+        }
+
+        var request = URLRequest(url: try Self.listModelsURL(apiKey: apiKey, pageSize: 100))
+        request.httpMethod = "GET"
+        let (data, response) = try await session.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            throw NanoBananaError.invalidResponse
+        }
+
+        let entries = try CuratedModelCatalog.entries(from: data, selectedModelID: selectedModelID)
+        if entries.isEmpty {
+            return CuratedModelCatalog.fallbackEntries(selectedModelID: selectedModelID)
+        }
+        return entries
+    }
     
     // MARK: - Image Editing
     
     /// Maximum payload size for inline batch requests (20MB per documentation)
     private let maxBatchPayloadSize = 20 * 1024 * 1024
     
-    func editImage(_ request: ImageEditRequest, onJobCreated: (@Sendable (String) -> Void)? = nil, onPollUpdate: (@Sendable (Int) -> Void)? = nil) async throws -> ImageEditResponse {
+    func editImage(_ request: ImageEditRequest, onJobCreated: (@Sendable (String) -> Void)? = nil, onPollUpdate: (@Sendable (PollStatusUpdate) -> Void)? = nil) async throws -> ImageEditResponse {
         guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
         }
@@ -252,7 +278,7 @@ actor NanoBananaService {
     // MARK: - Batch Job Resume
     
     /// Resume polling for an interrupted batch job
-    func resumePolling(jobName: String, onPollUpdate: (@Sendable (Int) -> Void)? = nil) async throws -> ImageEditResponse {
+    func resumePolling(jobName: String, onPollUpdate: (@Sendable (PollStatusUpdate) -> Void)? = nil, softTimeout: TimeInterval? = nil) async throws -> ImageEditResponse {
         guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
         }
@@ -260,7 +286,7 @@ actor NanoBananaService {
         await LogManager.shared.log(.request, payload: "Resuming polling for job: \(jobName)")
         
         // Use empty requestKey since we're resuming - we'll take whatever result comes back
-        return try await pollBatchJob(jobName: jobName, requestKey: "", apiKey: apiKey, onPollUpdate: onPollUpdate)
+        return try await pollBatchJob(jobName: jobName, requestKey: "", apiKey: apiKey, onPollUpdate: onPollUpdate, softTimeout: softTimeout)
     }
     
     // MARK: - Batch API (Async Job-Based)
@@ -312,24 +338,24 @@ actor NanoBananaService {
     }
     
     /// Convenience wrapper for polling a known batch job
-    func pollBatchJob(jobName: String, requestKey: String, onPollUpdate: (@Sendable (Int) -> Void)? = nil) async throws -> ImageEditResponse {
+    func pollBatchJob(jobName: String, requestKey: String, onPollUpdate: (@Sendable (PollStatusUpdate) -> Void)? = nil, softTimeout: TimeInterval? = nil) async throws -> ImageEditResponse {
         guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
         }
-        return try await pollBatchJob(jobName: jobName, requestKey: requestKey, apiKey: apiKey, onPollUpdate: onPollUpdate)
+        return try await pollBatchJob(jobName: jobName, requestKey: requestKey, apiKey: apiKey, onPollUpdate: onPollUpdate, softTimeout: softTimeout)
     }
 
-    private func pollBatchJob(jobName: String, requestKey: String, apiKey: String, onPollUpdate: (@Sendable (Int) -> Void)?) async throws -> ImageEditResponse {
+    private func pollBatchJob(jobName: String, requestKey: String, apiKey: String, onPollUpdate: (@Sendable (PollStatusUpdate) -> Void)?, softTimeout: TimeInterval?) async throws -> ImageEditResponse {
         let pollInterval: UInt64 = 10 * 1_000_000_000 // 10 seconds (docs show this interval)
         let completedStates = Set(["JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"])
         let maxPollCount = 360 // 360 × 10s = 1 hour max; prevents infinite loop on stuck API state
         var pollCount = 0
         let jobName = jobName.trimmingCharacters(in: .whitespacesAndNewlines)
         var retryState = PollRetryState()
+        let pollStart = Date()
         
         while pollCount <= maxPollCount {
             pollCount += 1
-            onPollUpdate?(pollCount)
             
             await LogManager.shared.log(.request, payload: "Polling batch job: \(jobName) (Attempt \(pollCount))")
             
@@ -369,6 +395,8 @@ actor NanoBananaService {
                 // Get state from metadata
                 let metadata = json["metadata"] as? [String: Any]
                 let state = metadata?["state"] as? String ?? (done ? "JOB_STATE_SUCCEEDED" : "JOB_STATE_PENDING")
+                let update = PollStatusUpdate(attempt: pollCount, state: state, updatedAt: Date())
+                onPollUpdate?(update)
                 
                 await LogManager.shared.log(.response, payload: "Job state: \(state), done: \(done)")
                 retryState.reset()
@@ -391,6 +419,10 @@ actor NanoBananaService {
                     } else {
                         throw NanoBananaError.batchError(message: "Job \(state.lowercased().replacingOccurrences(of: "job_state_", with: ""))")
                     }
+                }
+
+                if let softTimeout, Date().timeIntervalSince(pollStart) >= softTimeout {
+                    throw NanoBananaError.softTimeout(state: state)
                 }
                 
                 // Still running or pending - wait and retry
@@ -669,6 +701,16 @@ actor NanoBananaService {
         )
     }
 
+    static func listModelsURL(apiKey: String, pageSize: Int) throws -> URL {
+        try apiURL(
+            path: "/v1beta/models",
+            queryItems: [
+                URLQueryItem(name: "key", value: apiKey),
+                URLQueryItem(name: "pageSize", value: String(pageSize))
+            ]
+        )
+    }
+
     private static func apiURL(path: String, queryItems: [URLQueryItem]) throws -> URL {
         var components = URLComponents()
         components.scheme = "https"
@@ -693,6 +735,7 @@ enum NanoBananaError: LocalizedError {
     case invalidRequestURL(path: String)
     case apiError(statusCode: Int, data: Data)
     case batchError(message: String)
+    case softTimeout(state: String)
     case timeout
     case unknownError
     
@@ -713,6 +756,8 @@ enum NanoBananaError: LocalizedError {
             return "API error (\(code)): \(msg)"
         case .batchError(let message):
             return "Batch error: \(message)"
+        case .softTimeout(let state):
+            return "Polling paused after the local timeout while the remote job was still \(state.replacingOccurrences(of: "JOB_STATE_", with: "").lowercased())."
         case .timeout:
             return "The request timed out. Try again or reduce image size."
         case .unknownError:

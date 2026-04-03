@@ -286,7 +286,9 @@ final class BatchOrchestrator {
     /// Check if there are interrupted jobs that need resuming
     var hasInterruptedJobs: Bool {
         activeBatches.contains { batch in
-            batch.tasks.contains { $0.externalJobName != nil && ($0.phase == .polling || $0.phase == .reconnecting) } && batch.status != "processing"
+            batch.tasks.contains {
+                $0.externalJobName != nil && ($0.phase == .polling || $0.phase == .reconnecting || $0.phase == .stalled)
+            } && batch.status != "processing"
         }
     }
     
@@ -455,6 +457,9 @@ final class BatchOrchestrator {
                         job.externalJobName = jobInfo.jobName
                         job.phase = .polling
                         job.submittedAt = Date()
+                        job.lastPollState = "JOB_STATE_PENDING"
+                        job.lastPollUpdatedAt = Date()
+                        job.stalledAt = nil
                         
                         if let projectId = settings.projectId {
                             let entry = HistoryEntry(
@@ -502,17 +507,17 @@ final class BatchOrchestrator {
         do {
             let response: ImageEditResponse
             if recovering {
-                response = try await service.resumePolling(jobName: jobName, onPollUpdate: { @Sendable count in
+                response = try await service.resumePolling(jobName: jobName, onPollUpdate: { @Sendable update in
                     Task { @MainActor [weak self] in
-                        self?.updatePollCount(jobId: jobId, count: count)
+                        self?.updatePollStatus(jobId: jobId, update: update)
                     }
-                })
+                }, softTimeout: softPollTimeout)
             } else {
-                response = try await service.pollBatchJob(jobName: jobName, requestKey: "", onPollUpdate: { @Sendable count in
+                response = try await service.pollBatchJob(jobName: jobName, requestKey: "", onPollUpdate: { @Sendable update in
                     Task { @MainActor [weak self] in
-                        self?.updatePollCount(jobId: jobId, count: count)
+                        self?.updatePollStatus(jobId: jobId, update: update)
                     }
-                })
+                }, softTimeout: softPollTimeout)
             }
             
             await handleSuccess(
@@ -523,6 +528,10 @@ final class BatchOrchestrator {
                 jobName: jobName
             )
         } catch {
+            if case let NanoBananaError.softTimeout(state) = error {
+                await markJobAsStalled(jobId: jobId, state: state)
+                return
+            }
             await handleError(
                 jobId: jobId,
                 data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false),
@@ -532,11 +541,33 @@ final class BatchOrchestrator {
         }
     }
     
-    private func updatePollCount(jobId: UUID, count: Int) {
+    private func updatePollStatus(jobId: UUID, update: PollStatusUpdate) {
         if let job = activeBatches.lazy.flatMap({ $0.tasks }).first(where: { $0.id == jobId }) {
             job.phase = .polling
-            job.pollCount = count
+            job.status = "processing"
+            job.pollCount = update.attempt
+            job.lastPollState = update.state
+            job.lastPollUpdatedAt = update.updatedAt
+            job.stalledAt = nil
         }
+    }
+
+    private func markJobAsStalled(jobId: UUID, state: String) async {
+        guard let batch = activeBatches.first(where: { $0.tasks.contains(where: { $0.id == jobId }) }),
+              let job = batch.tasks.first(where: { $0.id == jobId }) else {
+            return
+        }
+
+        job.phase = .stalled
+        job.status = "processing"
+        job.lastPollState = state
+        job.lastPollUpdatedAt = Date()
+        job.stalledAt = Date()
+        job.error = "Polling paused locally after the configured timeout."
+        batch.status = "pending"
+        statusMessage = "Polling paused locally. Use Resume Batch to continue."
+        saveActiveBatches()
+        updateProgress()
     }
     
     private func handleSuccess(jobId: UUID, data: JobSubmissionData, settings: BatchSettings, response: ImageEditResponse, jobName: String?) async {
@@ -555,6 +586,8 @@ final class BatchOrchestrator {
             job.phase = .completed
             job.outputPath = outputURL.path
             job.completedAt = Date()
+            job.error = nil
+            job.stalledAt = nil
             
             let cost = settings.cost(inputCount: job.inputPaths.count)
             let currentModelName = await service.getModelName()
@@ -604,6 +637,7 @@ final class BatchOrchestrator {
         job.status = "failed"
         job.phase = .failed
         job.error = error.localizedDescription
+        job.stalledAt = nil
         
         if let projectId = settings.projectId {
             let historyEntry = HistoryEntry(
@@ -678,6 +712,10 @@ final class BatchOrchestrator {
     
     private var isTesting: Bool {
         NSClassFromString("XCTestCase") != nil
+    }
+
+    private var softPollTimeout: TimeInterval {
+        30 * 60
     }
 
     private func sendCompletionNotification() async {
@@ -792,6 +830,8 @@ final class BatchOrchestrator {
         task.status = "processing"
         task.phase = .polling
         task.submittedAt = entry.timestamp 
+        task.lastPollState = "JOB_STATE_PENDING"
+        task.lastPollUpdatedAt = entry.timestamp
         
         let outputDir: String
         if !entry.outputImagePath.isEmpty {

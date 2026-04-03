@@ -11,58 +11,66 @@ struct ProgressQueueView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Drawer Header with Controls
-            HStack {
-                Text("Queue")
-                    .font(.headline)
-                    .foregroundStyle(.secondary)
-                
-                Spacer()
-                
-                if orchestrator.hasInterruptedJobs {
-                    Button("Resume Batch") {
-                        Task { await orchestrator.resumeInterruptedJobs() }
+            VStack(spacing: 8) {
+                HStack {
+                    Text("Queue")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    if orchestrator.hasInterruptedJobs {
+                        Button("Resume Batch") {
+                            Task { await orchestrator.resumeInterruptedJobs() }
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.orange)
+                        .controlSize(.small)
                     }
-                    .buttonStyle(.bordered)
-                    .tint(.orange)
+
+                    Button(action: { withAnimation { isLogVisible.toggle() } }) {
+                        Label(isLogVisible ? "Hide Logs" : "Show Logs", systemImage: "list.bullet.rectangle")
+                    }
+                    .buttonStyle(.borderless)
                     .controlSize(.small)
+                    .foregroundStyle(isLogVisible ? .primary : .secondary)
+                    .help("View raw API logs")
+
+                    Divider()
+                        .frame(height: 16)
+
+                    if orchestrator.isRunning {
+                        Button(action: { orchestrator.pause() }) {
+                            Label("Pause", systemImage: "pause.fill")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Button(role: .destructive, action: { orchestrator.cancel() }) {
+                            Label("Cancel", systemImage: "xmark.circle")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    } else if orchestrator.isPaused {
+                        Button(action: { Task { await orchestrator.startAll() } }) {
+                            Label("Resume", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+
+                        Button(role: .destructive, action: { orchestrator.cancel() }) {
+                            Label("Cancel", systemImage: "xmark.circle")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
                 }
-                
-                // Logs Toggle
-                Button(action: { withAnimation { isLogVisible.toggle() } }) {
-                    Label(isLogVisible ? "Hide Logs" : "Show Logs", systemImage: "list.bullet.rectangle")
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .foregroundStyle(isLogVisible ? .primary : .secondary)
-                .help("View raw API logs")
-                
-                Divider()
-                    .frame(height: 16)
-                
-                if orchestrator.isRunning {
-                    Button(action: { orchestrator.pause() }) {
-                        Label("Pause", systemImage: "pause.fill")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    
-                    Button(role: .destructive, action: { orchestrator.cancel() }) {
-                        Label("Cancel", systemImage: "xmark.circle")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                } else if orchestrator.isPaused {
-                    Button(action: { Task { await orchestrator.startAll() } }) {
-                        Label("Resume", systemImage: "play.fill")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    
-                    Button(role: .destructive, action: { orchestrator.cancel() }) {
-                        Label("Cancel", systemImage: "xmark.circle")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+
+                HStack {
+                    Text("Reprioritize tasks in Staging before submission. Live queue reordering is not available.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
                 }
             }
             .padding(12)
@@ -300,11 +308,18 @@ struct TaskRowView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         
-                        if task.phase == .polling && task.pollCount > 0 {
+                        if (task.phase == .polling || task.phase == .stalled) && task.pollCount > 0 {
                             Text("#\(task.pollCount)")
                                 .font(.caption)
                                 .fontWeight(.medium)
                                 .foregroundStyle(.orange)
+                        }
+
+                        if let lastPollState = task.lastPollState,
+                           (task.phase == .polling || task.phase == .stalled || task.phase == .reconnecting) {
+                            Text("• \(formattedPollState(lastPollState))")
+                                .font(.caption)
+                                .foregroundStyle(task.phase == .stalled ? .orange : .secondary)
                         }
                         
                         if let startedAt = task.startedAt {
@@ -312,7 +327,22 @@ struct TaskRowView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+
+                        if let lastPollUpdatedAt = task.lastPollUpdatedAt {
+                            Text("• updated \(relativeUpdateString(from: lastPollUpdatedAt))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
+                    if task.phase == .stalled {
+                        Text("Polling paused locally. Use Resume Batch to continue.")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                } else if task.phase == .stalled {
+                    Text("Polling paused locally. Use Resume Batch to continue.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 } else if let error = task.errorMessage {
                     Text(error)
                         .font(.caption)
@@ -352,6 +382,21 @@ struct TaskRowView: View {
             return "\(seconds)s"
         }
     }
+
+    private func relativeUpdateString(from date: Date) -> String {
+        let elapsed = max(Int(Date().timeIntervalSince(date)), 0)
+        if elapsed >= 60 {
+            return "\(elapsed / 60)m ago"
+        }
+        return "\(elapsed)s ago"
+    }
+
+    private func formattedPollState(_ state: String) -> String {
+        state
+            .replacingOccurrences(of: "JOB_STATE_", with: "")
+            .replacingOccurrences(of: "_", with: " ")
+            .lowercased()
+    }
     
     @ViewBuilder
     private var statusIcon: some View {
@@ -366,6 +411,9 @@ struct TaskRowView: View {
             Image(systemName: task.phase.icon)
                 .foregroundStyle(.orange)
         case .reconnecting:
+            Image(systemName: task.phase.icon)
+                .foregroundStyle(.orange)
+        case .stalled:
             Image(systemName: task.phase.icon)
                 .foregroundStyle(.orange)
         case .downloading:

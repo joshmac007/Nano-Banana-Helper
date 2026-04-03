@@ -52,7 +52,8 @@ struct WorkbenchView: View {
                 case .results:
                     ResultsView(
                         historyManager: historyManager,
-                        projectManager: projectManager
+                        projectManager: projectManager,
+                        onReuse: reuseEntry
                     )
                 case .history:
                     HistoryView(
@@ -65,26 +66,7 @@ struct WorkbenchView: View {
                         onDelete: { entry in
                             historyManager.deleteEntry(entry)
                         },
-                        onReuse: { entry in
-                            // Reuse logic: Load prompt and settings back to staging
-                            stagingManager.prompt = entry.prompt
-                            stagingManager.systemPrompt = entry.systemPrompt ?? ""
-                            stagingManager.aspectRatio = entry.aspectRatio
-                            stagingManager.imageSize = entry.imageSize
-                            stagingManager.isBatchTier = entry.usedBatchTier
-                            
-                            // Switch to Staging tab
-                            selectedTab = .staging
-                            
-                            // Note: We can't easily restore file paths if they moved, 
-                            // but we could try to add them if they exist.
-                            for path in entry.sourceImagePaths {
-                                let url = URL(fileURLWithPath: path)
-                                if FileManager.default.fileExists(atPath: path) {
-                                    stagingManager.addFiles([url])
-                                }
-                            }
-                        },
+                        onReuse: reuseEntry,
                         onResumePolling: { entry in
                             orchestrator.resumePollingFromHistory(for: entry)
                         }
@@ -102,6 +84,22 @@ struct WorkbenchView: View {
         .onChange(of: selectedTab) { _, newValue in
             if newValue == .history {
                 historyManager.loadGlobalHistory(allProjects: projectManager.projects)
+            }
+        }
+    }
+
+    private func reuseEntry(_ entry: HistoryEntry) {
+        stagingManager.prompt = entry.prompt
+        stagingManager.systemPrompt = entry.systemPrompt ?? ""
+        stagingManager.aspectRatio = entry.aspectRatio
+        stagingManager.imageSize = entry.imageSize
+        stagingManager.isBatchTier = entry.usedBatchTier
+        selectedTab = .staging
+
+        for path in entry.sourceImagePaths {
+            let url = URL(fileURLWithPath: path)
+            if FileManager.default.fileExists(atPath: path) {
+                stagingManager.addFiles([url])
             }
         }
     }

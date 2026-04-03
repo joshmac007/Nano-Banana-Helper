@@ -83,6 +83,22 @@ class BatchStagingManager {
         stagedFiles.removeAll { $0 == url }
         stagedBookmarks.removeValue(forKey: url)
     }
+
+    func moveFiles(fromOffsets: IndexSet, toOffset: Int) {
+        stagedFiles.move(fromOffsets: fromOffsets, toOffset: toOffset)
+    }
+
+    func moveFile(_ source: URL, before target: URL) {
+        guard source != target,
+              let sourceIndex = stagedFiles.firstIndex(of: source),
+              let targetIndex = stagedFiles.firstIndex(of: target) else {
+            return
+        }
+
+        let item = stagedFiles.remove(at: sourceIndex)
+        let adjustedTargetIndex = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex
+        stagedFiles.insert(item, at: adjustedTargetIndex)
+    }
     
     /// Clear staged files and bookmarks, but preserve prompt and mode for UX continuity
     func clearAll() {

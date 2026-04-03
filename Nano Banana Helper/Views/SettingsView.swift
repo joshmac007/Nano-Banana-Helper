@@ -9,6 +9,8 @@ struct SettingsView: View {
     @State private var isLoaded: Bool = false
     @State private var selectedTab: SettingsTab = .api
     @State private var selectedModel: String = "gemini-3.1-flash-image-preview"
+    @State private var availableModels: [ModelCatalogEntry] = CuratedModelCatalog.fallbackEntries()
+    @State private var modelStatusMessage: String = ""
 
     var initialTab: SettingsTab = .api
 
@@ -69,7 +71,7 @@ struct SettingsView: View {
             if !isLoaded {
                 selectedTab = initialTab
                 checkExistingKey()
-                loadCurrentModel()
+                loadCurrentSettings()
                 isLoaded = true
             }
         }
@@ -131,15 +133,23 @@ struct SettingsView: View {
                         Spacer()
                         
                         Picker("", selection: $selectedModel) {
-                            Text("Nano Banana 2 (Default)").tag("gemini-3.1-flash-image-preview")
-                            Text("Nano Banana (Stable)").tag("gemini-2.5-flash-image-preview")
-                            Text("Nano Banana Pro (Legacy)").tag("gemini-3-pro-image-preview")
+                            ForEach(availableModels) { model in
+                                Text(model.pickerLabel)
+                                    .tag(model.id)
+                                    .disabled(!model.isSelectable)
+                            }
                         }
                         .pickerStyle(.menu)
-                        .frame(width: 200)
+                        .frame(width: 240)
                         .onChange(of: selectedModel) { _, newValue in
                             saveModelSelection(newValue)
                         }
+                    }
+
+                    if !modelStatusMessage.isEmpty {
+                        Text(modelStatusMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                     
                     // Status Messages
@@ -282,6 +292,7 @@ struct SettingsView: View {
             hasExistingKey = true
             apiKey = "••••••••••••••••"
             isSaving = false
+            await refreshModelCatalog(using: service)
         }
     }
     
@@ -293,6 +304,8 @@ struct SettingsView: View {
             statusMessage = "API key cleared"
             hasExistingKey = false
             isSaving = false
+            availableModels = CuratedModelCatalog.fallbackEntries(selectedModelID: selectedModel)
+            modelStatusMessage = "Using bundled model defaults until an API key is added."
         }
     }
     
@@ -320,10 +333,12 @@ struct SettingsView: View {
         }
     }
     
-    private func loadCurrentModel() {
+    private func loadCurrentSettings() {
         let service = NanoBananaService()
         Task {
             selectedModel = await service.getModelName()
+            availableModels = CuratedModelCatalog.fallbackEntries(selectedModelID: selectedModel)
+            await refreshModelCatalog(using: service)
         }
     }
     
@@ -331,6 +346,19 @@ struct SettingsView: View {
         let service = NanoBananaService()
         Task {
             await service.setModelName(modelName)
+        }
+    }
+
+    @MainActor
+    private func refreshModelCatalog(using service: NanoBananaService) async {
+        do {
+            availableModels = try await service.fetchAvailableModels(selectedModelID: selectedModel)
+            modelStatusMessage = hasExistingKey
+                ? "Model catalog synced from Gemini."
+                : "Using bundled model defaults until an API key is added."
+        } catch {
+            availableModels = CuratedModelCatalog.fallbackEntries(selectedModelID: selectedModel)
+            modelStatusMessage = "Using bundled model defaults. \(error.localizedDescription)"
         }
     }
 }

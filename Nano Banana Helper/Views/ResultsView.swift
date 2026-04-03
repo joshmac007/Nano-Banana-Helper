@@ -5,6 +5,7 @@ import SwiftUI
 struct ResultsView: View {
     var historyManager: HistoryManager
     var projectManager: ProjectManager
+    var onReuse: ((HistoryEntry) -> Void)? = nil
 
     @State private var selectedEntry: HistoryEntry?
     @State private var imageLoader = ResultsImageLoader()
@@ -98,7 +99,8 @@ struct ResultsView: View {
                     project: project,
                     historyManager: historyManager,
                     projectManager: projectManager,
-                    imageLoader: imageLoader
+                    imageLoader: imageLoader,
+                    onReuse: onReuse
                 )
             }
         }
@@ -199,6 +201,7 @@ fileprivate struct ResultCard: View {
     private func loadOutputImage() async {
         outputPhase = imageLoader.cachedPhase(for: outputReference) ?? .loading
         let outcome = await imageLoader.load(reference: outputReference)
+        guard !Task.isCancelled else { return }
         outputPhase = outcome.phase
         persistRefreshedOutputBookmark(outcome.refreshedBookmark)
     }
@@ -227,6 +230,7 @@ fileprivate struct ResultDetailView: View {
     let historyManager: HistoryManager
     let projectManager: ProjectManager
     let imageLoader: ResultsImageLoader
+    let onReuse: ((HistoryEntry) -> Void)?
 
     @Environment(\.dismiss) private var dismiss
 
@@ -308,15 +312,24 @@ fileprivate struct ResultDetailView: View {
                 }
             }
 
-            HStack {
-                Button("Open File", action: openFile)
-                    .buttonStyle(.bordered)
-                    .disabled(entry.outputImagePath.isEmpty)
+            VStack(alignment: .leading, spacing: 12) {
+                ResultsPromptMetadataView(entry: entry)
 
-                Button("Show in Finder", action: revealFile)
-                    .buttonStyle(.bordered)
-                    .disabled(entry.outputImagePath.isEmpty)
+                HStack {
+                    Button("Remix in Workbench", action: remixEntry)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(onReuse == nil)
+
+                    Button("Open File", action: openFile)
+                        .buttonStyle(.bordered)
+                        .disabled(entry.outputImagePath.isEmpty)
+
+                    Button("Show in Finder", action: revealFile)
+                        .buttonStyle(.bordered)
+                        .disabled(entry.outputImagePath.isEmpty)
+                }
             }
+            .padding(.horizontal)
             .padding(.bottom)
         }
         .frame(minWidth: 800, minHeight: 600)
@@ -374,6 +387,7 @@ fileprivate struct ResultDetailView: View {
     private func loadOutputImage() async {
         outputPhase = imageLoader.cachedPhase(for: outputReference) ?? .loading
         let outcome = await imageLoader.load(reference: outputReference)
+        guard !Task.isCancelled else { return }
         outputPhase = outcome.phase
         persistRefreshedOutputBookmark(outcome.refreshedBookmark)
     }
@@ -387,8 +401,14 @@ fileprivate struct ResultDetailView: View {
 
         sourcePhase = imageLoader.cachedPhase(for: sourceReference) ?? .loading
         let outcome = await imageLoader.load(reference: sourceReference)
+        guard !Task.isCancelled else { return }
         sourcePhase = outcome.phase
         persistRefreshedSourceBookmark(outcome.refreshedBookmark, at: 0)
+    }
+
+    private func remixEntry() {
+        onReuse?(entry)
+        dismiss()
     }
 
     private func openFile() {
@@ -501,6 +521,67 @@ private struct ResultsDetailLoadingState: View {
     }
 }
 
+private struct ResultsPromptMetadataView: View {
+    let entry: HistoryEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Generation Details")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                Spacer()
+                if let modelName = entry.modelName {
+                    Text(modelName)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            Text(entry.prompt)
+                .font(.body)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let systemPrompt = entry.systemPrompt, !systemPrompt.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("System Prompt")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .textCase(.uppercase)
+                    Text(systemPrompt)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+
+            HStack(spacing: 12) {
+                detailBadge("Ratio", entry.aspectRatio)
+                detailBadge("Size", entry.imageSize)
+                detailBadge("Tier", entry.usedBatchTier ? "Batch" : "Standard")
+            }
+        }
+        .padding(12)
+        .background(.background.secondary)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func detailBadge(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+            Text(value)
+                .font(.caption)
+                .fontWeight(.medium)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 private enum ResultsImageRole: String, Sendable {
     case output
     case sourcePrimary
@@ -607,17 +688,20 @@ private enum ThumbnailDecodeResult {
 }
 
 fileprivate final class ResultsImageLoader {
-    private let cache = NSCache<NSString, NSImage>()
+    private let thumbnailCache = NSCache<NSString, NSImage>()
+    private let fullResolutionCache = NSCache<NSString, NSImage>()
     private var inFlight: [String: Task<ResultsImageLoadOutcome, Never>] = [:]
 
     init() {
-        cache.countLimit = 120
-        cache.totalCostLimit = 256 * 1024 * 1024
+        thumbnailCache.countLimit = 160
+        thumbnailCache.totalCostLimit = 128 * 1024 * 1024
+        fullResolutionCache.countLimit = 16
+        fullResolutionCache.totalCostLimit = 96 * 1024 * 1024
     }
 
     @MainActor
     fileprivate func cachedPhase(for reference: ResultsImageReference) -> ResultsImagePhase? {
-        guard let image = cache.object(forKey: reference.cacheKey as NSString) else { return nil }
+        guard let image = cache(for: reference).object(forKey: reference.cacheKey as NSString) else { return nil }
         return .loaded(image)
     }
 
@@ -632,15 +716,21 @@ fileprivate final class ResultsImageLoader {
         }
 
         let task = Task<ResultsImageLoadOutcome, Never>(priority: .utility) { [reference] in
-            let outcome = await Task.detached(priority: .utility) {
-                ResultsImageLoader.read(reference: reference)
-            }.value
+            do {
+                try Task.checkCancellation()
+                let outcome = try ResultsImageLoader.read(reference: reference)
+                try Task.checkCancellation()
 
-            if case let .loaded(image) = outcome.phase {
-                self.cache(image, for: reference)
+                if case let .loaded(image) = outcome.phase {
+                    self.cache(image, for: reference)
+                }
+
+                return outcome
+            } catch is CancellationError {
+                return ResultsImageLoadOutcome(phase: .loading, refreshedBookmark: nil)
+            } catch {
+                return ResultsImageLoadOutcome(phase: .failed, refreshedBookmark: nil)
             }
-
-            return outcome
         }
 
         inFlight[reference.cacheKey] = task
@@ -650,33 +740,47 @@ fileprivate final class ResultsImageLoader {
 
     @MainActor
     private func cache(_ image: NSImage, for reference: ResultsImageReference) {
-        cache.setObject(
+        cache(for: reference).setObject(
             image,
             forKey: reference.cacheKey as NSString,
             cost: image.approximateMemoryCost
         )
     }
 
-    nonisolated private static func read(reference: ResultsImageReference) -> ResultsImageLoadOutcome {
+    @MainActor
+    private func cache(for reference: ResultsImageReference) -> NSCache<NSString, NSImage> {
         switch reference.variant {
+        case .thumbnail:
+            return thumbnailCache
         case .fullResolution:
-            return readFullResolution(reference: reference)
-        case let .thumbnail(bucket):
-            return readThumbnail(reference: reference, bucket: bucket)
+            return fullResolutionCache
         }
     }
 
-    nonisolated private static func readFullResolution(reference: ResultsImageReference) -> ResultsImageLoadOutcome {
+    nonisolated private static func read(reference: ResultsImageReference) throws -> ResultsImageLoadOutcome {
+        try Task.checkCancellation()
+        switch reference.variant {
+        case .fullResolution:
+            return try readFullResolution(reference: reference)
+        case let .thumbnail(bucket):
+            return try readThumbnail(reference: reference, bucket: bucket)
+        }
+    }
+
+    nonisolated private static func readFullResolution(reference: ResultsImageReference) throws -> ResultsImageLoadOutcome {
+        try Task.checkCancellation()
         switch AppPaths.loadImageData(
             bookmark: reference.bookmark,
             fallbackPath: reference.fallbackPath
         ) {
         case let .success(data, refreshedBookmark):
+            try Task.checkCancellation()
             guard let image = NSImage(data: data) else {
                 return ResultsImageLoadOutcome(phase: .failed, refreshedBookmark: refreshedBookmark)
             }
             return ResultsImageLoadOutcome(phase: .loaded(image), refreshedBookmark: refreshedBookmark)
         case let .fallbackUsed(data):
+            try Task.checkCancellation()
             guard let image = NSImage(data: data) else {
                 return ResultsImageLoadOutcome(phase: .failed, refreshedBookmark: nil)
             }
@@ -686,7 +790,8 @@ fileprivate final class ResultsImageLoader {
         }
     }
 
-    nonisolated private static func readThumbnail(reference: ResultsImageReference, bucket: ThumbnailBucket) -> ResultsImageLoadOutcome {
+    nonisolated private static func readThumbnail(reference: ResultsImageReference, bucket: ThumbnailBucket) throws -> ResultsImageLoadOutcome {
+        try Task.checkCancellation()
         switch AppPaths.withAccessibleURL(
             bookmark: reference.bookmark,
             fallbackPath: reference.fallbackPath,
@@ -716,6 +821,7 @@ fileprivate final class ResultsImageLoader {
     }
 
     nonisolated private static func decodeThumbnail(at url: URL, maxPixelSize: Int) -> ThumbnailDecodeResult? {
+        try? Task.checkCancellation()
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
             return .failed
         }
@@ -726,6 +832,7 @@ fileprivate final class ResultsImageLoader {
             kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
         ] as CFDictionary
 
+        try? Task.checkCancellation()
         guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else {
             return .failed
         }

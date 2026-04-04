@@ -52,7 +52,6 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 | Model | Display Name | Best For |
 |-------|--------------|----------|
 | `gemini-3.1-flash-image-preview` | Nano Banana 2 | Speed, high-volume workflows (default) |
-| `gemini-2.5-flash-image-preview` | Nano Banana | Stable, reliable image generation |
 | `gemini-3-pro-image-preview` | Nano Banana Pro | Complex, multi-turn image editing |
 
 ## Installation

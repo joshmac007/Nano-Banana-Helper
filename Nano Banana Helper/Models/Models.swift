@@ -544,7 +544,7 @@ enum JobPhase: String, Codable {
 @Observable
 class ImageTask: Identifiable, Codable {
     static let terminalStatuses: Set<String> = ["completed", "failed", "cancelled", "expired"]
-    static let issueStatuses: Set<String> = ["failed", "cancelled", "expired"]
+    static let issueStatuses: Set<String> = ["failed", "expired"]
 
     let id: UUID
     let inputPaths: [String] // Changed to array for multimodal support
@@ -649,14 +649,24 @@ class ImageTask: Identifiable, Codable {
     var inputURLs: [URL] { inputPaths.map { URL(fileURLWithPath: $0) } }
     var inputURL: URL { URL(fileURLWithPath: inputPath) }
     var outputURL: URL? { outputPath.map { URL(fileURLWithPath: $0) } }
-    var filename: String { 
+    var filename: String {
         if inputPaths.count > 1 {
             let label = status == "completed" ? "output" : "inputs"
             let count = status == "completed" ? "1" : "\(inputPaths.count)"
             return "Multimodal (\(count) \(label))"
         }
-        // Use the path string directly — no bookmark resolution needed for a display name.
-        return URL(fileURLWithPath: inputPath).lastPathComponent
+
+        if inputPaths.isEmpty {
+            return "Generated Image \(shortDisplayID)"
+        }
+
+        let component = URL(fileURLWithPath: inputPath).lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !component.isEmpty, !Self.genericDisplayNames.contains(component.lowercased()) {
+            return component
+        }
+
+        return "Image \(shortDisplayID)"
     }
     var errorMessage: String? { error }
     var duration: TimeInterval? {
@@ -674,6 +684,12 @@ class ImageTask: Identifiable, Codable {
 
     var hasRemoteJob: Bool {
         externalJobName != nil
+    }
+
+    private static let genericDisplayNames: Set<String> = ["data", "image", "file"]
+
+    private var shortDisplayID: String {
+        String(id.uuidString.prefix(8)).uppercased()
     }
 }
 

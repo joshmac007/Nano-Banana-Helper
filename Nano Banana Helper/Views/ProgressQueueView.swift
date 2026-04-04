@@ -1,5 +1,49 @@
 import SwiftUI
 
+struct QueueHeaderActionVisibility: Equatable {
+    let showsPause: Bool
+    let showsResume: Bool
+    let showsCancel: Bool
+
+    init(
+        controlState: QueueControlState,
+        hasCancellationInProgress: Bool,
+        hasActiveNonCancelledWork: Bool,
+        canResumeQueue: Bool,
+        hasOnlyCancelledTerminalJobs: Bool,
+        hasNonTerminalWork: Bool
+    ) {
+        if hasOnlyCancelledTerminalJobs {
+            showsPause = false
+            showsResume = false
+            showsCancel = false
+            return
+        }
+
+        if hasCancellationInProgress {
+            showsPause = false
+            showsResume = false
+            showsCancel = hasNonTerminalWork
+            return
+        }
+
+        switch controlState {
+        case .running, .resuming:
+            showsPause = hasActiveNonCancelledWork
+            showsResume = false
+            showsCancel = hasNonTerminalWork
+        case .pausedLocal, .interrupted:
+            showsPause = false
+            showsResume = canResumeQueue
+            showsCancel = hasNonTerminalWork
+        case .idle, .cancelling:
+            showsPause = false
+            showsResume = false
+            showsCancel = false
+        }
+    }
+}
+
 /// The "Banana Peel" - visual progress queue
 struct ProgressQueueView: View {
     let historyManager: HistoryManager
@@ -30,26 +74,24 @@ struct ProgressQueueView: View {
                     Divider()
                         .frame(height: 16)
 
-                    if orchestrator.isRunning {
+                    if headerActions.showsPause {
                         Button(action: { orchestrator.pause() }) {
                             Label("Pause", systemImage: "pause.fill")
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                    }
 
-                        Button(role: .destructive, action: { orchestrator.cancel() }) {
-                            Label("Cancel", systemImage: "xmark.circle")
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    } else if orchestrator.isPaused || orchestrator.hasInterruptedJobs {
+                    if headerActions.showsResume {
                         Button(action: { Task { await orchestrator.startAll() } }) {
                             Label("Resume", systemImage: "play.fill")
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                         .tint(.orange)
+                    }
 
+                    if headerActions.showsCancel {
                         Button(role: .destructive, action: { orchestrator.cancel() }) {
                             Label("Cancel", systemImage: "xmark.circle")
                         }
@@ -74,9 +116,7 @@ struct ProgressQueueView: View {
             if allTasks.isEmpty {
                 VStack {
                     ContentUnavailableView {
-                        Label("No Tasks", systemImage: "tray")
-                    } description: {
-                        Text("Add images and start a batch to see progress here.")
+                        Image(systemName: "tray")
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -113,6 +153,17 @@ struct ProgressQueueView: View {
                         }
                     }
                     
+                    // Cancelled
+                    if !orchestrator.cancelledJobs.isEmpty {
+                        let count = orchestrator.cancelledJobs.count
+                        Section("Cancelled (\(count))") {
+                            ForEach(orchestrator.cancelledJobs, id: \.id) { task in
+                                TaskRowView(task: task)
+                            }
+                            .onDelete(perform: orchestrator.removeCancelledTasks)
+                        }
+                    }
+
                     // Issues
                     if !orchestrator.failedJobs.isEmpty {
                         let count = orchestrator.failedJobs.count
@@ -193,7 +244,7 @@ struct ProgressQueueView: View {
     }
     
     private var allTasks: [ImageTask] {
-        orchestrator.pendingJobs + orchestrator.processingJobs + orchestrator.completedJobs + orchestrator.failedJobs
+        orchestrator.pendingJobs + orchestrator.processingJobs + orchestrator.completedJobs + orchestrator.cancelledJobs + orchestrator.failedJobs
     }
     
     private var progressColor: Color {
@@ -204,6 +255,14 @@ struct ProgressQueueView: View {
     }
 
     private var headerSubtitle: String {
+        if orchestrator.hasCancellationInProgress {
+            return "Cancelling remotely where possible and reconciling final job states."
+        }
+
+        if orchestrator.hasOnlyCancelledTerminalJobs {
+            return "Cancellation complete. Cancelled jobs remain visible until you clear them."
+        }
+
         switch orchestrator.controlState {
         case .pausedLocal:
             return "Paused locally. Gemini may still finish already-submitted work remotely."
@@ -214,6 +273,17 @@ struct ProgressQueueView: View {
         default:
             return "Reprioritize tasks in Staging before submission. Live queue reordering is not available."
         }
+    }
+
+    private var headerActions: QueueHeaderActionVisibility {
+        QueueHeaderActionVisibility(
+            controlState: orchestrator.controlState,
+            hasCancellationInProgress: orchestrator.hasCancellationInProgress,
+            hasActiveNonCancelledWork: orchestrator.hasActiveNonCancelledWork,
+            canResumeQueue: orchestrator.canResumeQueue,
+            hasOnlyCancelledTerminalJobs: orchestrator.hasOnlyCancelledTerminalJobs,
+            hasNonTerminalWork: orchestrator.hasNonTerminalWork
+        )
     }
     
     private func openOutputFolder() {
@@ -407,10 +477,7 @@ struct TaskRowView: View {
     }
 
     private func formattedPollState(_ state: String) -> String {
-        state
-            .replacingOccurrences(of: "JOB_STATE_", with: "")
-            .replacingOccurrences(of: "_", with: " ")
-            .lowercased()
+        NanoBananaService.displayBatchState(state)
     }
 
     private var shouldShowPhaseMetadata: Bool {

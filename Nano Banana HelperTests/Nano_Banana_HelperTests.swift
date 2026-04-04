@@ -10,6 +10,8 @@ import Testing
 @testable import Nano_Banana_Helper
 
 struct Nano_Banana_HelperTests {
+    private let floatingPointTolerance = 0.000_000_1
+
     private func makeTemporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -263,9 +265,9 @@ struct Nano_Banana_HelperTests {
             modelName: "gemini-2.5-flash-image"
         )
 
-        #expect(proImageCost == 0.1362)
-        #expect(flashImageCost == 0.078336)
-        #expect(flashTextCost == 0.0585)
+        #expect(abs(proImageCost - 0.1362) < floatingPointTolerance)
+        #expect(abs(flashImageCost - 0.078336) < floatingPointTolerance)
+        #expect(abs(flashTextCost - 0.0585) < floatingPointTolerance)
         #expect(proImageCost > flashImageCost)
     }
 
@@ -320,6 +322,98 @@ struct Nano_Banana_HelperTests {
         #expect(decoded.modelName == "gemini-3-pro-image-preview")
         #expect(decoded.isTextMode)
         #expect(decoded.systemPrompt == "system")
+    }
+
+    @Test func imageTaskFilenameUsesGeneratedFallbackForTextOnlyTasks() {
+        let task = ImageTask(inputPaths: [])
+
+        #expect(task.filename.hasPrefix("Generated Image "))
+        #expect(task.filename != "Data")
+    }
+
+    @Test func imageTaskFilenameUsesStableFallbackForGenericImportedNames() {
+        let task = ImageTask(inputPaths: ["/tmp/Data"])
+
+        #expect(task.filename.hasPrefix("Image "))
+        #expect(task.filename != "Data")
+    }
+
+    @Test func inferBatchJobStateTreatsDoneCancelledErrorAsCancelled() {
+        let error: [String: Any] = [
+            "status": "CANCELLED",
+            "message": "Operation was cancelled by the user."
+        ]
+
+        #expect(
+            NanoBananaService.inferBatchJobState(done: true, metadataState: nil, error: error) ==
+            "JOB_STATE_CANCELLED"
+        )
+    }
+
+    @Test func inferBatchJobStateNormalizesBatchStateCancelledToJobStateCancelled() {
+        #expect(
+            NanoBananaService.inferBatchJobState(
+                done: true,
+                metadataState: "BATCH_STATE_CANCELLED",
+                error: nil
+            ) == "JOB_STATE_CANCELLED"
+        )
+    }
+
+    @Test func inferBatchJobStateTreatsDoneErrorsWithoutCancelAsFailed() {
+        let error: [String: Any] = [
+            "status": "INTERNAL",
+            "message": "Batch processing failed."
+        ]
+
+        #expect(
+            NanoBananaService.inferBatchJobState(done: true, metadataState: nil, error: error) ==
+            "JOB_STATE_FAILED"
+        )
+    }
+
+    @Test func resolveTerminalBatchResolutionTreatsDoneCancelledPayloadAsCancelled() {
+        let error: [String: Any] = [
+            "status": "CANCELLED",
+            "message": "Operation was cancelled by the user."
+        ]
+
+        do {
+            _ = try NanoBananaService.resolveTerminalBatchResolution(
+                done: true,
+                metadataState: nil,
+                response: nil,
+                dest: nil,
+                error: error
+            )
+            Issue.record("Expected cancelled terminal payload to throw jobCancelled")
+        } catch NanoBananaError.jobCancelled {
+            // Expected path.
+        } catch {
+            Issue.record("Expected jobCancelled but got \(error)")
+        }
+    }
+
+    @Test func resolveTerminalBatchResolutionKeepsSucceededPayloadWithoutImageAsNoImageError() {
+        do {
+            _ = try NanoBananaService.resolveTerminalBatchResolution(
+                done: true,
+                metadataState: "JOB_STATE_SUCCEEDED",
+                response: nil,
+                dest: nil,
+                error: nil
+            )
+            Issue.record("Expected succeeded terminal payload without output to throw noImageInResponse")
+        } catch NanoBananaError.noImageInResponse {
+            // Expected path.
+        } catch {
+            Issue.record("Expected noImageInResponse but got \(error)")
+        }
+    }
+
+    @Test func canonicalBatchStateConvertsBatchPrefixToJobPrefix() {
+        #expect(NanoBananaService.canonicalBatchState("BATCH_STATE_CANCELLED") == "JOB_STATE_CANCELLED")
+        #expect(NanoBananaService.canonicalBatchState(" job_state_failed ") == "JOB_STATE_FAILED")
     }
 
     @MainActor @Test func stagingRestoreImageEntryRestoresImageModeSettingsAndFiles() throws {
@@ -1294,8 +1388,8 @@ struct Nano_Banana_HelperTests {
             modelName: "legacy-image-model"
         )
 
-        #expect(proEstimator.totalCost == 0.2704)
-        #expect(flashEstimator.totalCost == 0.156336)
+        #expect(abs(proEstimator.totalCost - 0.2702) < floatingPointTolerance)
+        #expect(abs(flashEstimator.totalCost - 0.156336) < floatingPointTolerance)
         #expect(proEstimator.totalCost > flashEstimator.totalCost)
         #expect(fallbackEstimator.fallbackPricingDescription == "Using Nano Banana pricing fallback.")
     }
@@ -1463,6 +1557,141 @@ struct Nano_Banana_HelperTests {
         }
     }
 
+    @MainActor @Test func pausedQueueCancelTransitionsToCancellingAndMovesRemoteTaskToCancelRequested() async throws {
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { _ in }
+        )
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        batch.status = "processing"
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .pausedLocal
+        task.externalJobName = "batches/test-job"
+        batch.tasks = [task]
+
+        orchestrator.enqueue(batch)
+        orchestrator.controlState = .pausedLocal
+
+        orchestrator.cancel()
+
+        for _ in 0..<5 {
+            await Task.yield()
+        }
+
+        #expect(orchestrator.controlState == .cancelling)
+        #expect(orchestrator.hasCancellationInProgress)
+        #expect(orchestrator.canResumeQueue == false)
+        #expect(orchestrator.processingJobs.first?.phase == .cancelRequested)
+        #expect(orchestrator.processingJobs.first?.error == "Cancel requested. Waiting for final status.")
+    }
+
+    @MainActor @Test func cancelledOnlyQueueFinishesWithCancellationCompleteStatus() async throws {
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false
+        )
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        batch.tasks = [ImageTask(inputPaths: ["/tmp/input.png"])]
+
+        orchestrator.enqueue(batch)
+        orchestrator.cancel()
+
+        for _ in 0..<5 {
+            await Task.yield()
+        }
+
+        #expect(orchestrator.controlState == .idle)
+        #expect(orchestrator.statusMessage == "Cancellation complete")
+        #expect(orchestrator.aggregateTone == .cancelled)
+    }
+
+    @MainActor @Test func cancelledTasksDoNotAppearInFailedJobs() async throws {
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false
+        )
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        batch.tasks = [ImageTask(inputPaths: ["/tmp/input.png"])]
+
+        orchestrator.enqueue(batch)
+        orchestrator.cancel()
+
+        for _ in 0..<5 {
+            await Task.yield()
+        }
+
+        #expect(orchestrator.cancelledJobs.count == 1)
+        #expect(orchestrator.failedJobs.isEmpty)
+        #expect(orchestrator.hasTrueFailures == false)
+    }
+
+    @MainActor @Test func failedTasksRemainInFailedJobs() throws {
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false
+        )
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "failed"
+        task.phase = .failed
+        task.error = "boom"
+        batch.tasks = [task]
+
+        orchestrator.enqueue(batch)
+
+        #expect(orchestrator.failedJobs.count == 1)
+        #expect(orchestrator.cancelledJobs.isEmpty)
+        #expect(orchestrator.hasTrueFailures)
+        #expect(orchestrator.aggregateTone == .issue)
+    }
+
+    @Test func headerActionsShowResumeBeforeCancelOnPausedQueue() {
+        let actions = QueueHeaderActionVisibility(
+            controlState: .pausedLocal,
+            hasCancellationInProgress: false,
+            hasActiveNonCancelledWork: true,
+            canResumeQueue: true,
+            hasOnlyCancelledTerminalJobs: false,
+            hasNonTerminalWork: true
+        )
+
+        #expect(actions.showsPause == false)
+        #expect(actions.showsResume)
+        #expect(actions.showsCancel)
+    }
+
+    @Test func headerActionsHideResumeWhileCancellationIsInProgress() {
+        let actions = QueueHeaderActionVisibility(
+            controlState: .pausedLocal,
+            hasCancellationInProgress: true,
+            hasActiveNonCancelledWork: false,
+            canResumeQueue: false,
+            hasOnlyCancelledTerminalJobs: false,
+            hasNonTerminalWork: true
+        )
+
+        #expect(actions.showsPause == false)
+        #expect(actions.showsResume == false)
+        #expect(actions.showsCancel)
+    }
+
+    @Test func headerActionsHideAllButtonsForCancelledOnlyTerminalQueue() {
+        let actions = QueueHeaderActionVisibility(
+            controlState: .idle,
+            hasCancellationInProgress: false,
+            hasActiveNonCancelledWork: false,
+            canResumeQueue: false,
+            hasOnlyCancelledTerminalJobs: true,
+            hasNonTerminalWork: false
+        )
+
+        #expect(actions.showsPause == false)
+        #expect(actions.showsResume == false)
+        #expect(actions.showsCancel == false)
+    }
+
     @MainActor @Test func pauseStatePersistsAcrossReload() throws {
         let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
         let orchestrator = BatchOrchestrator(
@@ -1578,8 +1807,8 @@ struct Nano_Banana_HelperTests {
             }
         )
 
-        if orchestrator.controlState != .interrupted {
-            Issue.record("Expected persisted cancelling state to normalize to interrupted on reload")
+        if orchestrator.controlState != .cancelling {
+            Issue.record("Expected persisted cancelling state to stay cancellation-oriented on reload")
         }
         if !orchestrator.pendingJobs.isEmpty {
             Issue.record("Expected cancelling recovery queue to avoid reintroducing pending work")

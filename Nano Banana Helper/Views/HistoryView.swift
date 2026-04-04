@@ -128,6 +128,13 @@ struct HistoryView: View {
                             showingRescueDialog = true
                         }
                     )
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button(role: .destructive) {
+                            onDelete?(entry)
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    }
                     .contextMenu {
                         if let project {
                             Button("Show in Finder") {

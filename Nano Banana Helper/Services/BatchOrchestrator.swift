@@ -42,11 +42,22 @@ private struct StartupRecoveryNormalizationResult {
     let didChangePersistedState: Bool
 }
 
+enum QueueAggregateTone: Equatable {
+    case neutral
+    case success
+    case cancelled
+    case issue
+}
+
 /// Orchestrates batch processing of image editing tasks
 @Observable
 @MainActor
 final class BatchOrchestrator {
     typealias ProcessQueueOverride = @Sendable (UUID) async -> Void
+
+    private var allJobs: [ImageTask] {
+        activeBatches.flatMap(\.tasks)
+    }
 
     var pendingJobs: [ImageTask] {
         activeBatches.flatMap { $0.tasks.filter { $0.status == "pending" } }
@@ -62,6 +73,57 @@ final class BatchOrchestrator {
 
     var failedJobs: [ImageTask] {
         activeBatches.flatMap { $0.tasks.filter { ImageTask.issueStatuses.contains($0.status) } }
+    }
+
+    var cancelledJobs: [ImageTask] {
+        activeBatches.flatMap { $0.tasks.filter { $0.status == "cancelled" } }
+    }
+
+    var hasNonTerminalWork: Bool {
+        allJobs.contains(where: { !$0.isTerminal })
+    }
+
+    var hasActiveNonCancelledWork: Bool {
+        allJobs.contains { !$0.isTerminal && $0.phase != .cancelRequested }
+    }
+
+    var hasCancellationInProgress: Bool {
+        controlState == .cancelling || allJobs.contains {
+            !$0.isTerminal && $0.phase == .cancelRequested
+        }
+    }
+
+    var hasRemoteCancellationReconciliation: Bool {
+        allJobs.contains {
+            !$0.isTerminal && $0.phase == .cancelRequested && $0.hasRemoteJob
+        }
+    }
+
+    var hasTrueFailures: Bool {
+        !failedJobs.isEmpty
+    }
+
+    var hasOnlyCancelledTerminalJobs: Bool {
+        !allJobs.isEmpty &&
+        allJobs.allSatisfy(\.isTerminal) &&
+        allJobs.allSatisfy { $0.status == "cancelled" }
+    }
+
+    var canResumeQueue: Bool {
+        !hasCancellationInProgress &&
+        !hasOnlyCancelledTerminalJobs &&
+        (isPaused || hasInterruptedJobs)
+    }
+
+    var aggregateTone: QueueAggregateTone {
+        if hasTrueFailures { return .issue }
+        if !isRunning && !cancelledJobs.isEmpty { return .cancelled }
+        if !isRunning && !completedJobs.isEmpty { return .success }
+        return .neutral
+    }
+
+    var cancellationStatusMessage: String {
+        hasRemoteCancellationReconciliation ? "Reconciling cancellation..." : "Cancelling jobs..."
     }
 
     var isRunning: Bool {
@@ -84,7 +146,6 @@ final class BatchOrchestrator {
                     task.phase == .reconnecting ||
                     task.phase == .stalled ||
                     task.phase == .pausedLocal ||
-                    task.phase == .cancelRequested ||
                     task.phase == .submittedRemote
                 )
             }
@@ -297,7 +358,7 @@ final class BatchOrchestrator {
     }
 
     func pause() {
-        guard isRunning else { return }
+        guard isRunning, !hasCancellationInProgress else { return }
         controlState = .pausedLocal
         statusMessage = "Paused locally"
         applyPausedStateToActiveTasks()
@@ -306,7 +367,7 @@ final class BatchOrchestrator {
     }
 
     func cancel() {
-        guard activeBatches.contains(where: { $0.tasks.contains(where: { !$0.isTerminal }) }) else {
+        guard hasNonTerminalWork else {
             controlState = .idle
             statusMessage = "Ready"
             saveActiveBatches()
@@ -314,7 +375,7 @@ final class BatchOrchestrator {
         }
 
         controlState = .cancelling
-        statusMessage = "Cancelling jobs..."
+        statusMessage = cancellationStatusMessage
         for batch in activeBatches {
             cancel(batch: batch)
         }
@@ -356,7 +417,7 @@ final class BatchOrchestrator {
         }
 
         normalizeBatchStatus(batch)
-        statusMessage = "Cancelling jobs..."
+        statusMessage = cancellationStatusMessage
         saveActiveBatches()
         updateProgress()
     }
@@ -371,6 +432,20 @@ final class BatchOrchestrator {
 
     func removeFailedTasks(at offsets: IndexSet) {
         let tasksToRemove = offsets.map { failedJobs[$0] }
+        for task in tasksToRemove {
+            if let batchIndex = activeBatches.firstIndex(where: { $0.tasks.contains(where: { $0.id == task.id }) }) {
+                activeBatches[batchIndex].tasks.removeAll(where: { $0.id == task.id })
+                if activeBatches[batchIndex].tasks.isEmpty {
+                    activeBatches.remove(at: batchIndex)
+                }
+            }
+        }
+        updateProgress()
+        saveActiveBatches()
+    }
+
+    func removeCancelledTasks(at offsets: IndexSet) {
+        let tasksToRemove = offsets.map { cancelledJobs[$0] }
         for task in tasksToRemove {
             if let batchIndex = activeBatches.firstIndex(where: { $0.tasks.contains(where: { $0.id == task.id }) }) {
                 activeBatches[batchIndex].tasks.removeAll(where: { $0.id == task.id })
@@ -741,6 +816,21 @@ final class BatchOrchestrator {
 
     private func markJobAsStalled(jobId: UUID, state: String) async {
         guard let batch = batch(containing: jobId), let job = task(for: jobId) else { return }
+        if job.phase == .cancelRequested || job.cancelRequestedAt != nil || controlState == .cancelling {
+            job.phase = .cancelRequested
+            job.status = "processing"
+            job.lastPollState = state
+            job.lastPollUpdatedAt = Date()
+            job.stalledAt = Date()
+            job.error = "Cancel requested. Waiting for the final remote status."
+            batch.status = "processing"
+            controlState = .cancelling
+            statusMessage = cancellationStatusMessage
+            saveActiveBatches()
+            updateProgress()
+            return
+        }
+
         job.phase = .stalled
         job.status = "processing"
         job.lastPollState = state
@@ -811,7 +901,7 @@ final class BatchOrchestrator {
                 onCostIncurred?(cost, settings.imageSize, projectId, response.tokenUsage, settings.modelName)
             }
 
-            if completedDespiteCancel {
+            if completedDespiteCancel, !hasCancellationInProgress {
                 statusMessage = "Some jobs completed before cancellation took effect."
             }
 
@@ -1076,11 +1166,19 @@ final class BatchOrchestrator {
 
         if activeBatches.allSatisfy({ $0.tasks.allSatisfy(\.isTerminal) }) {
             controlState = .idle
-            if failedJobs.isEmpty {
-                statusMessage = "Queue finished"
-            } else {
+            if hasOnlyCancelledTerminalJobs {
+                statusMessage = "Cancellation complete"
+            } else if hasTrueFailures {
                 statusMessage = "Queue finished with issues"
+            } else {
+                statusMessage = "Queue finished"
             }
+            return
+        }
+
+        if hasCancellationInProgress {
+            controlState = .cancelling
+            statusMessage = cancellationStatusMessage
             return
         }
 
@@ -1094,7 +1192,6 @@ final class BatchOrchestrator {
                 task.hasRemoteJob && !task.isTerminal && (
                     task.phase == .stalled || 
                     task.phase == .reconnecting || 
-                    task.phase == .cancelRequested || 
                     task.phase == .submittedRemote || 
                     task.phase == .pausedLocal
                 )
@@ -1102,11 +1199,6 @@ final class BatchOrchestrator {
         }) {
             controlState = .interrupted
             statusMessage = "Polling paused locally. Use Resume to continue."
-            return
-        }
-
-        if controlState == .cancelling {
-            statusMessage = "Cancelling jobs..."
             return
         }
 
@@ -1243,6 +1335,8 @@ final class BatchOrchestrator {
 
             if startupRecoveryHadAmbiguousSubmittingTasks && !activeBatches.contains(where: { $0.tasks.contains(where: { !$0.isTerminal }) }) {
                 statusMessage = "Saved queue has submission issues. Retry failed items manually."
+            } else if hasCancellationInProgress {
+                statusMessage = cancellationStatusMessage
             } else if controlState == .pausedLocal {
                 statusMessage = "Paused locally"
             } else if shouldAutoResumeRecoveredQueueOnLaunch {

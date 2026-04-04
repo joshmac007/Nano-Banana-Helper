@@ -83,6 +83,11 @@ struct AppConfig: Codable {
 
 /// Service for communicating with the Gemini API
 actor NanoBananaService {
+    enum BatchTerminalResolution {
+        case response([String: Any])
+        case dest([String: Any])
+    }
+
     // private let modelName = "gemini-3-pro-image-preview" // Removed hardcoded
     private let session: URLSession
     
@@ -430,7 +435,12 @@ actor NanoBananaService {
                 
                 // Get state from metadata
                 let metadata = json["metadata"] as? [String: Any]
-                let state = metadata?["state"] as? String ?? (done ? "JOB_STATE_SUCCEEDED" : "JOB_STATE_PENDING")
+                let error = json["error"] as? [String: Any] ?? metadata?["error"] as? [String: Any]
+                let state = Self.inferBatchJobState(
+                    done: done,
+                    metadataState: metadata?["state"] as? String,
+                    error: error
+                )
                 latestState = state
                 let update = PollStatusUpdate(attempt: pollCount, state: state, updatedAt: Date())
                 onPollUpdate?(update)
@@ -439,26 +449,19 @@ actor NanoBananaService {
                 retryState.reset()
                 
                 if done || completedStates.contains(state) {
-                    if state == "JOB_STATE_SUCCEEDED" || done {
-                        // Check for inlined responses in the response field
-                        if let responseObj = json["response"] as? [String: Any] {
-                            return try await extractResultFromResponse(responseObj, requestKey: requestKey, apiKey: apiKey)
-                        }
-                        // Some batch jobs may have results in metadata.dest
-                        if let dest = metadata?["dest"] as? [String: Any] {
-                            return try await extractResultFromDest(dest, requestKey: requestKey, apiKey: apiKey)
-                        }
-                        throw NanoBananaError.noImageInResponse
-                    } else if state == "JOB_STATE_FAILED" {
-                        let error = json["error"] as? [String: Any] ?? metadata?["error"] as? [String: Any]
-                        let message = error?["message"] as? String ?? "Unknown batch error"
-                        throw NanoBananaError.batchError(message: message)
-                    } else if state == "JOB_STATE_CANCELLED" {
-                        throw NanoBananaError.jobCancelled
-                    } else if state == "JOB_STATE_EXPIRED" {
-                        throw NanoBananaError.jobExpired
-                    } else {
-                        throw NanoBananaError.batchError(message: "Job \(state.lowercased().replacingOccurrences(of: "job_state_", with: ""))")
+                    let resolution = try Self.resolveTerminalBatchResolution(
+                        done: done,
+                        metadataState: metadata?["state"] as? String,
+                        response: json["response"] as? [String: Any],
+                        dest: metadata?["dest"] as? [String: Any],
+                        error: error
+                    )
+
+                    switch resolution {
+                    case .response(let responseObj):
+                        return try await extractResultFromResponse(responseObj, requestKey: requestKey, apiKey: apiKey)
+                    case .dest(let dest):
+                        return try await extractResultFromDest(dest, requestKey: requestKey, apiKey: apiKey)
                     }
                 }
 
@@ -696,6 +699,101 @@ actor NanoBananaService {
         throw NanoBananaError.noImageInResponse
     }
     
+    static func inferBatchJobState(done: Bool, metadataState: String?, error: [String: Any]?) -> String {
+        if let metadataState {
+            let trimmed = canonicalBatchState(metadataState)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+
+        guard done else {
+            return "JOB_STATE_PENDING"
+        }
+
+        if isCancellationError(error) {
+            return "JOB_STATE_CANCELLED"
+        }
+
+        if error != nil {
+            return "JOB_STATE_FAILED"
+        }
+
+        return "JOB_STATE_SUCCEEDED"
+    }
+
+    static func batchErrorMessage(from error: [String: Any]?) -> String? {
+        guard let error else { return nil }
+        if let message = error["message"] as? String, !message.isEmpty {
+            return message
+        }
+        if let status = error["status"] as? String, !status.isEmpty {
+            return status
+        }
+        return nil
+    }
+
+    static func resolveTerminalBatchResolution(
+        done: Bool,
+        metadataState: String?,
+        response: [String: Any]?,
+        dest: [String: Any]?,
+        error: [String: Any]?
+    ) throws -> BatchTerminalResolution {
+        let state = inferBatchJobState(done: done, metadataState: metadataState, error: error)
+
+        switch state {
+        case "JOB_STATE_SUCCEEDED":
+            if let response {
+                return .response(response)
+            }
+            if let dest {
+                return .dest(dest)
+            }
+            throw NanoBananaError.noImageInResponse
+        case "JOB_STATE_FAILED":
+            throw NanoBananaError.batchError(message: batchErrorMessage(from: error) ?? "Unknown batch error")
+        case "JOB_STATE_CANCELLED":
+            throw NanoBananaError.jobCancelled
+        case "JOB_STATE_EXPIRED":
+            throw NanoBananaError.jobExpired
+        default:
+            throw NanoBananaError.batchError(
+                message: "Job \(displayBatchState(state))"
+            )
+        }
+    }
+
+    private static func isCancellationError(_ error: [String: Any]?) -> Bool {
+        guard let error else { return false }
+
+        let status = (error["status"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        if status == "CANCELLED" || status == "CANCELED" {
+            return true
+        }
+
+        let message = (error["message"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        return message.contains("cancelled") || message.contains("canceled")
+    }
+
+    static func canonicalBatchState(_ state: String) -> String {
+        state
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+            .replacingOccurrences(of: "BATCH_STATE_", with: "JOB_STATE_")
+    }
+
+    static func displayBatchState(_ state: String) -> String {
+        canonicalBatchState(state)
+            .replacingOccurrences(of: "JOB_STATE_", with: "")
+            .replacingOccurrences(of: "_", with: " ")
+            .lowercased()
+    }
+
     private func mimeType(for url: URL) -> String {
         switch url.pathExtension.lowercased() {
         case "png": return "image/png"
@@ -808,9 +906,9 @@ enum NanoBananaError: LocalizedError {
         case .jobExpired:
             return "Remote batch expired before completion."
         case .softTimeout(let state):
-            return "Polling paused after the local timeout while the remote job was still \(state.replacingOccurrences(of: "JOB_STATE_", with: "").lowercased())."
+            return "Polling paused after the local timeout while the remote job was still \(NanoBananaService.displayBatchState(state))."
         case .pollingStopped(let state):
-            return "Polling stopped locally while the remote job was still \(state.replacingOccurrences(of: "JOB_STATE_", with: "").lowercased())."
+            return "Polling stopped locally while the remote job was still \(NanoBananaService.displayBatchState(state))."
         case .timeout:
             return "The request timed out. Try again or reduce image size."
         case .unknownError:

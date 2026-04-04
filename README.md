@@ -13,7 +13,7 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 ## Features
 
 ### 🚀 Core Capabilities
-- **Batch Orchestration**: Process hundreds of images concurrently with robust queue management.
+- **Batch Orchestration**: Process hundreds of images concurrently with robust queue management, including pause, resume, and cancel capabilities.
 - **Smart Staging**: Drag and drop support for individual images or entire directories.
 - **Text-to-Image**: Generate images from text prompts without input images. Create 1-4 variations per request.
 - **Multi-Input Mode**: Merge multiple input images into a single output using advanced prompt instructions.

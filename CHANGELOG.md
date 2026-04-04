@@ -2,19 +2,24 @@
 
 All notable changes to Nano Banana Helper will be documented in this file.
 
-## [1.4.0] - 2026-04-03
+## [1.4.0] - 2026-04-04
 
 ### Added
+- **Batch Task Controls**: Implemented full pause, resume, and cancel workflow capabilities with accurate UI state management and job tracking.
 - **Usage Dashboard Charts**: Enhanced the Usage tab with real-time visual charts to map Spend Over Time, Images Over Time, and usage broken down by models and resolutions.
 - **Model Catalog Engine**: Replaced static model parsing with dynamic compatibility fetching from API responses, seamlessly integrating legacy fallback states.
 - **File Reordering**: Support for file reordering within the Batch Staging View.
 
 ### Changed
+- **Centralized & Model-Aware Pricing**: Pricing is now centrally managed by an `AppPricing` engine and integrated across batch orchestration for accurate, real-time projections.
+- **Progress Queue UI**: Simplified the progress queue empty state by cleaning up text labels for a more elegant interface.
 - **Results View Layout**: Replaced the continuous size slider with a discrete grid column setting for Results. Result cards now use a uniform layout with centered, fit-to-fill crops.
-- **Centralized Pricing**: Pricing is now centrally managed by an `AppPricing` engine rather than inline literal constants.
 - **Image Loader Orchestration**: `ResultsView` image loading migrated to use `ResultsImageLoader` for coalescing repetitive requests and deduping duplicate in-flight data constraints. Loading states are explicit to remove visual flash.
 
 ### Fixed
+- **Project Data Persistence**: Fixed issues causing project history and image results to momentarily vanish upon tab switching or app relaunch.
+- **Startup Queue Recovery**: Implemented robust recovery and normalized queue states for resuming or clearing interrupted tasks upon application launch.
+- **Swift 6 Concurrency**: Resolved actor-isolation warnings and stabilized the test suite by utilizing explicit `@MainActor` annotations.
 - **Thumbnail Memory & Performance**: Added proper `ImageIO` thumbnail downsampling for results to dramatically improve scrolling performance and memory footprint over decoding true full-resolution variants.
 - **Bookmark Persistence**: Fixed deep macOS sandboxing reauthorization loops surrounding the Output Folder logic by introducing a new `BookmarkAccessDeniedView` and generic URL access helpers (`AppPaths`).
 

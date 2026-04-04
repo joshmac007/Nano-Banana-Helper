@@ -4,7 +4,8 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 
 ![MainScreen](https://github.com/joshmac007/Nano-Banana-Helper/blob/main/MainScreen.jpeg)
 
-![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)
+![Latest Release](https://img.shields.io/github/v/release/joshmac007/Nano-Banana-Helper?color=success&label=Release)
+![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)
 ![Swift 6.0](https://img.shields.io/badge/Swift-6.0-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -12,11 +13,12 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 ## Features
 
 ### 🚀 Core Capabilities
-- **Batch Orchestration**: Process hundreds of images concurrently with robust queue management.
+- **Batch Orchestration**: Process hundreds of images concurrently with robust queue management, including pause, resume, and cancel capabilities.
 - **Smart Staging**: Drag and drop support for individual images or entire directories.
 - **Text-to-Image**: Generate images from text prompts without input images. Create 1-4 variations per request.
 - **Multi-Input Mode**: Merge multiple input images into a single output using advanced prompt instructions.
 - **Cost Estimation**: Real-time cost calculation based on image size, count, and selected model tier.
+- **Usage Analytics**: Track token usage and estimated spend over time using rich dashboard charts, filtering by session, models, or specific time ranges.
 - **Model Selection**: Choose between Nano Banana 2 (fastest), Nano Banana (stable), or Nano Banana Pro (highest quality) in Settings.
 
 ### 🛠️ Advanced Tools
@@ -55,9 +57,18 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 
 ## Installation
 
+### Pre-built App (Recommended)
+
+The easiest way to install Nano Banana Helper is to download the compiled version:
+1. Go to the **Releases** section on the right sidebar of this GitHub repository.
+2. Download the latest `Nano Banana Helper.dmg` file.
+3. Open the `.dmg` and drag the app into your Applications folder.
+
+### Build from Source (Developers)
+
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/froggeric/Nano-Banana-Helper.git
+   git clone https://github.com/joshmac007/Nano-Banana-Helper.git
    cd Nano-Banana-Helper
    ```
 

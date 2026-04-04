@@ -54,6 +54,12 @@ struct PollRetryState: Sendable {
     }
 }
 
+struct PollStatusUpdate: Sendable {
+    let attempt: Int
+    let state: String
+    let updatedAt: Date
+}
+
 /// Simple config storage — @MainActor ensures all reads/writes are serialized
 @MainActor
 struct AppConfig: Codable {
@@ -77,6 +83,11 @@ struct AppConfig: Codable {
 
 /// Service for communicating with the Gemini API
 actor NanoBananaService {
+    enum BatchTerminalResolution {
+        case response([String: Any])
+        case dest([String: Any])
+    }
+
     // private let modelName = "gemini-3-pro-image-preview" // Removed hardcoded
     private let session: URLSession
     
@@ -124,13 +135,33 @@ actor NanoBananaService {
     func getModelName() async -> String {
         await MainActor.run { AppConfig.load().modelName } ?? "gemini-3.1-flash-image-preview"
     }
+
+    func fetchAvailableModels(selectedModelID: String? = nil) async throws -> [ModelCatalogEntry] {
+        guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
+            return CuratedModelCatalog.fallbackEntries(selectedModelID: selectedModelID)
+        }
+
+        var request = URLRequest(url: try Self.listModelsURL(apiKey: apiKey, pageSize: 100))
+        request.httpMethod = "GET"
+        let (data, response) = try await session.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            throw NanoBananaError.invalidResponse
+        }
+
+        let entries = try CuratedModelCatalog.entries(from: data, selectedModelID: selectedModelID)
+        if entries.isEmpty {
+            return CuratedModelCatalog.fallbackEntries(selectedModelID: selectedModelID)
+        }
+        return entries
+    }
     
     // MARK: - Image Editing
     
     /// Maximum payload size for inline batch requests (20MB per documentation)
     private let maxBatchPayloadSize = 20 * 1024 * 1024
     
-    func editImage(_ request: ImageEditRequest, onJobCreated: (@Sendable (String) -> Void)? = nil, onPollUpdate: (@Sendable (Int) -> Void)? = nil) async throws -> ImageEditResponse {
+    func editImage(_ request: ImageEditRequest, onJobCreated: (@Sendable (String) -> Void)? = nil, onPollUpdate: (@Sendable (PollStatusUpdate) -> Void)? = nil) async throws -> ImageEditResponse {
         guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
         }
@@ -252,7 +283,12 @@ actor NanoBananaService {
     // MARK: - Batch Job Resume
     
     /// Resume polling for an interrupted batch job
-    func resumePolling(jobName: String, onPollUpdate: (@Sendable (Int) -> Void)? = nil) async throws -> ImageEditResponse {
+    func resumePolling(
+        jobName: String,
+        onPollUpdate: (@Sendable (PollStatusUpdate) -> Void)? = nil,
+        softTimeout: TimeInterval? = nil,
+        shouldContinue: (@Sendable () async -> Bool)? = nil
+    ) async throws -> ImageEditResponse {
         guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
         }
@@ -260,7 +296,14 @@ actor NanoBananaService {
         await LogManager.shared.log(.request, payload: "Resuming polling for job: \(jobName)")
         
         // Use empty requestKey since we're resuming - we'll take whatever result comes back
-        return try await pollBatchJob(jobName: jobName, requestKey: "", apiKey: apiKey, onPollUpdate: onPollUpdate)
+        return try await pollBatchJob(
+            jobName: jobName,
+            requestKey: "",
+            apiKey: apiKey,
+            onPollUpdate: onPollUpdate,
+            softTimeout: softTimeout,
+            shouldContinue: shouldContinue
+        )
     }
     
     // MARK: - Batch API (Async Job-Based)
@@ -312,24 +355,48 @@ actor NanoBananaService {
     }
     
     /// Convenience wrapper for polling a known batch job
-    func pollBatchJob(jobName: String, requestKey: String, onPollUpdate: (@Sendable (Int) -> Void)? = nil) async throws -> ImageEditResponse {
+    func pollBatchJob(
+        jobName: String,
+        requestKey: String,
+        onPollUpdate: (@Sendable (PollStatusUpdate) -> Void)? = nil,
+        softTimeout: TimeInterval? = nil,
+        shouldContinue: (@Sendable () async -> Bool)? = nil
+    ) async throws -> ImageEditResponse {
         guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
         }
-        return try await pollBatchJob(jobName: jobName, requestKey: requestKey, apiKey: apiKey, onPollUpdate: onPollUpdate)
+        return try await pollBatchJob(
+            jobName: jobName,
+            requestKey: requestKey,
+            apiKey: apiKey,
+            onPollUpdate: onPollUpdate,
+            softTimeout: softTimeout,
+            shouldContinue: shouldContinue
+        )
     }
 
-    private func pollBatchJob(jobName: String, requestKey: String, apiKey: String, onPollUpdate: (@Sendable (Int) -> Void)?) async throws -> ImageEditResponse {
+    private func pollBatchJob(
+        jobName: String,
+        requestKey: String,
+        apiKey: String,
+        onPollUpdate: (@Sendable (PollStatusUpdate) -> Void)?,
+        softTimeout: TimeInterval?,
+        shouldContinue: (@Sendable () async -> Bool)?
+    ) async throws -> ImageEditResponse {
         let pollInterval: UInt64 = 10 * 1_000_000_000 // 10 seconds (docs show this interval)
         let completedStates = Set(["JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"])
         let maxPollCount = 360 // 360 × 10s = 1 hour max; prevents infinite loop on stuck API state
         var pollCount = 0
         let jobName = jobName.trimmingCharacters(in: .whitespacesAndNewlines)
         var retryState = PollRetryState()
+        let pollStart = Date()
+        var latestState = "JOB_STATE_PENDING"
         
         while pollCount <= maxPollCount {
+            if let shouldContinue, await shouldContinue() == false {
+                throw NanoBananaError.pollingStopped(state: latestState)
+            }
             pollCount += 1
-            onPollUpdate?(pollCount)
             
             await LogManager.shared.log(.request, payload: "Polling batch job: \(jobName) (Attempt \(pollCount))")
             
@@ -368,29 +435,41 @@ actor NanoBananaService {
                 
                 // Get state from metadata
                 let metadata = json["metadata"] as? [String: Any]
-                let state = metadata?["state"] as? String ?? (done ? "JOB_STATE_SUCCEEDED" : "JOB_STATE_PENDING")
+                let error = json["error"] as? [String: Any] ?? metadata?["error"] as? [String: Any]
+                let state = Self.inferBatchJobState(
+                    done: done,
+                    metadataState: metadata?["state"] as? String,
+                    error: error
+                )
+                latestState = state
+                let update = PollStatusUpdate(attempt: pollCount, state: state, updatedAt: Date())
+                onPollUpdate?(update)
                 
                 await LogManager.shared.log(.response, payload: "Job state: \(state), done: \(done)")
                 retryState.reset()
                 
                 if done || completedStates.contains(state) {
-                    if state == "JOB_STATE_SUCCEEDED" || done {
-                        // Check for inlined responses in the response field
-                        if let responseObj = json["response"] as? [String: Any] {
-                            return try await extractResultFromResponse(responseObj, requestKey: requestKey, apiKey: apiKey)
-                        }
-                        // Some batch jobs may have results in metadata.dest
-                        if let dest = metadata?["dest"] as? [String: Any] {
-                            return try await extractResultFromDest(dest, requestKey: requestKey, apiKey: apiKey)
-                        }
-                        throw NanoBananaError.noImageInResponse
-                    } else if state == "JOB_STATE_FAILED" {
-                        let error = json["error"] as? [String: Any] ?? metadata?["error"] as? [String: Any]
-                        let message = error?["message"] as? String ?? "Unknown batch error"
-                        throw NanoBananaError.batchError(message: message)
-                    } else {
-                        throw NanoBananaError.batchError(message: "Job \(state.lowercased().replacingOccurrences(of: "job_state_", with: ""))")
+                    let resolution = try Self.resolveTerminalBatchResolution(
+                        done: done,
+                        metadataState: metadata?["state"] as? String,
+                        response: json["response"] as? [String: Any],
+                        dest: metadata?["dest"] as? [String: Any],
+                        error: error
+                    )
+
+                    switch resolution {
+                    case .response(let responseObj):
+                        return try await extractResultFromResponse(responseObj, requestKey: requestKey, apiKey: apiKey)
+                    case .dest(let dest):
+                        return try await extractResultFromDest(dest, requestKey: requestKey, apiKey: apiKey)
                     }
+                }
+
+                if let softTimeout, Date().timeIntervalSince(pollStart) >= softTimeout {
+                    throw NanoBananaError.softTimeout(state: state)
+                }
+                if let shouldContinue, await shouldContinue() == false {
+                    throw NanoBananaError.pollingStopped(state: state)
                 }
                 
                 // Still running or pending - wait and retry
@@ -620,6 +699,101 @@ actor NanoBananaService {
         throw NanoBananaError.noImageInResponse
     }
     
+    static func inferBatchJobState(done: Bool, metadataState: String?, error: [String: Any]?) -> String {
+        if let metadataState {
+            let trimmed = canonicalBatchState(metadataState)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+
+        guard done else {
+            return "JOB_STATE_PENDING"
+        }
+
+        if isCancellationError(error) {
+            return "JOB_STATE_CANCELLED"
+        }
+
+        if error != nil {
+            return "JOB_STATE_FAILED"
+        }
+
+        return "JOB_STATE_SUCCEEDED"
+    }
+
+    static func batchErrorMessage(from error: [String: Any]?) -> String? {
+        guard let error else { return nil }
+        if let message = error["message"] as? String, !message.isEmpty {
+            return message
+        }
+        if let status = error["status"] as? String, !status.isEmpty {
+            return status
+        }
+        return nil
+    }
+
+    static func resolveTerminalBatchResolution(
+        done: Bool,
+        metadataState: String?,
+        response: [String: Any]?,
+        dest: [String: Any]?,
+        error: [String: Any]?
+    ) throws -> BatchTerminalResolution {
+        let state = inferBatchJobState(done: done, metadataState: metadataState, error: error)
+
+        switch state {
+        case "JOB_STATE_SUCCEEDED":
+            if let response {
+                return .response(response)
+            }
+            if let dest {
+                return .dest(dest)
+            }
+            throw NanoBananaError.noImageInResponse
+        case "JOB_STATE_FAILED":
+            throw NanoBananaError.batchError(message: batchErrorMessage(from: error) ?? "Unknown batch error")
+        case "JOB_STATE_CANCELLED":
+            throw NanoBananaError.jobCancelled
+        case "JOB_STATE_EXPIRED":
+            throw NanoBananaError.jobExpired
+        default:
+            throw NanoBananaError.batchError(
+                message: "Job \(displayBatchState(state))"
+            )
+        }
+    }
+
+    private static func isCancellationError(_ error: [String: Any]?) -> Bool {
+        guard let error else { return false }
+
+        let status = (error["status"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        if status == "CANCELLED" || status == "CANCELED" {
+            return true
+        }
+
+        let message = (error["message"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        return message.contains("cancelled") || message.contains("canceled")
+    }
+
+    static func canonicalBatchState(_ state: String) -> String {
+        state
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+            .replacingOccurrences(of: "BATCH_STATE_", with: "JOB_STATE_")
+    }
+
+    static func displayBatchState(_ state: String) -> String {
+        canonicalBatchState(state)
+            .replacingOccurrences(of: "JOB_STATE_", with: "")
+            .replacingOccurrences(of: "_", with: " ")
+            .lowercased()
+    }
+
     private func mimeType(for url: URL) -> String {
         switch url.pathExtension.lowercased() {
         case "png": return "image/png"
@@ -669,6 +843,16 @@ actor NanoBananaService {
         )
     }
 
+    static func listModelsURL(apiKey: String, pageSize: Int) throws -> URL {
+        try apiURL(
+            path: "/v1beta/models",
+            queryItems: [
+                URLQueryItem(name: "key", value: apiKey),
+                URLQueryItem(name: "pageSize", value: String(pageSize))
+            ]
+        )
+    }
+
     private static func apiURL(path: String, queryItems: [URLQueryItem]) throws -> URL {
         var components = URLComponents()
         components.scheme = "https"
@@ -693,6 +877,10 @@ enum NanoBananaError: LocalizedError {
     case invalidRequestURL(path: String)
     case apiError(statusCode: Int, data: Data)
     case batchError(message: String)
+    case jobCancelled
+    case jobExpired
+    case softTimeout(state: String)
+    case pollingStopped(state: String)
     case timeout
     case unknownError
     
@@ -713,6 +901,14 @@ enum NanoBananaError: LocalizedError {
             return "API error (\(code)): \(msg)"
         case .batchError(let message):
             return "Batch error: \(message)"
+        case .jobCancelled:
+            return "Cancelled by user."
+        case .jobExpired:
+            return "Remote batch expired before completion."
+        case .softTimeout(let state):
+            return "Polling paused after the local timeout while the remote job was still \(NanoBananaService.displayBatchState(state))."
+        case .pollingStopped(let state):
+            return "Polling stopped locally while the remote job was still \(NanoBananaService.displayBatchState(state))."
         case .timeout:
             return "The request timed out. Try again or reduce image size."
         case .unknownError:

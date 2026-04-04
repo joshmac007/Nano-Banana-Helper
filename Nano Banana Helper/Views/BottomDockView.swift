@@ -62,8 +62,15 @@ struct BottomDockView: View {
     }
     
     private var statusColor: Color {
-        if orchestrator.failedJobs.count > 0 { return .red }
-        if orchestrator.completedJobs.count > 0 && !orchestrator.isRunning { return .green }
-        return .secondary
+        switch orchestrator.aggregateTone {
+        case .issue:
+            return .red
+        case .cancelled:
+            return .orange
+        case .success:
+            return .green
+        case .neutral:
+            return .secondary
+        }
     }
 }

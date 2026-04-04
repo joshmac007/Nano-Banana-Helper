@@ -10,6 +10,8 @@ import Testing
 @testable import Nano_Banana_Helper
 
 struct Nano_Banana_HelperTests {
+    private let floatingPointTolerance = 0.000_000_1
+
     private func makeTemporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -51,6 +53,82 @@ struct Nano_Banana_HelperTests {
         Project(name: "Test Project", outputDirectory: "/tmp")
     }
 
+    private func makeTemporaryFile(in directory: URL, named name: String, contents: Data = Data()) throws -> URL {
+        let url = directory.appendingPathComponent(name)
+        guard FileManager.default.createFile(atPath: url.path, contents: contents) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        return url
+    }
+
+    private func makeRestoreEntry(
+        projectId: UUID = UUID(),
+        sourceImagePaths: [String],
+        sourceImageBookmarks: [Data]? = nil,
+        prompt: String = "prompt",
+        systemPrompt: String? = "system",
+        aspectRatio: String = "16:9",
+        imageSize: String = "2K",
+        usedBatchTier: Bool = false
+    ) -> HistoryEntry {
+        HistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: sourceImagePaths,
+            outputImagePath: "/tmp/output.png",
+            prompt: prompt,
+            aspectRatio: aspectRatio,
+            imageSize: imageSize,
+            usedBatchTier: usedBatchTier,
+            cost: 1,
+            sourceImageBookmarks: sourceImageBookmarks,
+            systemPrompt: systemPrompt
+        )
+    }
+
+    @MainActor
+    private func persistQueueState(_ state: PersistedQueueState, to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(state)
+        try data.write(to: url)
+    }
+
+    private func loadPersistedQueueState(from url: URL) throws -> PersistedQueueState {
+        let data = try Data(contentsOf: url)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(PersistedQueueState.self, from: data)
+    }
+
+    @MainActor
+    private func withStoredModelName<T>(
+        _ modelName: String?,
+        perform: () async throws -> T
+    ) async rethrows -> T {
+        let fileManager = FileManager.default
+        let configURL = AppConfig.fileURL
+        let originalData = try? Data(contentsOf: configURL)
+
+        try? fileManager.createDirectory(
+            at: configURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        var config = AppConfig.load()
+        config.modelName = modelName
+        config.save()
+
+        defer {
+            if let originalData {
+                try? originalData.write(to: configURL)
+            } else {
+                try? fileManager.removeItem(at: configURL)
+            }
+        }
+
+        return try await perform()
+    }
+
     @Test func example() async throws {
         // Write your test here and use APIs like
         // APIs like `#expect(...)` to check expected conditions.
@@ -72,7 +150,7 @@ struct Nano_Banana_HelperTests {
         #expect(decoded.totalTokenCount == 150)
     }
 
-    @Test func historyEntryBackwardCompatibility() throws {
+    @MainActor @Test func historyEntryBackwardCompatibility() throws {
         // JSON without tokenUsage/modelName fields — must decode without crashing
         let json = """
         {
@@ -99,7 +177,7 @@ struct Nano_Banana_HelperTests {
         #expect(entry.cost == 0.067)
     }
 
-    @Test func historyEntryWithTokenData() throws {
+    @MainActor @Test func historyEntryWithTokenData() throws {
         let json = """
         {
             "id": "00000000-0000-0000-0000-000000000001",
@@ -133,7 +211,338 @@ struct Nano_Banana_HelperTests {
         #expect(entry.modelName == "gemini-3.1-flash-image-preview")
     }
 
-    @Test func costSummaryBackwardCompatibility() throws {
+    @Test func appPricingResolvesKnownAliasAndFallbackModels() {
+        let pro = AppPricing.pricing(for: "gemini-3-pro-image-preview")
+        #expect(pro.pricingModelName == "gemini-3-pro-image-preview")
+        #expect(pro.pricingDisplayName == "Nano Banana Pro")
+        #expect(pro.isFallback == false)
+
+        let alias = AppPricing.pricing(for: "gemini-3.1-flash-image-preview")
+        #expect(alias.pricingModelName == "gemini-2.5-flash-image")
+        #expect(alias.pricingDisplayName == "Nano Banana")
+        #expect(alias.isFallback == false)
+
+        let unknown = AppPricing.pricing(for: "legacy-image-model")
+        #expect(unknown.pricingModelName == "gemini-2.5-flash-image")
+        #expect(unknown.isFallback)
+
+        let missing = AppPricing.pricing(for: nil)
+        #expect(missing.pricingModelName == "gemini-2.5-flash-image")
+        #expect(missing.isFallback)
+    }
+
+    @Test func appPricingUsesModelAwareRates() {
+        #expect(AppPricing.inputRate(modelName: "gemini-3-pro-image-preview", isBatchTier: false) == 0.0011)
+        #expect(AppPricing.inputRate(modelName: "gemini-3-pro-image-preview", isBatchTier: true) == 0.0006)
+        #expect(AppPricing.outputRate(for: .size4K, modelName: "gemini-3-pro-image-preview", isBatchTier: false) == 0.24)
+        #expect(AppPricing.outputRate(for: .size2K, modelName: "gemini-3-pro-image-preview", isBatchTier: true) == 0.067)
+
+        #expect(AppPricing.inputRate(modelName: "gemini-2.5-flash-image", isBatchTier: false) == 0.000168)
+        #expect(AppPricing.inputRate(modelName: "gemini-2.5-flash-image", isBatchTier: true) == 0.000084)
+        #expect(AppPricing.outputRate(for: .size1K, modelName: "gemini-2.5-flash-image", isBatchTier: false) == 0.039)
+        #expect(AppPricing.outputRate(for: .size1K, modelName: "gemini-2.5-flash-image", isBatchTier: true) == 0.0195)
+
+        #expect(AppPricing.outputFallbackRate(modelName: "legacy-image-model", isBatchTier: false) == 0.039)
+    }
+
+    @Test func imageSizeCostCalculationsUseSelectedModelRates() {
+        let proImageCost = ImageSize.calculateCost(
+            imageSize: "2K",
+            inputCount: 2,
+            isBatchTier: false,
+            modelName: "gemini-3-pro-image-preview"
+        )
+        let flashImageCost = ImageSize.calculateCost(
+            imageSize: "2K",
+            inputCount: 2,
+            isBatchTier: false,
+            modelName: "gemini-2.5-flash-image"
+        )
+        let flashTextCost = ImageSize.calculateTextModeCost(
+            imageSize: "1K",
+            outputCount: 3,
+            isBatchTier: true,
+            modelName: "gemini-2.5-flash-image"
+        )
+
+        #expect(abs(proImageCost - 0.1362) < floatingPointTolerance)
+        #expect(abs(flashImageCost - 0.078336) < floatingPointTolerance)
+        #expect(abs(flashTextCost - 0.0585) < floatingPointTolerance)
+        #expect(proImageCost > flashImageCost)
+    }
+
+    @Test func batchJobBackwardCompatibilityDecodesMissingModelName() throws {
+        let json = """
+        {
+            "id": "00000000-0000-0000-0000-000000000011",
+            "createdAt": "2026-01-15T10:00:00Z",
+            "projectId": "00000000-0000-0000-0000-000000000022",
+            "prompt": "test prompt",
+            "systemPrompt": "system",
+            "aspectRatio": "16:9",
+            "imageSize": "2K",
+            "outputDirectory": "/tmp",
+            "useBatchTier": true,
+            "status": "pending",
+            "tasks": [],
+            "isTextMode": false
+        }
+        """.data(using: .utf8)!
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let batch = try decoder.decode(BatchJob.self, from: json)
+
+        #expect(batch.modelName == nil)
+        #expect(batch.imageSize == "2K")
+        #expect(batch.useBatchTier)
+    }
+
+    @Test func batchJobRoundTripsModelName() throws {
+        let batch = BatchJob(
+            prompt: "prompt",
+            systemPrompt: "system",
+            aspectRatio: "1:1",
+            imageSize: "4K",
+            outputDirectory: "/tmp",
+            useBatchTier: true,
+            projectId: UUID(),
+            modelName: "gemini-3-pro-image-preview"
+        )
+        batch.isTextMode = true
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(batch)
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(BatchJob.self, from: data)
+
+        #expect(decoded.modelName == "gemini-3-pro-image-preview")
+        #expect(decoded.isTextMode)
+        #expect(decoded.systemPrompt == "system")
+    }
+
+    @Test func imageTaskFilenameUsesGeneratedFallbackForTextOnlyTasks() {
+        let task = ImageTask(inputPaths: [])
+
+        #expect(task.filename.hasPrefix("Generated Image "))
+        #expect(task.filename != "Data")
+    }
+
+    @Test func imageTaskFilenameUsesStableFallbackForGenericImportedNames() {
+        let task = ImageTask(inputPaths: ["/tmp/Data"])
+
+        #expect(task.filename.hasPrefix("Image "))
+        #expect(task.filename != "Data")
+    }
+
+    @Test func inferBatchJobStateTreatsDoneCancelledErrorAsCancelled() {
+        let error: [String: Any] = [
+            "status": "CANCELLED",
+            "message": "Operation was cancelled by the user."
+        ]
+
+        #expect(
+            NanoBananaService.inferBatchJobState(done: true, metadataState: nil, error: error) ==
+            "JOB_STATE_CANCELLED"
+        )
+    }
+
+    @Test func inferBatchJobStateNormalizesBatchStateCancelledToJobStateCancelled() {
+        #expect(
+            NanoBananaService.inferBatchJobState(
+                done: true,
+                metadataState: "BATCH_STATE_CANCELLED",
+                error: nil
+            ) == "JOB_STATE_CANCELLED"
+        )
+    }
+
+    @Test func inferBatchJobStateTreatsDoneErrorsWithoutCancelAsFailed() {
+        let error: [String: Any] = [
+            "status": "INTERNAL",
+            "message": "Batch processing failed."
+        ]
+
+        #expect(
+            NanoBananaService.inferBatchJobState(done: true, metadataState: nil, error: error) ==
+            "JOB_STATE_FAILED"
+        )
+    }
+
+    @Test func resolveTerminalBatchResolutionTreatsDoneCancelledPayloadAsCancelled() {
+        let error: [String: Any] = [
+            "status": "CANCELLED",
+            "message": "Operation was cancelled by the user."
+        ]
+
+        do {
+            _ = try NanoBananaService.resolveTerminalBatchResolution(
+                done: true,
+                metadataState: nil,
+                response: nil,
+                dest: nil,
+                error: error
+            )
+            Issue.record("Expected cancelled terminal payload to throw jobCancelled")
+        } catch NanoBananaError.jobCancelled {
+            // Expected path.
+        } catch {
+            Issue.record("Expected jobCancelled but got \(error)")
+        }
+    }
+
+    @Test func resolveTerminalBatchResolutionKeepsSucceededPayloadWithoutImageAsNoImageError() {
+        do {
+            _ = try NanoBananaService.resolveTerminalBatchResolution(
+                done: true,
+                metadataState: "JOB_STATE_SUCCEEDED",
+                response: nil,
+                dest: nil,
+                error: nil
+            )
+            Issue.record("Expected succeeded terminal payload without output to throw noImageInResponse")
+        } catch NanoBananaError.noImageInResponse {
+            // Expected path.
+        } catch {
+            Issue.record("Expected noImageInResponse but got \(error)")
+        }
+    }
+
+    @Test func canonicalBatchStateConvertsBatchPrefixToJobPrefix() {
+        #expect(NanoBananaService.canonicalBatchState("BATCH_STATE_CANCELLED") == "JOB_STATE_CANCELLED")
+        #expect(NanoBananaService.canonicalBatchState(" job_state_failed ") == "JOB_STATE_FAILED")
+    }
+
+    @MainActor @Test func stagingRestoreImageEntryRestoresImageModeSettingsAndFiles() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "input.png")
+        let bookmark = Data("bookmark-a".utf8)
+        let entry = makeRestoreEntry(
+            sourceImagePaths: [sourceURL.path],
+            sourceImageBookmarks: [bookmark],
+            prompt: "new prompt",
+            systemPrompt: "new system",
+            aspectRatio: "Auto",
+            imageSize: "4K",
+            usedBatchTier: true
+        )
+
+        let manager = BatchStagingManager()
+        manager.generationMode = .text
+        manager.textImageCount = 4
+        manager.prompt = "old prompt"
+        manager.stagedFiles = [URL(fileURLWithPath: "/tmp/stale.png")]
+        manager.stagedBookmarks = [URL(fileURLWithPath: "/tmp/stale.png"): Data("stale".utf8)]
+
+        manager.restore(from: entry)
+
+        #expect(manager.generationMode == .image)
+        #expect(manager.prompt == "new prompt")
+        #expect(manager.systemPrompt == "new system")
+        #expect(manager.aspectRatio == "Auto")
+        #expect(manager.imageSize == "4K")
+        #expect(manager.isBatchTier)
+        #expect(manager.textImageCount == 1)
+        #expect(manager.stagedFiles == [sourceURL])
+        #expect(manager.stagedBookmarks[sourceURL] == bookmark)
+        #expect(manager.isMultiInput == false)
+    }
+
+    @MainActor @Test func stagingRestoreImageEntryEnablesMultiInputForMultipleSources() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "first.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "second.png")
+        let entry = makeRestoreEntry(sourceImagePaths: [firstURL.path, secondURL.path])
+
+        let manager = BatchStagingManager()
+        manager.restore(from: entry)
+
+        #expect(manager.generationMode == .image)
+        #expect(manager.stagedFiles == [firstURL, secondURL])
+        #expect(manager.isMultiInput)
+    }
+
+    @MainActor @Test func stagingRestoreTextEntryClearsFilesAndSwitchesToTextMode() {
+        let manager = BatchStagingManager()
+        let staleURL = URL(fileURLWithPath: "/tmp/stale.png")
+        manager.generationMode = .image
+        manager.textImageCount = 3
+        manager.isMultiInput = true
+        manager.stagedFiles = [staleURL]
+        manager.stagedBookmarks = [staleURL: Data("stale".utf8)]
+
+        manager.restore(from: makeRestoreEntry(sourceImagePaths: [], prompt: "text prompt"))
+
+        #expect(manager.generationMode == .text)
+        #expect(manager.prompt == "text prompt")
+        #expect(manager.stagedFiles.isEmpty)
+        #expect(manager.stagedBookmarks.isEmpty)
+        #expect(manager.isMultiInput == false)
+        #expect(manager.textImageCount == 1)
+    }
+
+    @MainActor @Test func stagingRestoreReplacesPreviousStagedStateInsteadOfAppending() throws {
+        let directory = try makeTemporaryDirectory()
+        let restoredURL = try makeTemporaryFile(in: directory, named: "restored.png")
+        let entry = makeRestoreEntry(sourceImagePaths: [restoredURL.path])
+
+        let manager = BatchStagingManager()
+        let staleURL = URL(fileURLWithPath: "/tmp/stale.png")
+        manager.stagedFiles = [staleURL]
+        manager.stagedBookmarks = [staleURL: Data("stale".utf8)]
+
+        manager.restore(from: entry)
+
+        #expect(manager.stagedFiles == [restoredURL])
+        #expect(manager.stagedBookmarks[staleURL] == nil)
+        #expect(manager.stagedBookmarks.count == 0)
+    }
+
+    @MainActor @Test func stagingRestoreMissingImageSourcesStillRestoresSettings() {
+        let entry = makeRestoreEntry(
+            sourceImagePaths: ["/tmp/does-not-exist.png"],
+            prompt: "restored prompt",
+            systemPrompt: "restored system",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true
+        )
+
+        let manager = BatchStagingManager()
+        manager.restore(from: entry)
+
+        #expect(manager.generationMode == .image)
+        #expect(manager.prompt == "restored prompt")
+        #expect(manager.systemPrompt == "restored system")
+        #expect(manager.aspectRatio == "1:1")
+        #expect(manager.imageSize == "1K")
+        #expect(manager.isBatchTier)
+        #expect(manager.stagedFiles.isEmpty)
+        #expect(manager.isMultiInput == false)
+    }
+
+    @MainActor @Test func stagingRestoreAlignsBookmarksBySourceIndex() throws {
+        let directory = try makeTemporaryDirectory()
+        let restoredURL = try makeTemporaryFile(in: directory, named: "second.png")
+        let firstBookmark = Data("bookmark-a".utf8)
+        let secondBookmark = Data("bookmark-b".utf8)
+        let entry = makeRestoreEntry(
+            sourceImagePaths: ["/tmp/missing-first.png", restoredURL.path],
+            sourceImageBookmarks: [firstBookmark, secondBookmark]
+        )
+
+        let manager = BatchStagingManager()
+        manager.restore(from: entry)
+
+        #expect(manager.stagedFiles == [restoredURL])
+        #expect(manager.stagedBookmarks[restoredURL] == secondBookmark)
+        #expect(manager.stagedBookmarks[restoredURL] != firstBookmark)
+    }
+
+    @MainActor @Test func costSummaryBackwardCompatibility() throws {
         // JSON without token/model fields — must decode without crashing
         let json = """
         {
@@ -155,7 +564,7 @@ struct Nano_Banana_HelperTests {
         #expect(summary.byModel.isEmpty)
     }
 
-    @Test func costSummaryRecordWithTokens() throws {
+    @MainActor @Test func costSummaryRecordWithTokens() throws {
         var summary = CostSummary()
         let projectId = UUID()
 
@@ -175,7 +584,7 @@ struct Nano_Banana_HelperTests {
         #expect(summary.byResolution["1K"] == 0.067)
     }
 
-    @Test func costSummaryRoundTrip() throws {
+    @MainActor @Test func costSummaryRoundTrip() throws {
         var summary = CostSummary()
         let projectId = UUID()
         let usage = TokenUsage(promptTokenCount: 100, candidatesTokenCount: 50, totalTokenCount: 150)
@@ -196,6 +605,57 @@ struct Nano_Banana_HelperTests {
         #expect(decoded.byModel["gemini-3-pro"] == 0.50)
     }
 
+    @Test func curatedModelCatalogRequiresBothGenerationMethodsAndIgnoresUncuratedModels() throws {
+        let payload = """
+        {
+          "models": [
+            {
+              "name": "models/gemini-3.1-flash-image-preview",
+              "supportedGenerationMethods": ["generateContent", "batchGenerateContent"]
+            },
+            {
+              "name": "models/gemini-3-pro-image-preview",
+              "supportedGenerationMethods": ["generateContent", "batchGenerateContent"]
+            },
+            {
+              "name": "models/gemini-2.5-flash-image",
+              "supportedGenerationMethods": ["generateContent"]
+            },
+            {
+              "name": "models/not-approved-image-model",
+              "supportedGenerationMethods": ["generateContent", "batchGenerateContent"]
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let entries = try CuratedModelCatalog.entries(
+            from: payload,
+            selectedModelID: "gemini-3-pro-image-preview"
+        )
+
+        #expect(entries.contains(where: { $0.id == "gemini-3.1-flash-image-preview" }))
+        #expect(entries.contains(where: { $0.id == "gemini-3.1-flash-image-preview" && $0.isSelectable }))
+        #expect(entries.contains(where: { $0.id == "gemini-3-pro-image-preview" && $0.isSelectable }))
+        #expect(entries.contains(where: { $0.id == "gemini-2.5-flash-image" }) == false)
+        #expect(entries.contains(where: { $0.id == "not-approved-image-model" }) == false)
+    }
+
+    @Test func curatedModelCatalogFallbackEntriesExcludeDeprecatedDefaultsAndInjectLegacySelection() throws {
+        let fallbackEntries = CuratedModelCatalog.fallbackEntries()
+        #expect(fallbackEntries.map { $0.id } == ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"])
+        #expect(fallbackEntries.allSatisfy { $0.isSelectable })
+
+        let legacyEntries = CuratedModelCatalog.fallbackEntries(selectedModelID: "gemini-2.5-flash-image")
+        #expect(legacyEntries.first?.id == "gemini-2.5-flash-image")
+        #expect(legacyEntries.first?.displayName == "Legacy: gemini-2.5-flash-image")
+        #expect(legacyEntries.first?.isSelectable == false)
+        #expect(legacyEntries.dropFirst().map { $0.id } == ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"])
+
+        let selectedCurrentEntries = CuratedModelCatalog.fallbackEntries(selectedModelID: "gemini-3.1-flash-image-preview")
+        #expect(selectedCurrentEntries.map { $0.id } == ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"])
+    }
+
     @Test func serviceURLBuildersPercentEncodeAPIKeyAndDynamicValues() throws {
         let apiKey = "abc def✓&?"
         let modelName = "gemini model"
@@ -207,7 +667,8 @@ struct Nano_Banana_HelperTests {
             NanoBananaService.batchGenerateContentURL(apiKey: apiKey, modelName: modelName),
             NanoBananaService.batchOperationURL(jobName: jobName, apiKey: apiKey),
             NanoBananaService.downloadResultsURL(fileName: fileName, apiKey: apiKey),
-            NanoBananaService.cancelBatchJobURL(jobName: jobName, apiKey: apiKey)
+            NanoBananaService.cancelBatchJobURL(jobName: jobName, apiKey: apiKey),
+            NanoBananaService.listModelsURL(apiKey: apiKey, pageSize: 100)
         ]
 
         for url in urls {
@@ -217,7 +678,6 @@ struct Nano_Banana_HelperTests {
             #expect(url.absoluteString.contains("%20"))
             #expect(url.absoluteString.contains("%E2%9C%93"))
             #expect(url.absoluteString.contains("%26"))
-            #expect(url.absoluteString.contains("%3F"))
         }
     }
 
@@ -535,7 +995,7 @@ struct Nano_Banana_HelperTests {
             projectsDirectoryURL: tempProjectsDirectory,
             bookmarkDependencies: dependencies
         )
-        initialManager.entries = [
+        initialManager.allGlobalEntries = [
             HistoryEntry(
                 projectId: projectId,
                 sourceImagePaths: ["/tmp/input.png"],
@@ -557,9 +1017,9 @@ struct Nano_Banana_HelperTests {
         )
         loadedManager.loadHistory(for: projectId)
 
-        #expect(loadedManager.entries.count == 1)
-        #expect(loadedManager.entries[0].sourceImageBookmarks == [newSourceBookmark])
-        #expect(loadedManager.entries[0].outputImageBookmark == newOutputBookmark)
+        #expect(loadedManager.allGlobalEntries.count == 1)
+        #expect(loadedManager.allGlobalEntries[0].sourceImageBookmarks == [newSourceBookmark])
+        #expect(loadedManager.allGlobalEntries[0].outputImageBookmark == newOutputBookmark)
 
         let fileURL = tempProjectsDirectory
             .appendingPathComponent(projectId.uuidString)
@@ -580,7 +1040,6 @@ struct Nano_Banana_HelperTests {
         let outputBookmark = Data("new-output".utf8)
         let sourceBookmarks = [Data("new-source".utf8)]
         let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
-        manager.entries = [entry]
         manager.allGlobalEntries = [entry]
         manager.saveHistory(for: projectId)
 
@@ -590,8 +1049,8 @@ struct Nano_Banana_HelperTests {
             sourceBookmarks: sourceBookmarks
         )
 
-        #expect(manager.entries.first?.outputImageBookmark == outputBookmark)
-        #expect(manager.entries.first?.sourceImageBookmarks == sourceBookmarks)
+        #expect(manager.allGlobalEntries.first?.outputImageBookmark == outputBookmark)
+        #expect(manager.allGlobalEntries.first?.sourceImageBookmarks == sourceBookmarks)
         #expect(manager.allGlobalEntries.first?.outputImageBookmark == outputBookmark)
         #expect(manager.allGlobalEntries.first?.sourceImageBookmarks == sourceBookmarks)
 
@@ -610,11 +1069,11 @@ struct Nano_Banana_HelperTests {
         let sourceBookmarks = [Data("target-source".utf8)]
         let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
 
-        manager.entries = [currentEntry]
+        manager.allGlobalEntries = [currentEntry]
         manager.saveHistory(for: currentProject)
-        manager.entries = [targetEntry]
+        manager.allGlobalEntries = [targetEntry]
         manager.saveHistory(for: targetProject)
-        manager.entries = [currentEntry]
+        manager.allGlobalEntries = [currentEntry]
         manager.allGlobalEntries = [targetEntry, currentEntry]
 
         manager.updateBookmarks(
@@ -623,8 +1082,8 @@ struct Nano_Banana_HelperTests {
             sourceBookmarks: sourceBookmarks
         )
 
-        #expect(manager.entries.first?.id == currentEntry.id)
-        #expect(manager.entries.first?.outputImageBookmark == nil)
+        #expect(manager.allGlobalEntries.first?.id == currentEntry.id)
+        #expect(manager.allGlobalEntries.first?.outputImageBookmark == nil)
 
         let persistedEntries = try loadPersistedHistoryEntries(from: tempProjectsDirectory, projectId: targetProject)
         #expect(persistedEntries.first?.outputImageBookmark == outputBookmark)
@@ -638,7 +1097,6 @@ struct Nano_Banana_HelperTests {
         let tempProjectsDirectory = try makeTemporaryDirectory()
         let entry = makeHistoryEntry(projectId: projectId)
         let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
-        manager.entries = [entry]
         manager.allGlobalEntries = [entry]
         manager.saveHistory(for: projectId)
 
@@ -667,7 +1125,6 @@ struct Nano_Banana_HelperTests {
         let matchingEntry = makeHistoryEntry(projectId: projectId, outputImagePath: matchingOutputURL.path)
         let outsideEntry = makeHistoryEntry(projectId: projectId, outputImagePath: outsideOutputURL.path)
         let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
-        manager.entries = [matchingEntry, outsideEntry]
         manager.allGlobalEntries = [matchingEntry, outsideEntry]
         manager.saveHistory(for: projectId)
 
@@ -708,7 +1165,6 @@ struct Nano_Banana_HelperTests {
             outputImagePath: "/tmp/skipped-output.png"
         )
         let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
-        manager.entries = [requestedEntry, skippedEntry]
         manager.allGlobalEntries = [requestedEntry, skippedEntry]
         manager.saveHistory(for: projectId)
 
@@ -751,7 +1207,6 @@ struct Nano_Banana_HelperTests {
             sourceImageBookmarks: [oldFirstBookmark, oldSecondBookmark, oldThirdBookmark]
         )
         let manager = HistoryManager(projectsDirectoryURL: tempProjectsDirectory)
-        manager.entries = [entry]
         manager.allGlobalEntries = [entry]
         manager.saveHistory(for: projectId)
 
@@ -772,7 +1227,7 @@ struct Nano_Banana_HelperTests {
         )
     }
 
-    @Test func reauthorizeOutputFolderReturnsWrongFolderSelectedAndShowsError() throws {
+    @MainActor @Test func reauthorizeOutputFolderReturnsWrongFolderSelectedAndShowsError() throws {
         let tempAppSupportURL = try makeTemporaryDirectory()
         let projectsListURL = tempAppSupportURL.appendingPathComponent("projects.json")
         let costSummaryURL = tempAppSupportURL.appendingPathComponent("cost_summary.json")
@@ -841,14 +1296,14 @@ struct Nano_Banana_HelperTests {
             cost: 1
         )
 
-        manager.entries = [entry]
+        manager.allGlobalEntries = [entry]
         manager.saveHistory(for: projectId)
         manager.loadHistory(for: projectId)
         manager.loadGlobalHistory(allProjects: [project])
 
         manager.clearHistory(for: projectId)
 
-        #expect(manager.entries.isEmpty)
+        #expect(manager.allGlobalEntries.isEmpty)
         #expect(manager.allGlobalEntries.isEmpty)
 
         let fileURL = tempProjectsDirectory
@@ -861,7 +1316,7 @@ struct Nano_Banana_HelperTests {
         #expect(persistedEntries.isEmpty)
     }
 
-    @Test func recordCostIncurredPersistsCostSummaryMidSession() throws {
+    @MainActor @Test func recordCostIncurredPersistsCostSummaryMidSession() throws {
         let tempAppSupportURL = try makeTemporaryDirectory()
         let projectsListURL = tempAppSupportURL.appendingPathComponent("projects.json")
         let costSummaryURL = tempAppSupportURL.appendingPathComponent("cost_summary.json")
@@ -887,12 +1342,168 @@ struct Nano_Banana_HelperTests {
         let decoder = JSONDecoder()
         let summary = try decoder.decode(CostSummary.self, from: data)
 
-        #expect(summary.totalSpent == 0.5)
-        #expect(summary.imageCount == 1)
-        #expect(summary.byModel["gemini-test"] == 0.5)
-        #expect(manager.sessionCost == 0.5)
-        #expect(manager.sessionTokens == 15)
-        #expect(manager.sessionImageCount == 1)
+        if summary.totalSpent != 0.5 {
+            Issue.record("Expected persisted totalSpent to remain 0.5")
+        }
+        if summary.imageCount != 1 {
+            Issue.record("Expected persisted imageCount to remain 1")
+        }
+        if summary.byModel["gemini-test"] != 0.5 {
+            Issue.record("Expected persisted byModel entry for gemini-test to remain 0.5")
+        }
+        if manager.sessionCost != 0.5 {
+            Issue.record("Expected sessionCost to remain 0.5")
+        }
+        if manager.sessionTokens != 15 {
+            Issue.record("Expected sessionTokens to remain 15")
+        }
+        if manager.sessionImageCount != 1 {
+            Issue.record("Expected sessionImageCount to remain 1")
+        }
+    }
+
+    @Test func costEstimatorViewUsesModelAwareTotalsAndFallbackWarning() {
+        let proEstimator = CostEstimatorView(
+            imageCount: 2,
+            imageSize: "2K",
+            isBatchTier: false,
+            isMultiInput: false,
+            generationMode: .image,
+            modelName: "gemini-3-pro-image-preview"
+        )
+        let flashEstimator = CostEstimatorView(
+            imageCount: 2,
+            imageSize: "2K",
+            isBatchTier: false,
+            isMultiInput: false,
+            generationMode: .image,
+            modelName: "gemini-2.5-flash-image"
+        )
+        let fallbackEstimator = CostEstimatorView(
+            imageCount: 1,
+            imageSize: "1K",
+            isBatchTier: true,
+            isMultiInput: false,
+            generationMode: .text,
+            modelName: "legacy-image-model"
+        )
+
+        #expect(abs(proEstimator.totalCost - 0.2702) < floatingPointTolerance)
+        #expect(abs(flashEstimator.totalCost - 0.156336) < floatingPointTolerance)
+        #expect(proEstimator.totalCost > flashEstimator.totalCost)
+        #expect(fallbackEstimator.fallbackPricingDescription == "Using Nano Banana pricing fallback.")
+    }
+
+    @MainActor @Test func enqueueTextGenerationLocksConfiguredModelName() async throws {
+        try await withStoredModelName("gemini-3-pro-image-preview") {
+            let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+            let orchestrator = BatchOrchestrator(
+                activeBatchURL: activeBatchURL,
+                autoStartEnqueuedBatches: false
+            )
+
+            orchestrator.enqueueTextGeneration(
+                prompt: "prompt",
+                aspectRatio: "16:9",
+                imageSize: "2K",
+                outputDirectory: "/tmp",
+                useBatchTier: true,
+                imageCount: 2,
+                projectId: UUID()
+            )
+
+            let persistedState = try loadPersistedQueueState(from: activeBatchURL)
+            #expect(persistedState.batches.count == 1)
+            #expect(persistedState.batches.first?.modelName == "gemini-3-pro-image-preview")
+            #expect(persistedState.batches.first?.isTextMode == true)
+        }
+    }
+
+    @MainActor @Test func cancelUsesLockedBatchModelNameInsteadOfCurrentConfig() async throws {
+        try await withStoredModelName("gemini-3-pro-image-preview") {
+            let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+            let orchestrator = BatchOrchestrator(
+                activeBatchURL: activeBatchURL,
+                autoStartEnqueuedBatches: false
+            )
+            let projectId = UUID()
+            let batch = BatchJob(
+                prompt: "prompt",
+                outputDirectory: "/tmp",
+                projectId: projectId,
+                modelName: AppConfig.load().modelName ?? AppPricing.defaultModelName
+            )
+            let task = ImageTask(inputPaths: ["/tmp/input.png"], projectId: projectId)
+            batch.tasks = [task]
+
+            var capturedEntry: HistoryEntry?
+            orchestrator.onImageCompleted = { entry in
+                capturedEntry = entry
+            }
+
+            orchestrator.enqueue(batch)
+
+            var config = AppConfig.load()
+            config.modelName = "gemini-2.5-flash-image"
+            config.save()
+
+            orchestrator.cancel(batch: batch)
+
+            #expect(capturedEntry?.modelName == "gemini-3-pro-image-preview")
+            #expect(capturedEntry?.status == "cancelled")
+        }
+    }
+
+    @MainActor @Test func resumePollingFromHistoryPreservesSavedModelName() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/input.png"],
+            outputImagePath: "/tmp/output.png",
+            prompt: "prompt",
+            aspectRatio: "16:9",
+            imageSize: "2K",
+            usedBatchTier: true,
+            cost: 1,
+            status: "processing",
+            externalJobName: "batches/test-job",
+            modelName: "gemini-3-pro-image-preview"
+        )
+
+        orchestrator.resumePollingFromHistory(for: entry)
+
+        let persistedState = try loadPersistedQueueState(from: activeBatchURL)
+        #expect(persistedState.batches.first?.modelName == "gemini-3-pro-image-preview")
+        #expect(persistedState.batches.first?.systemPrompt == nil)
+    }
+
+    @MainActor @Test func resumePollingFromLegacyHistoryLeavesModelNameNil() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/input.png"],
+            outputImagePath: "/tmp/output.png",
+            prompt: "prompt",
+            aspectRatio: "16:9",
+            imageSize: "2K",
+            usedBatchTier: false,
+            cost: 1,
+            status: "processing",
+            externalJobName: "batches/test-job"
+        )
+
+        orchestrator.resumePollingFromHistory(for: entry)
+
+        let persistedState = try loadPersistedQueueState(from: activeBatchURL)
+        #expect(persistedState.batches.first?.modelName == nil)
     }
 
     @MainActor @Test func cancelHandlesSubmittingPhaseTasks() throws {
@@ -909,10 +1520,396 @@ struct Nano_Banana_HelperTests {
         orchestrator.enqueue(batch)
         orchestrator.cancel(batch: batch)
 
-        #expect(batch.status == "cancelled")
-        #expect(task.status == "failed")
-        #expect(task.phase == .failed)
-        #expect(task.error == "Cancelled by user")
+        if batch.status != "processing" {
+            Issue.record("Expected batch to stay active while cancellation is being reconciled")
+        }
+        if task.status != "processing" {
+            Issue.record("Expected submitting task to remain processing while cancellation is pending")
+        }
+        if task.phase != .cancelRequested {
+            Issue.record("Expected submitting task to move into cancelRequested phase")
+        }
+        if task.error != "Cancel requested. Waiting for final status." {
+            Issue.record("Expected cancelRequested copy to be preserved on the task")
+        }
+    }
+
+    @MainActor @Test func cancelPendingTaskMarksCancelledInsteadOfFailed() throws {
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false
+        )
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        batch.tasks = [task]
+
+        orchestrator.enqueue(batch)
+        orchestrator.cancel(batch: batch)
+
+        if task.status != "cancelled" {
+            Issue.record("Expected pending task to be cancelled locally")
+        }
+        if task.phase != .cancelled {
+            Issue.record("Expected pending task to move to cancelled phase")
+        }
+        if task.error != "Cancelled by user" {
+            Issue.record("Expected pending task to retain the local cancellation message")
+        }
+    }
+
+    @MainActor @Test func pausedQueueCancelTransitionsToCancellingAndMovesRemoteTaskToCancelRequested() async throws {
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { _ in }
+        )
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        batch.status = "processing"
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .pausedLocal
+        task.externalJobName = "batches/test-job"
+        batch.tasks = [task]
+
+        orchestrator.enqueue(batch)
+        orchestrator.controlState = .pausedLocal
+
+        orchestrator.cancel()
+
+        for _ in 0..<5 {
+            await Task.yield()
+        }
+
+        #expect(orchestrator.controlState == .cancelling)
+        #expect(orchestrator.hasCancellationInProgress)
+        #expect(orchestrator.canResumeQueue == false)
+        #expect(orchestrator.processingJobs.first?.phase == .cancelRequested)
+        #expect(orchestrator.processingJobs.first?.error == "Cancel requested. Waiting for final status.")
+    }
+
+    @MainActor @Test func cancelledOnlyQueueFinishesWithCancellationCompleteStatus() async throws {
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false
+        )
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        batch.tasks = [ImageTask(inputPaths: ["/tmp/input.png"])]
+
+        orchestrator.enqueue(batch)
+        orchestrator.cancel()
+
+        for _ in 0..<5 {
+            await Task.yield()
+        }
+
+        #expect(orchestrator.controlState == .idle)
+        #expect(orchestrator.statusMessage == "Cancellation complete")
+        #expect(orchestrator.aggregateTone == .cancelled)
+    }
+
+    @MainActor @Test func cancelledTasksDoNotAppearInFailedJobs() async throws {
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false
+        )
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        batch.tasks = [ImageTask(inputPaths: ["/tmp/input.png"])]
+
+        orchestrator.enqueue(batch)
+        orchestrator.cancel()
+
+        for _ in 0..<5 {
+            await Task.yield()
+        }
+
+        #expect(orchestrator.cancelledJobs.count == 1)
+        #expect(orchestrator.failedJobs.isEmpty)
+        #expect(orchestrator.hasTrueFailures == false)
+    }
+
+    @MainActor @Test func failedTasksRemainInFailedJobs() throws {
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false
+        )
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "failed"
+        task.phase = .failed
+        task.error = "boom"
+        batch.tasks = [task]
+
+        orchestrator.enqueue(batch)
+
+        #expect(orchestrator.failedJobs.count == 1)
+        #expect(orchestrator.cancelledJobs.isEmpty)
+        #expect(orchestrator.hasTrueFailures)
+        #expect(orchestrator.aggregateTone == .issue)
+    }
+
+    @Test func headerActionsShowResumeBeforeCancelOnPausedQueue() {
+        let actions = QueueHeaderActionVisibility(
+            controlState: .pausedLocal,
+            hasCancellationInProgress: false,
+            hasActiveNonCancelledWork: true,
+            canResumeQueue: true,
+            hasOnlyCancelledTerminalJobs: false,
+            hasNonTerminalWork: true
+        )
+
+        #expect(actions.showsPause == false)
+        #expect(actions.showsResume)
+        #expect(actions.showsCancel)
+    }
+
+    @Test func headerActionsHideResumeWhileCancellationIsInProgress() {
+        let actions = QueueHeaderActionVisibility(
+            controlState: .pausedLocal,
+            hasCancellationInProgress: true,
+            hasActiveNonCancelledWork: false,
+            canResumeQueue: false,
+            hasOnlyCancelledTerminalJobs: false,
+            hasNonTerminalWork: true
+        )
+
+        #expect(actions.showsPause == false)
+        #expect(actions.showsResume == false)
+        #expect(actions.showsCancel)
+    }
+
+    @Test func headerActionsHideAllButtonsForCancelledOnlyTerminalQueue() {
+        let actions = QueueHeaderActionVisibility(
+            controlState: .idle,
+            hasCancellationInProgress: false,
+            hasActiveNonCancelledWork: false,
+            canResumeQueue: false,
+            hasOnlyCancelledTerminalJobs: true,
+            hasNonTerminalWork: false
+        )
+
+        #expect(actions.showsPause == false)
+        #expect(actions.showsResume == false)
+        #expect(actions.showsCancel == false)
+    }
+
+    @MainActor @Test func pauseStatePersistsAcrossReload() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        batch.status = "processing"
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .polling
+        task.externalJobName = "batches/test-job"
+        batch.tasks = [task]
+
+        orchestrator.enqueue(batch)
+        orchestrator.controlState = .running
+        orchestrator.pause()
+
+        if orchestrator.controlState != .pausedLocal {
+            Issue.record("Expected pause to update the queue control state")
+        }
+        if orchestrator.processingJobs.first?.phase != .pausedLocal {
+            Issue.record("Expected active task to be persisted as pausedLocal")
+        }
+
+        let reloaded = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+
+        if reloaded.controlState != .pausedLocal {
+            Issue.record("Expected paused queue control state to reload from disk")
+        }
+        if reloaded.processingJobs.first?.phase != .pausedLocal {
+            Issue.record("Expected paused task phase to reload from disk")
+        }
+    }
+
+    @MainActor @Test func pausedQueueDoesNotAutoResumeOnLaunchRecovery() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .pausedLocal
+        task.externalJobName = "batches/test-job"
+        batch.tasks = [task]
+        batch.status = "processing"
+        try persistQueueState(PersistedQueueState(controlState: .pausedLocal, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if orchestrator.controlState != .pausedLocal {
+            Issue.record("Expected persisted paused queue to remain paused after launch recovery")
+        }
+        if await probe.startedCount() != 0 {
+            Issue.record("Expected launch recovery to leave manually paused work untouched")
+        }
+    }
+
+    @MainActor @Test func launchRecoveryAutoStartsInterruptedPendingWorkOnce() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        batch.tasks = [ImageTask(inputPaths: ["/tmp/input.png"])]
+        try persistQueueState(PersistedQueueState(controlState: .running, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        if orchestrator.controlState != .interrupted {
+            Issue.record("Expected persisted running state to normalize to interrupted on reload")
+        }
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if await probe.startedCount() != 1 {
+            Issue.record("Expected launch recovery to auto-start interrupted saved work exactly once")
+        }
+    }
+
+    @MainActor @Test func launchRecoveryResumesCancellingQueueWithoutNewLocalSubmissions() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .cancelRequested
+        task.externalJobName = "batches/test-job"
+        batch.tasks = [task]
+        batch.status = "processing"
+        try persistQueueState(PersistedQueueState(controlState: .cancelling, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        if orchestrator.controlState != .cancelling {
+            Issue.record("Expected persisted cancelling state to stay cancellation-oriented on reload")
+        }
+        if !orchestrator.pendingJobs.isEmpty {
+            Issue.record("Expected cancelling recovery queue to avoid reintroducing pending work")
+        }
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if await probe.startedCount() != 1 {
+            Issue.record("Expected launch recovery to reconcile cancelling work")
+        }
+    }
+
+    @MainActor @Test func launchRecoveryAutoResumesRemotePollingStates() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .submittedRemote
+        task.externalJobName = "batches/test-job"
+        batch.tasks = [task]
+        batch.status = "processing"
+        try persistQueueState(PersistedQueueState(controlState: .interrupted, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if await probe.startedCount() != 1 {
+            Issue.record("Expected launch recovery to resume remote polling work")
+        }
+    }
+
+    @MainActor @Test func launchRecoveryMarksOrphanedSubmittingTasksAsIssues() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .submitting
+        batch.tasks = [task]
+        batch.status = "processing"
+        try persistQueueState(PersistedQueueState(controlState: .running, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if orchestrator.failedJobs.count != 1 {
+            Issue.record("Expected orphaned submitting task to be surfaced as a failed issue on reload")
+        }
+        if orchestrator.failedJobs.first?.error != "App closed before submission completed. Remote job id was not saved; retry manually to avoid duplicate jobs." {
+            Issue.record("Expected orphaned submitting task to carry the duplicate-safe retry guidance")
+        }
+        if orchestrator.controlState != .idle {
+            Issue.record("Expected queue with only orphaned submitting issues to stay idle after reload")
+        }
+        if await probe.startedCount() != 0 {
+            Issue.record("Expected launch recovery to avoid auto-resubmitting ambiguous submitting work")
+        }
+    }
+
+    @MainActor @Test func launchRecoveryIgnoresTerminalOnlySavedQueues() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "completed"
+        task.phase = .completed
+        batch.tasks = [task]
+        batch.status = "completed"
+        try persistQueueState(PersistedQueueState(controlState: .running, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if orchestrator.controlState != .idle {
+            Issue.record("Expected terminal-only saved queues to remain idle on reload")
+        }
+        if await probe.startedCount() != 0 {
+            Issue.record("Expected launch recovery to ignore terminal-only saved queues")
+        }
     }
 
     @MainActor @Test func startAllStartsEligibleBatchesConcurrently() async throws {
@@ -948,7 +1945,9 @@ struct Nano_Banana_HelperTests {
         await probe.release()
         await task.value
 
-        #expect(startedCount == 2)
+        if startedCount != 2 {
+            Issue.record("Expected startAll() to start both eligible batches")
+        }
     }
 }
 

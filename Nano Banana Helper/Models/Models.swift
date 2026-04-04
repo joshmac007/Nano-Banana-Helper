@@ -138,6 +138,18 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         // Use AppPaths scoped helpers for image loading and Finder operations.
         return URL(fileURLWithPath: outputImagePath)
     }
+
+    var hasSourceImages: Bool {
+        sourceImagePaths.contains { !$0.isEmpty }
+    }
+
+    var isTextToImage: Bool {
+        !hasSourceImages
+    }
+
+    var generationDescription: String {
+        isTextToImage ? "Text to Image" : "Image to Image"
+    }
     
     enum CodingKeys: String, CodingKey {
         case id, projectId, timestamp, sourceImagePaths, outputImagePath
@@ -345,12 +357,33 @@ class LogManager {
 
 // MARK: - Batch Job
 
+enum QueueControlState: String, Codable {
+    case idle
+    case running
+    case pausedLocal
+    case resuming
+    case cancelling
+    case interrupted
+
+    var displayName: String {
+        switch self {
+        case .idle: return "Idle"
+        case .running: return "Running"
+        case .pausedLocal: return "Paused locally"
+        case .resuming: return "Resuming"
+        case .cancelling: return "Cancelling"
+        case .interrupted: return "Interrupted"
+        }
+    }
+}
+
 /// A batch editing job containing multiple image tasks
 @Observable
 class BatchJob: Identifiable, Codable {
     let id: UUID
     let createdAt: Date
     var projectId: UUID?
+    var modelName: String?
     var prompt: String
     var systemPrompt: String? // Added
     var aspectRatio: String
@@ -362,7 +395,7 @@ class BatchJob: Identifiable, Codable {
     var isTextMode: Bool = false // For text-to-image generation
 
     enum CodingKeys: String, CodingKey {
-        case id, createdAt, projectId, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, useBatchTier, status, tasks, isTextMode
+        case id, createdAt, projectId, modelName, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, useBatchTier, status, tasks, isTextMode
     }
 
     required init(from decoder: Decoder) throws {
@@ -370,6 +403,7 @@ class BatchJob: Identifiable, Codable {
         id = try container.decode(UUID.self, forKey: .id)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         projectId = try container.decodeIfPresent(UUID.self, forKey: .projectId)
+        modelName = try container.decodeIfPresent(String.self, forKey: .modelName)
         prompt = try container.decode(String.self, forKey: .prompt)
         systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt) // Decode if present
         aspectRatio = try container.decode(String.self, forKey: .aspectRatio)
@@ -386,6 +420,7 @@ class BatchJob: Identifiable, Codable {
         try container.encode(id, forKey: .id)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(projectId, forKey: .projectId)
+        try container.encodeIfPresent(modelName, forKey: .modelName)
         try container.encode(prompt, forKey: .prompt)
         try container.encode(systemPrompt, forKey: .systemPrompt)
         try container.encode(aspectRatio, forKey: .aspectRatio)
@@ -404,11 +439,13 @@ class BatchJob: Identifiable, Codable {
         imageSize: String = "4K",
         outputDirectory: String,
         useBatchTier: Bool = false,
-        projectId: UUID? = nil
+        projectId: UUID? = nil,
+        modelName: String? = nil
     ) {
         self.id = UUID()
         self.createdAt = Date()
         self.projectId = projectId
+        self.modelName = modelName
         self.prompt = prompt
         self.systemPrompt = systemPrompt
         self.aspectRatio = aspectRatio
@@ -421,7 +458,7 @@ class BatchJob: Identifiable, Codable {
     
     var pendingCount: Int { tasks.filter { $0.status == "pending" }.count }
     var completedCount: Int { tasks.filter { $0.status == "completed" }.count }
-    var failedCount: Int { tasks.filter { $0.status == "failed" }.count }
+    var failedCount: Int { tasks.filter { ImageTask.issueStatuses.contains($0.status) }.count }
     var progress: Double {
         guard !tasks.isEmpty else { return 0 }
         return Double(completedCount + failedCount) / Double(tasks.count)
@@ -433,10 +470,16 @@ class BatchJob: Identifiable, Codable {
             return ImageSize.calculateTextModeCost(
                 imageSize: imageSize,
                 outputCount: 1,
-                isBatchTier: useBatchTier
+                isBatchTier: useBatchTier,
+                modelName: modelName
             )
         }
-        return ImageSize.calculateCost(imageSize: imageSize, inputCount: task.inputPaths.count, isBatchTier: useBatchTier)
+        return ImageSize.calculateCost(
+            imageSize: imageSize,
+            inputCount: task.inputPaths.count,
+            isBatchTier: useBatchTier,
+            modelName: modelName
+        )
     }
 }
 
@@ -446,20 +489,32 @@ class BatchJob: Identifiable, Codable {
 enum JobPhase: String, Codable {
     case pending
     case submitting
+    case submittedRemote
     case polling
     case reconnecting
+    case pausedLocal
+    case cancelRequested
+    case stalled
     case downloading
     case completed
+    case cancelled
+    case expired
     case failed
     
     var displayName: String {
         switch self {
         case .pending: return "Pending"
         case .submitting: return "Submitting"
+        case .submittedRemote: return "Submitted"
         case .polling: return "Waiting"
         case .reconnecting: return "Reconnecting"
+        case .pausedLocal: return "Paused locally"
+        case .cancelRequested: return "Cancel requested"
+        case .stalled: return "Paused locally"
         case .downloading: return "Downloading"
         case .completed: return "Completed"
+        case .cancelled: return "Cancelled"
+        case .expired: return "Expired"
         case .failed: return "Failed"
         }
     }
@@ -468,10 +523,16 @@ enum JobPhase: String, Codable {
         switch self {
         case .pending: return "circle"
         case .submitting: return "arrow.up.circle"
+        case .submittedRemote: return "tray.and.arrow.up"
         case .polling: return "clock.arrow.circlepath"
         case .reconnecting: return "arrow.triangle.2.circlepath"
+        case .pausedLocal: return "pause.circle"
+        case .cancelRequested: return "xmark.circle"
+        case .stalled: return "pause.circle"
         case .downloading: return "arrow.down.circle"
         case .completed: return "checkmark.circle.fill"
+        case .cancelled: return "xmark.circle.fill"
+        case .expired: return "clock.badge.exclamationmark"
         case .failed: return "exclamationmark.circle.fill"
         }
     }
@@ -482,6 +543,9 @@ enum JobPhase: String, Codable {
 /// A single image editing task within a batch (can have multiple input images)
 @Observable
 class ImageTask: Identifiable, Codable {
+    static let terminalStatuses: Set<String> = ["completed", "failed", "cancelled", "expired"]
+    static let issueStatuses: Set<String> = ["failed", "expired"]
+
     let id: UUID
     let inputPaths: [String] // Changed to array for multimodal support
     var inputBookmarks: [Data]? // Security-scoped bookmarks for file picker selections
@@ -489,15 +553,21 @@ class ImageTask: Identifiable, Codable {
     var status: String
     var phase: JobPhase
     var pollCount: Int
+    var lastPollState: String?
+    var lastPollUpdatedAt: Date?
+    var stalledAt: Date?
     var error: String?
     var startedAt: Date?
     var submittedAt: Date?
     var completedAt: Date?
     var externalJobName: String? // Store Gemini API job ID
     var projectId: UUID? // Added for filtering results by project
+    var cancelRequestedAt: Date?
 
     enum CodingKeys: String, CodingKey {
-        case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount, error, startedAt, submittedAt, completedAt, externalJobName, projectId
+        case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount
+        case lastPollState, lastPollUpdatedAt, stalledAt
+        case error, startedAt, submittedAt, completedAt, externalJobName, projectId, cancelRequestedAt
     }
 
     required init(from decoder: Decoder) throws {
@@ -509,12 +579,16 @@ class ImageTask: Identifiable, Codable {
         status = try container.decode(String.self, forKey: .status)
         phase = try container.decodeIfPresent(JobPhase.self, forKey: .phase) ?? .pending
         pollCount = try container.decodeIfPresent(Int.self, forKey: .pollCount) ?? 0
+        lastPollState = try container.decodeIfPresent(String.self, forKey: .lastPollState)
+        lastPollUpdatedAt = try container.decodeIfPresent(Date.self, forKey: .lastPollUpdatedAt)
+        stalledAt = try container.decodeIfPresent(Date.self, forKey: .stalledAt)
         error = try container.decodeIfPresent(String.self, forKey: .error)
         startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt)
         submittedAt = try container.decodeIfPresent(Date.self, forKey: .submittedAt)
         completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
         projectId = try container.decodeIfPresent(UUID.self, forKey: .projectId)
+        cancelRequestedAt = try container.decodeIfPresent(Date.self, forKey: .cancelRequestedAt)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -526,12 +600,16 @@ class ImageTask: Identifiable, Codable {
         try container.encode(status, forKey: .status)
         try container.encode(phase, forKey: .phase)
         try container.encode(pollCount, forKey: .pollCount)
+        try container.encodeIfPresent(lastPollState, forKey: .lastPollState)
+        try container.encodeIfPresent(lastPollUpdatedAt, forKey: .lastPollUpdatedAt)
+        try container.encodeIfPresent(stalledAt, forKey: .stalledAt)
         try container.encode(error, forKey: .error)
         try container.encode(startedAt, forKey: .startedAt)
         try container.encode(submittedAt, forKey: .submittedAt)
         try container.encode(completedAt, forKey: .completedAt)
         try container.encode(externalJobName, forKey: .externalJobName)
         try container.encode(projectId, forKey: .projectId)
+        try container.encodeIfPresent(cancelRequestedAt, forKey: .cancelRequestedAt)
     }
     
     init(inputPaths: [String], projectId: UUID? = nil, inputBookmarks: [Data]? = nil) {
@@ -541,7 +619,11 @@ class ImageTask: Identifiable, Codable {
         self.status = "pending"
         self.phase = .pending
         self.pollCount = 0
+        self.lastPollState = nil
+        self.lastPollUpdatedAt = nil
+        self.stalledAt = nil
         self.projectId = projectId
+        self.cancelRequestedAt = nil
     }
     
     init(inputPath: String, projectId: UUID? = nil, inputBookmark: Data? = nil) {
@@ -551,7 +633,11 @@ class ImageTask: Identifiable, Codable {
         self.status = "pending"
         self.phase = .pending
         self.pollCount = 0
+        self.lastPollState = nil
+        self.lastPollUpdatedAt = nil
+        self.stalledAt = nil
         self.projectId = projectId
+        self.cancelRequestedAt = nil
     }
     
     // Backward compatibility for single input path
@@ -563,19 +649,47 @@ class ImageTask: Identifiable, Codable {
     var inputURLs: [URL] { inputPaths.map { URL(fileURLWithPath: $0) } }
     var inputURL: URL { URL(fileURLWithPath: inputPath) }
     var outputURL: URL? { outputPath.map { URL(fileURLWithPath: $0) } }
-    var filename: String { 
+    var filename: String {
         if inputPaths.count > 1 {
             let label = status == "completed" ? "output" : "inputs"
             let count = status == "completed" ? "1" : "\(inputPaths.count)"
             return "Multimodal (\(count) \(label))"
         }
-        // Use the path string directly — no bookmark resolution needed for a display name.
-        return URL(fileURLWithPath: inputPath).lastPathComponent
+
+        if inputPaths.isEmpty {
+            return "Generated Image \(shortDisplayID)"
+        }
+
+        let component = URL(fileURLWithPath: inputPath).lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !component.isEmpty, !Self.genericDisplayNames.contains(component.lowercased()) {
+            return component
+        }
+
+        return "Image \(shortDisplayID)"
     }
     var errorMessage: String? { error }
     var duration: TimeInterval? {
         guard let start = startedAt, let end = completedAt else { return nil }
         return end.timeIntervalSince(start)
+    }
+
+    var isTerminal: Bool {
+        Self.terminalStatuses.contains(status)
+    }
+
+    var isIssue: Bool {
+        Self.issueStatuses.contains(status)
+    }
+
+    var hasRemoteJob: Bool {
+        externalJobName != nil
+    }
+
+    private static let genericDisplayNames: Set<String> = ["data", "image", "file"]
+
+    private var shortDisplayID: String {
+        String(id.uuidString.prefix(8)).uppercased()
     }
 }
 
@@ -594,42 +708,36 @@ enum ImageSize: String, CaseIterable, Identifiable {
     
     /// Output cost per image for standard tier
     var standardCost: Double {
-        switch self {
-        case .size4K: return 0.24
-        case .size2K: return 0.134
-        case .size1K: return 0.067
-        case .size512: return 0.034
-        }
+        AppPricing.outputRate(for: self, modelName: nil, isBatchTier: false)
     }
     
     /// Output cost per image for batch tier (50% off)
     var batchCost: Double {
-        standardCost / 2
+        AppPricing.outputRate(for: self, modelName: nil, isBatchTier: true)
     }
     
     /// Get cost for given tier
-    func cost(isBatchTier: Bool) -> Double {
-        isBatchTier ? batchCost : standardCost
+    func cost(modelName: String?, isBatchTier: Bool) -> Double {
+        AppPricing.outputRate(for: self, modelName: modelName, isBatchTier: isBatchTier)
     }
     
     /// Calculate total cost including input images
-    static func calculateCost(imageSize: String, inputCount: Int, isBatchTier: Bool) -> Double {
-        let inputRate = isBatchTier ? 0.0006 : 0.0011
+    static func calculateCost(imageSize: String, inputCount: Int, isBatchTier: Bool, modelName: String?) -> Double {
+        let inputRate = AppPricing.inputRate(modelName: modelName, isBatchTier: isBatchTier)
         let inputCost = inputRate * Double(max(1, inputCount))
         
         guard let size = ImageSize(rawValue: imageSize) else {
-            return inputCost + (isBatchTier ? 0.067 : 0.134) // fallback to 1K pricing
+            return inputCost + AppPricing.outputFallbackRate(modelName: modelName, isBatchTier: isBatchTier)
         }
         
-        return inputCost + size.cost(isBatchTier: isBatchTier)
+        return inputCost + size.cost(modelName: modelName, isBatchTier: isBatchTier)
     }
     
     /// Calculate cost for text-to-image generation (no input images)
-    static func calculateTextModeCost(imageSize: String, outputCount: Int, isBatchTier: Bool) -> Double {
+    static func calculateTextModeCost(imageSize: String, outputCount: Int, isBatchTier: Bool, modelName: String?) -> Double {
         guard let size = ImageSize(rawValue: imageSize) else {
-            // Fallback to 1K pricing
-            return Double(outputCount) * (isBatchTier ? 0.067 : 0.134)
+            return Double(outputCount) * AppPricing.outputFallbackRate(modelName: modelName, isBatchTier: isBatchTier)
         }
-        return Double(outputCount) * size.cost(isBatchTier: isBatchTier)
+        return Double(outputCount) * size.cost(modelName: modelName, isBatchTier: isBatchTier)
     }
 }

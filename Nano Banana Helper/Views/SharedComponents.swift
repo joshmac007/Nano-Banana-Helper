@@ -28,13 +28,19 @@ struct CostEstimatorView: View {
     let generationMode: GenerationMode
     let modelName: String?
     
-    private var inputCostPerImage: Double { isBatchTier ? 0.0006 : 0.0011 }
+    var pricingResolution: AppPricing.PricingResolution {
+        AppPricing.pricing(for: modelName)
+    }
+
+    var inputCostPerImage: Double {
+        AppPricing.inputRate(modelName: modelName, isBatchTier: isBatchTier)
+    }
     
-    private var outputCostPerImage: Double {
+    var outputCostPerImage: Double {
         guard let size = ImageSize(rawValue: imageSize) else {
-            return isBatchTier ? 0.067 : 0.134 // fallback to 1K pricing
+            return AppPricing.outputFallbackRate(modelName: modelName, isBatchTier: isBatchTier)
         }
-        return size.cost(isBatchTier: isBatchTier)
+        return size.cost(modelName: modelName, isBatchTier: isBatchTier)
     }
     
     /// Number of output images: 1 if Multi-Input, otherwise same as input count
@@ -42,7 +48,7 @@ struct CostEstimatorView: View {
         isMultiInput ? 1 : imageCount
     }
     
-    private var totalCost: Double {
+    var totalCost: Double {
         switch generationMode {
         case .image:
             // Input cost: charged per input image
@@ -55,41 +61,116 @@ struct CostEstimatorView: View {
             return Double(imageCount) * outputCostPerImage
         }
     }
+
+    var inputTotalCost: Double {
+        switch generationMode {
+        case .image:
+            return Double(imageCount) * inputCostPerImage
+        case .text:
+            return 0
+        }
+    }
+
+    var outputTotalCost: Double {
+        switch generationMode {
+        case .image:
+            return Double(outputCount) * outputCostPerImage
+        case .text:
+            return Double(imageCount) * outputCostPerImage
+        }
+    }
+
+    var fallbackPricingDescription: String? {
+        guard pricingResolution.isFallback else { return nil }
+        return "Using \(pricingResolution.pricingDisplayName) pricing fallback."
+    }
     
     var body: some View {
-        HStack {
-            VStack(alignment: .leading) {
-                switch generationMode {
-                case .image:
-                    if isMultiInput {
-                        Text("\(imageCount) inputs → 1 output @ \(imageSize)")
-                            .font(.subheadline)
-                    } else {
-                        Text("\(imageCount) images @ \(imageSize)")
-                            .font(.subheadline)
-                    }
-                    Text("$\(inputCostPerImage, specifier: "%.4f")/input + $\(outputCostPerImage, specifier: "%.3f")/output")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                case .text:
-                    Text("\(imageCount) image\(imageCount == 1 ? "" : "s") @ \(imageSize)")
-                        .font(.subheadline)
-                    Text("$\(outputCostPerImage, specifier: "%.3f")/output (text-to-image)")
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Projected Cost")
+                        .font(.system(size: 11, weight: .bold))
+                        .textCase(.uppercase)
+                    Text("Estimated only")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
+                Spacer()
+
+                Text("≈ $\(totalCost, specifier: "%.2f")")
+                    .font(.headline)
+                    .foregroundStyle(.green)
+            }
+
+            switch generationMode {
+            case .image:
+                if isMultiInput {
+                    Text("\(imageCount) inputs → 1 output @ \(imageSize)")
+                        .font(.subheadline)
+                } else {
+                    Text("\(imageCount) images @ \(imageSize)")
+                        .font(.subheadline)
+                }
+            case .text:
+                Text("\(imageCount) image\(imageCount == 1 ? "" : "s") @ \(imageSize)")
+                    .font(.subheadline)
+            }
+
+            HStack(spacing: 12) {
+                if generationMode == .image {
+                    estimatorMetric(
+                        title: "Inputs",
+                        detail: String(format: "$%.4f each", inputCostPerImage),
+                        total: inputTotalCost
+                    )
+                }
+
+                estimatorMetric(
+                    title: "Outputs",
+                    detail: String(format: "$%.3f each", outputCostPerImage),
+                    total: outputTotalCost
+                )
+
+                estimatorMetric(
+                    title: "Total",
+                    detail: isBatchTier ? "Batch tier" : "Standard tier",
+                    total: totalCost
+                )
             }
 
             if let modelName {
                 Text(modelName)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
 
-            Spacer()
-            Text("≈ $\(totalCost, specifier: "%.2f")")
-                .font(.headline)
-                .foregroundStyle(.green)
+            if let fallbackPricingDescription {
+                Text(fallbackPricingDescription)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
         }
+        .padding(12)
+        .background(.background.secondary)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func estimatorMetric(title: String, detail: String, total: Double) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+            Text("$\(total, specifier: "%.2f")")
+                .font(.subheadline)
+                .fontWeight(.semibold)
+            Text(detail)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

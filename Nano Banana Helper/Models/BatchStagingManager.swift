@@ -83,6 +83,22 @@ class BatchStagingManager {
         stagedFiles.removeAll { $0 == url }
         stagedBookmarks.removeValue(forKey: url)
     }
+
+    func moveFiles(fromOffsets: IndexSet, toOffset: Int) {
+        stagedFiles.move(fromOffsets: fromOffsets, toOffset: toOffset)
+    }
+
+    func moveFile(_ source: URL, before target: URL) {
+        guard source != target,
+              let sourceIndex = stagedFiles.firstIndex(of: source),
+              let targetIndex = stagedFiles.firstIndex(of: target) else {
+            return
+        }
+
+        let item = stagedFiles.remove(at: sourceIndex)
+        let adjustedTargetIndex = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex
+        stagedFiles.insert(item, at: adjustedTargetIndex)
+    }
     
     /// Clear staged files and bookmarks, but preserve prompt and mode for UX continuity
     func clearAll() {
@@ -102,6 +118,46 @@ class BatchStagingManager {
     
     func bookmark(for url: URL) -> Data? {
         stagedBookmarks[url]
+    }
+
+    func restore(from entry: HistoryEntry) {
+        clearAll()
+
+        prompt = entry.prompt
+        systemPrompt = entry.systemPrompt ?? ""
+        aspectRatio = entry.aspectRatio
+        imageSize = entry.imageSize
+        isBatchTier = entry.usedBatchTier
+        textImageCount = 1
+
+        guard !entry.isTextToImage else {
+            generationMode = .text
+            isMultiInput = false
+            return
+        }
+
+        generationMode = .image
+
+        var restoredFiles: [URL] = []
+        var restoredBookmarks: [URL: Data] = [:]
+        let sourceBookmarks = entry.sourceImageBookmarks ?? []
+
+        for (index, path) in entry.sourceImagePaths.enumerated() {
+            guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
+                continue
+            }
+
+            let url = URL(fileURLWithPath: path)
+            restoredFiles.append(url)
+
+            if sourceBookmarks.indices.contains(index) {
+                restoredBookmarks[url] = sourceBookmarks[index]
+            }
+        }
+
+        stagedFiles = restoredFiles
+        stagedBookmarks = restoredBookmarks
+        isMultiInput = restoredFiles.count > 1
     }
     
     func updateSettings(prompt: String? = nil, systemPrompt: String? = nil, ratio: String? = nil, size: String? = nil, batch: Bool? = nil, multiInput: Bool? = nil) {

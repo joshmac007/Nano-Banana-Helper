@@ -1,17 +1,33 @@
+import AppKit
 import SwiftUI
 
 struct CostReportView: View {
     let costSummary: CostSummary
     let projects: [Project]
+    @Environment(ProjectManager.self) private var projectManager
     @Environment(\.dismiss) var dismiss
+    @State private var exportStatusMessage: String?
+
+    var selectedModelName: String? {
+        AppConfig.load().modelName
+    }
+
+    var pricingResolution: AppPricing.PricingResolution {
+        AppPricing.pricing(for: selectedModelName)
+    }
     
     var body: some View {
         VStack(spacing: 0) {
             // Header
             HStack {
-                Text("Cost Report")
+                Text("Estimated Cost Report")
                     .font(.headline)
                 Spacer()
+
+                Button(action: exportReport) {
+                    Label("Export CSV", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.bordered)
                 
                 Button("Done") {
                     dismiss()
@@ -27,7 +43,7 @@ struct CostReportView: View {
                 VStack(spacing: 20) {
                     // Total summary card
                     VStack(spacing: 12) {
-                        Text("Total Spent")
+                        Text("Estimated Spend")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                         
@@ -38,6 +54,12 @@ struct CostReportView: View {
                         Text("\(costSummary.imageCount) images processed")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+
+                        if let exportStatusMessage {
+                            Text(exportStatusMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     .frame(maxWidth: .infinity)
                     .padding()
@@ -208,9 +230,21 @@ struct CostReportView: View {
 
                     // Pricing reference
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Pricing Reference")
+                        Text("Estimated Pricing Reference")
                             .font(.subheadline)
                             .fontWeight(.medium)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(selectedModelName ?? AppPricing.defaultModelName)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            if pricingResolution.isFallback {
+                                Text("Using \(pricingResolution.pricingDisplayName) pricing fallback.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                            }
+                        }
                         
                         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
                             GridRow {
@@ -220,7 +254,7 @@ struct CostReportView: View {
                                     .fontWeight(.medium)
                                 Text("Output (4K)")
                                     .fontWeight(.medium)
-                                Text("Output (2K/1K)")
+                                Text("Output (2K)")
                                     .fontWeight(.medium)
                             }
                             .font(.caption)
@@ -228,22 +262,22 @@ struct CostReportView: View {
                             
                             GridRow {
                                 Text("Standard")
-                                Text("$0.0011")
-                                Text("$0.24")
-                                Text("$0.134")
+                                Text("$\(AppPricing.inputRate(modelName: selectedModelName, isBatchTier: false), specifier: "%.4f")")
+                                Text("$\(ImageSize.size4K.cost(modelName: selectedModelName, isBatchTier: false), specifier: "%.3f")")
+                                Text("$\(ImageSize.size2K.cost(modelName: selectedModelName, isBatchTier: false), specifier: "%.3f")")
                             }
                             .font(.caption)
                             
                             GridRow {
                                 Text("Batch")
-                                Text("$0.0006")
-                                Text("$0.12")
-                                Text("$0.067")
+                                Text("$\(AppPricing.inputRate(modelName: selectedModelName, isBatchTier: true), specifier: "%.4f")")
+                                Text("$\(ImageSize.size4K.cost(modelName: selectedModelName, isBatchTier: true), specifier: "%.3f")")
+                                Text("$\(ImageSize.size2K.cost(modelName: selectedModelName, isBatchTier: true), specifier: "%.3f")")
                             }
                             .font(.caption)
                         }
 
-                        Text("Usage data is based on app tracking only. Actual billing is determined by your Google Cloud billing account.")
+                        Text("Usage data is based on app tracking only. These values are estimated and may differ from actual Google billing.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .padding(.top, 4)
@@ -264,5 +298,14 @@ struct CostReportView: View {
         formatter.minimumFractionDigits = 2
         formatter.maximumFractionDigits = 4
         return formatter.string(from: NSNumber(value: value)) ?? "$0.00"
+    }
+
+    private func exportReport() {
+        if let url = projectManager.exportCostReportCSV() {
+            NSWorkspace.shared.open(url)
+            exportStatusMessage = "CSV exported to Application Support."
+        } else {
+            exportStatusMessage = "CSV export failed."
+        }
     }
 }

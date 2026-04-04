@@ -9,7 +9,6 @@ class HistoryManager {
     private let projectsDirectoryURL: URL
     private let bookmarkDependencies: AppPaths.BookmarkResolutionDependencies
     
-    var entries: [HistoryEntry] = []
     var allGlobalEntries: [HistoryEntry] = []
     
     private func historyURL(for projectId: UUID) -> URL {
@@ -34,19 +33,22 @@ class HistoryManager {
     func loadHistory(for projectId: UUID) {
         let url = historyURL(for: projectId)
         guard fileManager.fileExists(atPath: url.path) else {
-            entries = []
+            allGlobalEntries.removeAll { $0.projectId == projectId }
             return
         }
         
         do {
             let data = try Data(contentsOf: url)
-            entries = try decoder.decode([HistoryEntry].self, from: data)
-            if refreshBookmarksIfNeeded(in: &entries) {
-                saveHistory(for: projectId)
+            var projectEntries = try decoder.decode([HistoryEntry].self, from: data)
+            if refreshBookmarksIfNeeded(in: &projectEntries) {
+                saveEntries(projectEntries, to: url)
             }
+            allGlobalEntries.removeAll { $0.projectId == projectId }
+            allGlobalEntries.append(contentsOf: projectEntries)
+            allGlobalEntries.sort(by: { $0.timestamp > $1.timestamp })
         } catch {
             print("Failed to load history: \(error)")
-            entries = []
+            allGlobalEntries.removeAll { $0.projectId == projectId }
         }
     }
     
@@ -79,33 +81,29 @@ class HistoryManager {
         // Ensure directory exists
         let directory = url.deletingLastPathComponent()
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-        saveEntries(entries, to: url)
+        
+        let projectEntries = allGlobalEntries.filter { $0.projectId == projectId }
+        saveEntries(projectEntries, to: url)
     }
     
     // MARK: - Entry Management
     
     func addEntry(_ entry: HistoryEntry) {
-        entries.insert(entry, at: 0)  // Most recent first in current view
         allGlobalEntries.insert(entry, at: 0) // Newest first in global
         allGlobalEntries.sort(by: { $0.timestamp > $1.timestamp })
         saveHistory(for: entry.projectId)
     }
     
     func deleteEntry(_ entry: HistoryEntry) {
-        entries.removeAll { $0.id == entry.id }
         allGlobalEntries.removeAll { $0.id == entry.id }
         saveHistory(for: entry.projectId)
     }
     
     /// Updates an existing entry by matching externalJobName, or adds as new entry if not found
     func updateEntry(byExternalJobName jobName: String, with newEntry: HistoryEntry) {
-        // Search current project's entries first (fast path)
-        if let index = entries.firstIndex(where: { $0.externalJobName == jobName }) {
-            entries[index] = newEntry
-            // Also update allGlobalEntries
-            if let globalIndex = allGlobalEntries.firstIndex(where: { $0.externalJobName == jobName }) {
-                allGlobalEntries[globalIndex] = newEntry
-            }
+        // Search current global entries first
+        if let globalIndex = allGlobalEntries.firstIndex(where: { $0.externalJobName == jobName }) {
+            allGlobalEntries[globalIndex] = newEntry
             saveHistory(for: newEntry.projectId)
             return
         }
@@ -124,6 +122,9 @@ class HistoryManager {
             // Keep allGlobalEntries in sync
             if let globalIndex = allGlobalEntries.firstIndex(where: { $0.externalJobName == jobName }) {
                 allGlobalEntries[globalIndex] = newEntry
+            } else {
+                allGlobalEntries.append(newEntry)
+                allGlobalEntries.sort(by: { $0.timestamp > $1.timestamp })
             }
             return
         }
@@ -133,7 +134,6 @@ class HistoryManager {
     }
     
     func clearHistory(for projectId: UUID) {
-        entries.removeAll { $0.projectId == projectId }
         allGlobalEntries.removeAll { $0.projectId == projectId }
         saveHistory(for: projectId)
     }
@@ -232,11 +232,11 @@ class HistoryManager {
     // MARK: - Filtering
     
     func entries(for projectId: UUID) -> [HistoryEntry] {
-        entries.filter { $0.projectId == projectId }
+        allGlobalEntries.filter { $0.projectId == projectId }
     }
     
     func recentEntries(limit: Int = 20) -> [HistoryEntry] {
-        Array(entries.prefix(limit))
+        Array(allGlobalEntries.prefix(limit))
     }
     
     // MARK: - Statistics
@@ -278,12 +278,6 @@ class HistoryManager {
     private func syncCachedEntries(with projectEntries: [HistoryEntry], for projectId: UUID) {
         let updatedEntriesByID = Dictionary(uniqueKeysWithValues: projectEntries.map { ($0.id, $0) })
 
-        for index in entries.indices {
-            if let updatedEntry = updatedEntriesByID[entries[index].id] {
-                entries[index] = updatedEntry
-            }
-        }
-
         for index in allGlobalEntries.indices {
             if let updatedEntry = updatedEntriesByID[allGlobalEntries[index].id] {
                 allGlobalEntries[index] = updatedEntry
@@ -291,17 +285,10 @@ class HistoryManager {
         }
 
         allGlobalEntries.sort(by: { $0.timestamp > $1.timestamp })
-
-        if !entries.isEmpty && entries.allSatisfy({ $0.projectId == projectId }) {
-            entries = projectEntries
-        }
     }
 
     private func projectID(for entryId: UUID) -> UUID? {
         if let entry = allGlobalEntries.first(where: { $0.id == entryId }) {
-            return entry.projectId
-        }
-        if let entry = entries.first(where: { $0.id == entryId }) {
             return entry.projectId
         }
         return nil

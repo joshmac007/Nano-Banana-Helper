@@ -128,6 +128,13 @@ struct HistoryView: View {
                             showingRescueDialog = true
                         }
                     )
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button(role: .destructive) {
+                            onDelete?(entry)
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    }
                     .contextMenu {
                         if let project {
                             Button("Show in Finder") {
@@ -254,103 +261,7 @@ struct HistoryRowView: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 16) {
-            HStack(spacing: 4) {
-                ZStack(alignment: .topTrailing) {
-                    if let sourceImage {
-                        Image(nsImage: sourceImage)
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(width: 64, height: 64)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                    } else {
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(.quaternary)
-                            .frame(width: 64, height: 64)
-                            .overlay(Image(systemName: sourceAccessDenied ? "lock.fill" : "photo").foregroundStyle(.tertiary))
-                    }
-
-                    if sourceAccessDenied {
-                        Button(action: reauthorizeSource) {
-                            Image(systemName: "lock.badge.plus")
-                                .padding(4)
-                                .background(.ultraThinMaterial, in: Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .offset(x: 4, y: -4)
-                    } else if entry.sourceImagePaths.count > 1 {
-                        Text("\(entry.sourceImagePaths.count)")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 4)
-                            .background(Color.accentColor)
-                            .clipShape(Capsule())
-                            .offset(x: 4, y: 4)
-                    }
-                }
-
-                Image(systemName: "arrow.right")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(.tertiary)
-
-                if entry.status == "completed" {
-                    ZStack(alignment: .topTrailing) {
-                        if let outputImage {
-                            ZStack(alignment: .bottomTrailing) {
-                                Image(nsImage: outputImage)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .frame(width: 64, height: 64)
-                                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                                    .onTapGesture {
-                                        showingPreview = true
-                                    }
-                                    .help("Click to preview")
-
-                                if entry.sourceImagePaths.count > 1 {
-                                    Text("1")
-                                        .font(.system(size: 10, weight: .bold))
-                                        .foregroundStyle(.white)
-                                        .padding(.horizontal, 4)
-                                        .background(Color.green)
-                                        .clipShape(Capsule())
-                                        .offset(x: 4, y: 4)
-                                }
-                            }
-                        } else {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(.quaternary)
-                                .frame(width: 64, height: 64)
-                                .overlay(Image(systemName: outputAccessDenied ? "lock.fill" : "photo").foregroundStyle(.tertiary))
-                        }
-
-                        if outputAccessDenied {
-                            Button(action: reauthorizeOutput) {
-                                Image(systemName: "lock.badge.plus")
-                                    .padding(4)
-                                    .background(.ultraThinMaterial, in: Circle())
-                            }
-                            .buttonStyle(.plain)
-                            .offset(x: 4, y: -4)
-                        }
-                    }
-                } else {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(statusColor.opacity(0.1))
-                        .frame(width: 64, height: 64)
-                        .overlay(
-                            Group {
-                                if isActive {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                } else {
-                                    Image(systemName: statusIcon)
-                                        .font(.system(size: 20))
-                                        .foregroundStyle(statusColor)
-                                }
-                            }
-                        )
-                }
-            }
+            previewStrip
 
             VStack(spacing: 12) {
                 Button(action: { onReuse?(entry) }) {
@@ -387,6 +298,17 @@ struct HistoryRowView: View {
                 Text(entry.prompt)
                     .font(.system(.subheadline, weight: .medium))
                     .lineLimit(2)
+
+                HStack(spacing: 6) {
+                    modeBadge
+
+                    if let modelName = entry.modelName, !modelName.isEmpty {
+                        Text(modelName)
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
 
                 if let systemPrompt = entry.systemPrompt, !systemPrompt.isEmpty {
                     HStack(spacing: 4) {
@@ -504,6 +426,129 @@ struct HistoryRowView: View {
                 .frame(minWidth: 400, minHeight: 400)
             }
         }
+    }
+
+    @ViewBuilder
+    private var previewStrip: some View {
+        HStack(spacing: 4) {
+            if entry.hasSourceImages {
+                sourceThumbnail
+
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.tertiary)
+            }
+
+            outputThumbnail
+        }
+    }
+
+    @ViewBuilder
+    private var sourceThumbnail: some View {
+        ZStack(alignment: .topTrailing) {
+            if let sourceImage {
+                Image(nsImage: sourceImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 64, height: 64)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(.quaternary)
+                    .frame(width: 64, height: 64)
+                    .overlay(Image(systemName: sourceAccessDenied ? "lock.fill" : "photo").foregroundStyle(.tertiary))
+            }
+
+            if sourceAccessDenied {
+                Button(action: reauthorizeSource) {
+                    Image(systemName: "lock.badge.plus")
+                        .padding(4)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .offset(x: 4, y: -4)
+            } else if entry.sourceImagePaths.count > 1 {
+                Text("\(entry.sourceImagePaths.count)")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 4)
+                    .background(Color.accentColor)
+                    .clipShape(Capsule())
+                    .offset(x: 4, y: 4)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var outputThumbnail: some View {
+        if entry.status == "completed" {
+            ZStack(alignment: .topTrailing) {
+                if let outputImage {
+                    ZStack(alignment: .bottomTrailing) {
+                        Image(nsImage: outputImage)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: 64, height: 64)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .onTapGesture {
+                                showingPreview = true
+                            }
+                            .help("Click to preview")
+
+                        if entry.hasSourceImages && entry.sourceImagePaths.count > 1 {
+                            Text("1")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 4)
+                                .background(Color.green)
+                                .clipShape(Capsule())
+                                .offset(x: 4, y: 4)
+                        }
+                    }
+                } else {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(.quaternary)
+                        .frame(width: 64, height: 64)
+                        .overlay(Image(systemName: outputAccessDenied ? "lock.fill" : "photo").foregroundStyle(.tertiary))
+                }
+
+                if outputAccessDenied {
+                    Button(action: reauthorizeOutput) {
+                        Image(systemName: "lock.badge.plus")
+                            .padding(4)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .offset(x: 4, y: -4)
+                }
+            }
+        } else {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(statusColor.opacity(0.1))
+                .frame(width: 64, height: 64)
+                .overlay(
+                    Group {
+                        if isActive {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: statusIcon)
+                                .font(.system(size: 20))
+                                .foregroundStyle(statusColor)
+                        }
+                    }
+                )
+        }
+    }
+
+    private var modeBadge: some View {
+        Text(entry.generationDescription)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(entry.isTextToImage ? .blue : .secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background((entry.isTextToImage ? Color.blue : Color.secondary).opacity(0.12))
+            .clipShape(Capsule())
     }
 
     private var loadID: String {
@@ -639,6 +684,7 @@ struct HistoryRowView: View {
         switch entry.status {
         case "completed": return .green
         case "cancelled": return .orange
+        case "expired": return .orange
         case "failed": return .red
         default: return .secondary
         }
@@ -649,6 +695,7 @@ struct HistoryRowView: View {
         case "completed": return "checkmark.circle"
         case "processing": return "pause.circle"
         case "cancelled": return "xmark.circle"
+        case "expired": return "clock.badge.exclamationmark"
         case "failed": return "exclamationmark.triangle"
         default: return "questionmark"
         }

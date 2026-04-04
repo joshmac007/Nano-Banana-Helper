@@ -299,6 +299,7 @@ struct HistoryEntryCard: View {
         switch entry.status {
         case "completed": return .green
         case "cancelled": return .orange
+        case "expired": return .orange
         case "failed": return .red
         default: return .secondary
         }
@@ -308,6 +309,7 @@ struct HistoryEntryCard: View {
         switch entry.status {
         case "completed": return "checkmark"
         case "cancelled": return "xmark"
+        case "expired": return "clock.badge.exclamationmark"
         case "failed": return "exclamationmark.triangle"
         default: return "questionmark"
         }

@@ -79,7 +79,7 @@ struct ProjectListView: View {
             
             // Total cost summary
             HStack {
-                Text("Total Spent")
+                Text("Estimated Spend")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()

@@ -124,7 +124,7 @@ struct SidebarView: View {
                     HStack {
                         Image(systemName: "dollarsign.circle.fill")
                             .foregroundStyle(.green)
-                        Text("Spent: \(formatCurrency(projectManager.costSummary.totalSpent))")
+                        Text("Estimated: \(formatCurrency(projectManager.costSummary.totalSpent))")
                             .font(.caption)
                             .fontWeight(.medium)
                         Spacer()

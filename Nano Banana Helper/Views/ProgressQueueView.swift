@@ -48,6 +48,7 @@ struct QueueHeaderActionVisibility: Equatable {
 struct ProgressQueueView: View {
     let historyManager: HistoryManager
     let projectManager: ProjectManager
+    let queueHeight: CGFloat
     @Environment(BatchOrchestrator.self) private var orchestrator
     @State private var logManager = LogManager.shared
     @State private var isLogVisible: Bool = false
@@ -55,7 +56,7 @@ struct ProgressQueueView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Drawer Header with Controls
-            VStack(spacing: 8) {
+            VStack(spacing: 4) {
                 HStack {
                     Text("Queue")
                         .font(.headline)
@@ -70,6 +71,19 @@ struct ProgressQueueView: View {
                     .controlSize(.small)
                     .foregroundStyle(isLogVisible ? .primary : .secondary)
                     .help("View raw API logs")
+
+                    if !orchestrator.completedJobs.isEmpty {
+                        Divider()
+                            .frame(height: 16)
+
+                        Button(action: openOutputFolder) {
+                            Label("Open Output", systemImage: "folder")
+                        }
+                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                        .foregroundStyle(.secondary)
+                        .help("Open output folder in Finder")
+                    }
 
                     Divider()
                         .frame(height: 16)
@@ -100,14 +114,18 @@ struct ProgressQueueView: View {
                     }
                 }
 
-                HStack {
-                    Text(headerSubtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
+                if !headerSubtitle.isEmpty {
+                    HStack {
+                        Text(headerSubtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
                 }
             }
-            .padding(12)
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+            .padding(.bottom, 8)
             .background(.background.secondary)
             
             Divider()
@@ -124,57 +142,115 @@ struct ProgressQueueView: View {
                 List {
                     // Processing
                     if !orchestrator.processingJobs.isEmpty {
-                        Section("Processing (\(orchestrator.processingJobs.count))") {
+                        Section {
                             ForEach(orchestrator.processingJobs, id: \.id) { task in
                                 TaskRowView(task: task)
                             }
+                        } header: {
+                            QueueSectionHeader(
+                                title: "Processing (\(orchestrator.processingJobs.count))"
+                            )
                         }
                     }
                     
                     // Pending
                     if !orchestrator.pendingJobs.isEmpty {
                         let count = orchestrator.pendingJobs.count
-                        Section("Pending (\(count) task\(count == 1 ? "" : "s"))") {
+                        Section {
                             ForEach(orchestrator.pendingJobs, id: \.id) { task in
                                 TaskRowView(task: task)
                             }
                             .onDelete(perform: orchestrator.removePendingTasks)
+                        } header: {
+                            QueueSectionHeader(
+                                title: "Pending (\(count) task\(count == 1 ? "" : "s"))",
+                                clearAction: {
+                                    clearAll(orchestrator.pendingJobs) { orchestrator.removePendingTasks(at: $0) }
+                                }
+                            )
                         }
                     }
                     
                     // Completed
                     if !orchestrator.completedJobs.isEmpty {
                         let count = orchestrator.completedJobs.count
-                        Section("Completed (\(count) output\(count == 1 ? "" : "s"))") {
+                        Section {
                             ForEach(orchestrator.completedJobs, id: \.id) { task in
                                 TaskRowView(task: task)
+                                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                        Button(role: .destructive) {
+                                            if let index = orchestrator.completedJobs.firstIndex(where: { $0.id == task.id }) {
+                                                orchestrator.removeCompletedTasks(at: IndexSet(integer: index))
+                                            }
+                                        } label: {
+                                            Text("Dismiss")
+                                        }
+                                    }
                             }
-                            .onDelete(perform: orchestrator.removeCompletedTasks)
+                        } header: {
+                            QueueSectionHeader(
+                                title: "Completed (\(count))",
+                                clearAction: {
+                                    clearAll(orchestrator.completedJobs) { orchestrator.removeCompletedTasks(at: $0) }
+                                }
+                            )
                         }
                     }
                     
                     // Cancelled
                     if !orchestrator.cancelledJobs.isEmpty {
                         let count = orchestrator.cancelledJobs.count
-                        Section("Cancelled (\(count))") {
+                        Section {
                             ForEach(orchestrator.cancelledJobs, id: \.id) { task in
                                 TaskRowView(task: task)
+                                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                        Button(role: .destructive) {
+                                            if let index = orchestrator.cancelledJobs.firstIndex(where: { $0.id == task.id }) {
+                                                orchestrator.removeCancelledTasks(at: IndexSet(integer: index))
+                                            }
+                                        } label: {
+                                            Text("Dismiss")
+                                        }
+                                    }
                             }
-                            .onDelete(perform: orchestrator.removeCancelledTasks)
+                        } header: {
+                            QueueSectionHeader(
+                                title: "Cancelled (\(count))",
+                                subtitle: "Logged in History",
+                                clearAction: {
+                                    clearAll(orchestrator.cancelledJobs) { orchestrator.removeCancelledTasks(at: $0) }
+                                }
+                            )
                         }
                     }
 
                     // Issues
                     if !orchestrator.failedJobs.isEmpty {
                         let count = orchestrator.failedJobs.count
-                        Section("Issues (\(count))") {
+                        Section {
                             ForEach(orchestrator.failedJobs, id: \.id) { task in
                                 TaskRowView(task: task)
+                                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                        Button(role: .destructive) {
+                                            if let index = orchestrator.failedJobs.firstIndex(where: { $0.id == task.id }) {
+                                                orchestrator.removeFailedTasks(at: IndexSet(integer: index))
+                                            }
+                                        } label: {
+                                            Text("Dismiss")
+                                        }
+                                    }
                             }
-                            .onDelete(perform: orchestrator.removeFailedTasks)
+                        } header: {
+                            QueueSectionHeader(
+                                title: "Issues (\(count))",
+                                clearAction: {
+                                    clearAll(orchestrator.failedJobs) { orchestrator.removeFailedTasks(at: $0) }
+                                }
+                            )
                         }
                     }
                 }
+                .id(queueContentRefreshID)
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
             }
@@ -218,26 +294,11 @@ struct ProgressQueueView: View {
                         .frame(maxWidth: .infinity)
                         .padding()
                     }
-                    .frame(height: 180)
+                    .frame(height: apiLogHeight)
                     .frame(maxWidth: .infinity)
                     .background(.black.opacity(0.1))
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-            
-            Divider()
-            
-            // Control buttons
-            if !orchestrator.completedJobs.isEmpty {
-                HStack {
-                    Spacer()
-                    Button(action: openOutputFolder) {
-                        Label("Open Output", systemImage: "folder")
-                    }
-                    .buttonStyle(.bordered)
-                    Spacer()
-                }
-                .padding()
             }
         }
         .navigationSplitViewColumnWidth(min: 300, ideal: 350)
@@ -271,7 +332,7 @@ struct ProgressQueueView: View {
         case .interrupted:
             return "Queue recovery required. Resume reconciles remote jobs before submitting new work."
         default:
-            return "Reprioritize tasks in Staging before submission. Live queue reordering is not available."
+            return ""
         }
     }
 
@@ -309,6 +370,28 @@ struct ProgressQueueView: View {
                 )
             }
         }
+    }
+
+    private func clearAll(_ tasks: [ImageTask], removal: (IndexSet) -> Void) {
+        guard !tasks.isEmpty else { return }
+        removal(IndexSet(integersIn: tasks.indices))
+    }
+
+    private var apiLogHeight: CGFloat {
+        let scaledHeight = queueHeight * 0.5
+        return min(max(180, scaledHeight), 360)
+    }
+
+    private var queueContentRefreshID: String {
+        let allJobs = orchestrator.pendingJobs
+            + orchestrator.processingJobs
+            + orchestrator.completedJobs
+            + orchestrator.cancelledJobs
+            + orchestrator.failedJobs
+
+        return allJobs
+            .map { "\($0.id.uuidString)-\($0.status)-\($0.phase.rawValue)" }
+            .joined(separator: "|")
     }
 }
 
@@ -349,6 +432,42 @@ struct StatusIndicator: View {
     
     private var statusText: String {
         controlState.displayName
+    }
+}
+
+struct QueueSectionHeader: View {
+    let title: String
+    var subtitle: String? = nil
+    var clearAction: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer(minLength: 12)
+
+            if let clearAction {
+                Button(action: clearAction) {
+                    Text("Clear All")
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help("Remove all items in this queue section")
+            }
+        }
+        .textCase(nil)
+        .padding(.vertical, 2)
     }
 }
 

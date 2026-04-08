@@ -1924,6 +1924,21 @@ struct Nano_Banana_HelperTests {
         #expect(actions.showsCancel == false)
     }
 
+    @Test func queueLayoutMetricsReserveSpaceForWorkbenchAndDock() {
+        let bounds = QueueLayoutMetrics.heightBounds(for: 900)
+
+        #expect(bounds.lowerBound == QueueLayoutMetrics.minimumQueueHeight)
+        #expect(bounds.upperBound == 592)
+        #expect(
+            QueueLayoutMetrics.clampedHeight(1_000, availableHeight: 900)
+            == bounds.upperBound
+        )
+        #expect(
+            QueueLayoutMetrics.clampedHeight(120, availableHeight: 900)
+            == bounds.lowerBound
+        )
+    }
+
     @MainActor @Test func pauseStatePersistsAcrossReload() throws {
         let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
         let orchestrator = BatchOrchestrator(

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct MainLayoutView: View {
@@ -12,6 +13,8 @@ struct MainLayoutView: View {
     // Width Management
     @State private var sidebarWidth: CGFloat = 250
     @State private var inspectorWidth: CGFloat = 300
+    @State private var queueHeight: CGFloat = 300
+    @State private var queueDragPreviewHeight: CGFloat?
     
     @State private var settingsSheet: SettingsView.SettingsTab? = nil
     
@@ -35,7 +38,13 @@ struct MainLayoutView: View {
             )
             .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 300)
         } detail: {
-            VStack(spacing: 0) {
+            GeometryReader { proxy in
+                let queueBounds = QueueLayoutMetrics.heightBounds(for: proxy.size.height)
+                let displayedQueueHeight = QueueLayoutMetrics.clampedHeight(
+                    queueDragPreviewHeight ?? queueHeight,
+                    availableHeight: proxy.size.height
+                )
+
                 // Top Area: Workbench + Inspector
                 HStack(spacing: 0) {
                     // Center Workbench
@@ -46,26 +55,39 @@ struct MainLayoutView: View {
                             projectManager: projectManager
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        
+
                         if isQueueOpen {
-                            Divider()
+                            QueueResizeHandle(
+                                currentHeight: displayedQueueHeight,
+                                minHeight: queueBounds.lowerBound,
+                                maxHeight: queueBounds.upperBound,
+                                onHeightChanged: { queueDragPreviewHeight = $0 },
+                                onHeightCommitted: { finalHeight in
+                                    queueHeight = finalHeight
+                                    queueDragPreviewHeight = nil
+                                }
+                            )
+                            .padding(.top, 1)
+                            .background(.background.secondary)
+
                             ProgressQueueView(
                                 historyManager: historyManager,
-                                projectManager: projectManager
+                                projectManager: projectManager,
+                                queueHeight: displayedQueueHeight
                             )
-                                .frame(height: 300) // Increased height
-                                .transition(.move(edge: .bottom))
-                                .background(VisualEffectView(material: .popover, blendingMode: .withinWindow))
+                            .frame(height: displayedQueueHeight)
+                            .transition(.move(edge: .bottom))
+                            .background(VisualEffectView(material: .popover, blendingMode: .withinWindow))
                         }
 
                         Divider()
-                        
+
                         // Bottom Dock (Tucked inside workbench container for matching width)
                         BottomDockView(isQueueOpen: $isQueueOpen)
                     }
-                    
+
                     Divider()
-                    
+
                     // Right Inspector
                     InspectorView(
                         stagingManager: stagingManager,
@@ -74,6 +96,7 @@ struct MainLayoutView: View {
                     )
                     .frame(width: inspectorWidth)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
         }
         .navigationTitle(projectManager.currentProject?.name ?? "Nano Banana Pro")
@@ -123,5 +146,69 @@ struct MainLayoutView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openPromptSettings)) { _ in
             settingsSheet = .prompts
         }
+    }
+
+}
+
+struct QueueLayoutMetrics {
+    static let minimumQueueHeight: CGFloat = 180
+    static let minimumWorkbenchHeight: CGFloat = 260
+    static let bottomDockHeight: CGFloat = 34
+    static let resizeHandleHeight: CGFloat = 13
+    static let dividerHeight: CGFloat = 1
+
+    static func clampedHeight(_ height: CGFloat, availableHeight: CGFloat) -> CGFloat {
+        let bounds = heightBounds(for: availableHeight)
+        return min(max(height, bounds.lowerBound), bounds.upperBound)
+    }
+
+    static func heightBounds(for availableHeight: CGFloat) -> ClosedRange<CGFloat> {
+        let reservedHeight = minimumWorkbenchHeight + bottomDockHeight + resizeHandleHeight + dividerHeight
+        let maximumHeight = max(minimumQueueHeight, availableHeight - reservedHeight)
+        return minimumQueueHeight...maximumHeight
+    }
+}
+
+private struct QueueResizeHandle: View {
+    let currentHeight: CGFloat
+    let minHeight: CGFloat
+    let maxHeight: CGFloat
+    let onHeightChanged: (CGFloat) -> Void
+    let onHeightCommitted: (CGFloat) -> Void
+    @State private var dragStartHeight: CGFloat?
+
+    var body: some View {
+        Capsule()
+            .fill(Color.secondary.opacity(0.6))
+            .frame(width: 64, height: 4)
+        .frame(height: 10)
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            if hovering {
+                NSCursor.resizeUpDown.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                .onChanged { value in
+                    if dragStartHeight == nil {
+                        dragStartHeight = currentHeight
+                    }
+                    guard let dragStartHeight else { return }
+                    let proposedHeight = dragStartHeight - value.translation.height
+                    onHeightChanged(min(max(proposedHeight, minHeight), maxHeight))
+                }
+                .onEnded { value in
+                    let startHeight = dragStartHeight ?? currentHeight
+                    let proposedHeight = startHeight - value.translation.height
+                    onHeightCommitted(min(max(proposedHeight, minHeight), maxHeight))
+                    dragStartHeight = nil
+                }
+        )
+        .accessibilityLabel("Resize queue")
+        .accessibilityHint("Drag to change the queue height")
     }
 }

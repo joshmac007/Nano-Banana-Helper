@@ -22,6 +22,9 @@ enum GenerationMode: String, CaseIterable, Identifiable, Sendable {
 class BatchStagingManager {
     // MARK: - Generation Mode
     var generationMode: GenerationMode = .image
+
+    /// Number of output images to generate per image input set (1-4).
+    var imageVariationCount: Int = 1
     
     /// Number of output images to generate in text mode (1-4).
     /// Clamping is handled at the call site (InspectorView buttons have .disabled guards).
@@ -51,9 +54,25 @@ class BatchStagingManager {
     /// Number of tasks that will be created (files for image mode, count for text mode)
     var effectiveTaskCount: Int {
         switch generationMode {
-        case .image: return stagedFiles.count
+        case .image:
+            guard !stagedFiles.isEmpty else { return 0 }
+            return isMultiInput ? imageVariationCount : stagedFiles.count * imageVariationCount
         case .text: return textImageCount
         }
+    }
+
+    /// Number of input-image charges implied by the current staging configuration.
+    var effectiveInputCount: Int {
+        switch generationMode {
+        case .image:
+            return stagedFiles.count * imageVariationCount
+        case .text:
+            return 0
+        }
+    }
+
+    var containsPNGInputs: Bool {
+        stagedFiles.contains { $0.pathExtension.lowercased() == "png" }
     }
     
     /// Whether the staging area is ready to start generation
@@ -113,6 +132,7 @@ class BatchStagingManager {
         prompt = ""
         systemPrompt = ""
         generationMode = .image
+        imageVariationCount = 1
         textImageCount = 1
     }
     
@@ -128,6 +148,7 @@ class BatchStagingManager {
         aspectRatio = entry.aspectRatio
         imageSize = entry.imageSize
         isBatchTier = entry.usedBatchTier
+        imageVariationCount = 1
         textImageCount = 1
 
         guard !entry.isTextToImage else {
@@ -158,6 +179,34 @@ class BatchStagingManager {
         stagedFiles = restoredFiles
         stagedBookmarks = restoredBookmarks
         isMultiInput = restoredFiles.count > 1
+    }
+
+    func makeImageTasks() -> [ImageTask] {
+        guard !stagedFiles.isEmpty else { return [] }
+
+        if isMultiInput {
+            let inputPaths = stagedFiles.map(\.path)
+            let inputBookmarks = stagedFiles.compactMap { bookmark(for: $0) }
+            return (0..<imageVariationCount).map { index in
+                ImageTask(
+                    inputPaths: inputPaths,
+                    inputBookmarks: inputBookmarks.isEmpty ? nil : inputBookmarks,
+                    variationIndex: index + 1,
+                    variationTotal: imageVariationCount
+                )
+            }
+        }
+
+        return stagedFiles.flatMap { url in
+            (0..<imageVariationCount).map { index in
+                ImageTask(
+                    inputPath: url.path,
+                    inputBookmark: bookmark(for: url),
+                    variationIndex: index + 1,
+                    variationTotal: imageVariationCount
+                )
+            }
+        }
     }
     
     func updateSettings(prompt: String? = nil, systemPrompt: String? = nil, ratio: String? = nil, size: String? = nil, batch: Bool? = nil, multiInput: Bool? = nil) {

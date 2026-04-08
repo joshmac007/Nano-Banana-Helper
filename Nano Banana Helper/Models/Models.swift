@@ -341,9 +341,18 @@ class LogManager {
     static let shared = LogManager()
     var entries: [LogEntry] = []
     private let maxEntries = 100
+    private let maxPayloadCharacters = 1600
     
     func log(_ type: LogEntry.LogType, payload: String) {
-        let entry = LogEntry(type: type, payload: payload)
+        let cappedPayload: String
+        if payload.count > maxPayloadCharacters {
+            let clipped = payload.prefix(maxPayloadCharacters)
+            cappedPayload = "\(clipped)… [truncated \(payload.count - maxPayloadCharacters) chars]"
+        } else {
+            cappedPayload = payload
+        }
+
+        let entry = LogEntry(type: type, payload: cappedPayload)
         entries.insert(entry, at: 0)
         if entries.count > maxEntries {
             entries.removeLast()
@@ -563,11 +572,14 @@ class ImageTask: Identifiable, Codable {
     var externalJobName: String? // Store Gemini API job ID
     var projectId: UUID? // Added for filtering results by project
     var cancelRequestedAt: Date?
+    var variationIndex: Int?
+    var variationTotal: Int?
 
     enum CodingKeys: String, CodingKey {
         case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount
         case lastPollState, lastPollUpdatedAt, stalledAt
         case error, startedAt, submittedAt, completedAt, externalJobName, projectId, cancelRequestedAt
+        case variationIndex, variationTotal
     }
 
     required init(from decoder: Decoder) throws {
@@ -589,6 +601,8 @@ class ImageTask: Identifiable, Codable {
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
         projectId = try container.decodeIfPresent(UUID.self, forKey: .projectId)
         cancelRequestedAt = try container.decodeIfPresent(Date.self, forKey: .cancelRequestedAt)
+        variationIndex = try container.decodeIfPresent(Int.self, forKey: .variationIndex)
+        variationTotal = try container.decodeIfPresent(Int.self, forKey: .variationTotal)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -610,9 +624,17 @@ class ImageTask: Identifiable, Codable {
         try container.encode(externalJobName, forKey: .externalJobName)
         try container.encode(projectId, forKey: .projectId)
         try container.encodeIfPresent(cancelRequestedAt, forKey: .cancelRequestedAt)
+        try container.encodeIfPresent(variationIndex, forKey: .variationIndex)
+        try container.encodeIfPresent(variationTotal, forKey: .variationTotal)
     }
     
-    init(inputPaths: [String], projectId: UUID? = nil, inputBookmarks: [Data]? = nil) {
+    init(
+        inputPaths: [String],
+        projectId: UUID? = nil,
+        inputBookmarks: [Data]? = nil,
+        variationIndex: Int? = nil,
+        variationTotal: Int? = nil
+    ) {
         self.id = UUID()
         self.inputPaths = inputPaths
         self.inputBookmarks = inputBookmarks
@@ -624,9 +646,17 @@ class ImageTask: Identifiable, Codable {
         self.stalledAt = nil
         self.projectId = projectId
         self.cancelRequestedAt = nil
+        self.variationIndex = variationIndex
+        self.variationTotal = variationTotal
     }
     
-    init(inputPath: String, projectId: UUID? = nil, inputBookmark: Data? = nil) {
+    init(
+        inputPath: String,
+        projectId: UUID? = nil,
+        inputBookmark: Data? = nil,
+        variationIndex: Int? = nil,
+        variationTotal: Int? = nil
+    ) {
         self.id = UUID()
         self.inputPaths = [inputPath]
         self.inputBookmarks = inputBookmark.map { [$0] }
@@ -638,6 +668,8 @@ class ImageTask: Identifiable, Codable {
         self.stalledAt = nil
         self.projectId = projectId
         self.cancelRequestedAt = nil
+        self.variationIndex = variationIndex
+        self.variationTotal = variationTotal
     }
     
     // Backward compatibility for single input path
@@ -650,23 +682,27 @@ class ImageTask: Identifiable, Codable {
     var inputURL: URL { URL(fileURLWithPath: inputPath) }
     var outputURL: URL? { outputPath.map { URL(fileURLWithPath: $0) } }
     var filename: String {
+        let baseName: String
         if inputPaths.count > 1 {
             let label = status == "completed" ? "output" : "inputs"
             let count = status == "completed" ? "1" : "\(inputPaths.count)"
-            return "Multimodal (\(count) \(label))"
+            baseName = "Multimodal (\(count) \(label))"
+        } else if inputPaths.isEmpty {
+            baseName = "Generated Image \(shortDisplayID)"
+        } else {
+            let component = URL(fileURLWithPath: inputPath).lastPathComponent
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !component.isEmpty, !Self.genericDisplayNames.contains(component.lowercased()) {
+                baseName = component
+            } else {
+                baseName = "Image \(shortDisplayID)"
+            }
         }
 
-        if inputPaths.isEmpty {
-            return "Generated Image \(shortDisplayID)"
+        if let variationLabel {
+            return "\(baseName) (\(variationLabel))"
         }
-
-        let component = URL(fileURLWithPath: inputPath).lastPathComponent
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !component.isEmpty, !Self.genericDisplayNames.contains(component.lowercased()) {
-            return component
-        }
-
-        return "Image \(shortDisplayID)"
+        return baseName
     }
     var errorMessage: String? { error }
     var duration: TimeInterval? {
@@ -684,6 +720,11 @@ class ImageTask: Identifiable, Codable {
 
     var hasRemoteJob: Bool {
         externalJobName != nil
+    }
+
+    var variationLabel: String? {
+        guard let variationIndex, let variationTotal, variationTotal > 1 else { return nil }
+        return "Variation \(variationIndex)/\(variationTotal)"
     }
 
     private static let genericDisplayNames: Set<String> = ["data", "image", "file"]

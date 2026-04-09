@@ -109,9 +109,6 @@ struct MainLayoutView: View {
              // Load global history
              historyManager.loadGlobalHistory(allProjects: projectManager.projects)
              
-             // Rebuild updated cost summary from actual history
-             projectManager.rebuildCostSummary(from: historyManager.allGlobalEntries)
-             
              // Wire up Orchestrator Callbacks
              orchestrator.onImageCompleted = { entry in
                  historyManager.addEntry(entry)
@@ -120,21 +117,30 @@ struct MainLayoutView: View {
              orchestrator.onHistoryEntryUpdated = { jobName, entry in
                  historyManager.updateEntry(byExternalJobName: jobName, with: entry)
              }
+
+             orchestrator.onLedgerEntryCreated = { entry in
+                 projectManager.appendLedgerEntry(entry)
+             }
+
+             orchestrator.onOutputDirectoryBookmarkRefreshed = { projectId, outputDirectory, bookmark in
+                 guard let projectId,
+                       let project = projectManager.projects.first(where: { $0.id == projectId }),
+                       project.outputDirectory == outputDirectory else {
+                     return
+                 }
+                 projectManager.refreshOutputBookmark(bookmark, for: projectId)
+             }
              
-             orchestrator.onCostIncurred = { cost, resolution, projectId, tokenUsage, modelName in
-                 projectManager.recordCostIncurred(
-                    cost: cost,
-                    resolution: resolution,
-                    projectId: projectId,
-                    tokenUsage: tokenUsage,
-                    modelName: modelName
-                 )
+             orchestrator.onCostIncurred = { cost, _, _, tokenUsage, _ in
+                 projectManager.recordSessionUsage(cost: cost, tokens: tokenUsage)
              }
         }
         .onDisappear {
             // Clear callbacks to prevent stale closures from firing if the view is re-created
             orchestrator.onImageCompleted = nil
             orchestrator.onHistoryEntryUpdated = nil
+            orchestrator.onLedgerEntryCreated = nil
+            orchestrator.onOutputDirectoryBookmarkRefreshed = nil
             orchestrator.onCostIncurred = nil
         }
         .sheet(item: $settingsSheet) { tab in

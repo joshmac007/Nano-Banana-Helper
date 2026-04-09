@@ -98,11 +98,34 @@ class HistoryManager {
         allGlobalEntries.removeAll { $0.id == entry.id }
         saveHistory(for: entry.projectId)
     }
+
+    func replaceEntry(byId entryId: UUID, with newEntry: HistoryEntry) {
+        guard let globalIndex = allGlobalEntries.firstIndex(where: { $0.id == entryId }) else {
+            assertionFailure("Attempted to replace unknown history entry id \(entryId)")
+            return
+        }
+
+        allGlobalEntries[globalIndex] = newEntry
+        guard var projectEntries = loadPersistedEntries(for: newEntry.projectId),
+              let entryIndex = projectEntries.firstIndex(where: { $0.id == entryId }) else {
+            assertionFailure("Persisted history missing entry id \(entryId)")
+            return
+        }
+
+        projectEntries[entryIndex] = newEntry
+        persistProjectEntries(projectEntries, for: newEntry.projectId)
+        syncCachedEntries(with: projectEntries, for: newEntry.projectId)
+    }
     
     /// Updates an existing entry by matching externalJobName, or adds as new entry if not found
     func updateEntry(byExternalJobName jobName: String, with newEntry: HistoryEntry) {
         // Search current global entries first
         if let globalIndex = allGlobalEntries.firstIndex(where: { $0.externalJobName == jobName }) {
+            allGlobalEntries[globalIndex] = newEntry
+            saveHistory(for: newEntry.projectId)
+            return
+        }
+        if let globalIndex = allGlobalEntries.firstIndex(where: { $0.id == newEntry.id }) {
             allGlobalEntries[globalIndex] = newEntry
             saveHistory(for: newEntry.projectId)
             return
@@ -114,13 +137,13 @@ class HistoryManager {
         if fileManager.fileExists(atPath: url.path),
            let data = try? Data(contentsOf: url),
            var projectEntries = try? decoder.decode([HistoryEntry].self, from: data),
-           let index = projectEntries.firstIndex(where: { $0.externalJobName == jobName }) {
+           let index = projectEntries.firstIndex(where: { $0.externalJobName == jobName || $0.id == newEntry.id }) {
             projectEntries[index] = newEntry
             if let encoded = try? encoder.encode(projectEntries) {
                 try? encoded.write(to: url)
             }
             // Keep allGlobalEntries in sync
-            if let globalIndex = allGlobalEntries.firstIndex(where: { $0.externalJobName == jobName }) {
+            if let globalIndex = allGlobalEntries.firstIndex(where: { $0.externalJobName == jobName || $0.id == newEntry.id }) {
                 allGlobalEntries[globalIndex] = newEntry
             } else {
                 allGlobalEntries.append(newEntry)
@@ -141,7 +164,8 @@ class HistoryManager {
     func updateBookmarks(
         for entryId: UUID,
         outputBookmark: Data?,
-        sourceBookmarks: [Data]?
+        sourceBookmarks: [Data]?,
+        outputDirectoryBookmark: Data? = nil
     ) {
         guard let projectId = projectID(for: entryId),
               var projectEntries = loadPersistedEntries(for: projectId),
@@ -151,6 +175,9 @@ class HistoryManager {
 
         projectEntries[index].outputImageBookmark = outputBookmark
         projectEntries[index].sourceImageBookmarks = sourceBookmarks
+        if let outputDirectoryBookmark {
+            projectEntries[index].outputDirectoryBookmark = outputDirectoryBookmark
+        }
         persistProjectEntries(projectEntries, for: projectId)
         syncCachedEntries(with: projectEntries, for: projectId)
     }
@@ -172,6 +199,7 @@ class HistoryManager {
             }
 
             projectEntries[index].outputImageBookmark = bookmark
+            projectEntries[index].outputDirectoryBookmark = AppPaths.bookmark(for: folderURL)
             didRepair = true
         }
 
@@ -350,11 +378,21 @@ class HistoryManager {
 
             if let outputBookmark = entries[index].outputImageBookmark,
                let resolution = AppPaths.resolveBookmarkToPath(
-                outputBookmark,
-                dependencies: bookmarkDependencies
+                    outputBookmark,
+                    dependencies: bookmarkDependencies
                ),
                let refreshedBookmark = resolution.refreshedBookmarkData {
                 entries[index].outputImageBookmark = refreshedBookmark
+                didRefresh = true
+            }
+
+            if let outputDirectoryBookmark = entries[index].outputDirectoryBookmark,
+               let resolution = AppPaths.resolveBookmarkToPath(
+                    outputDirectoryBookmark,
+                    dependencies: bookmarkDependencies
+               ),
+               let refreshedBookmark = resolution.refreshedBookmarkData {
+                entries[index].outputDirectoryBookmark = refreshedBookmark
                 didRefresh = true
             }
         }

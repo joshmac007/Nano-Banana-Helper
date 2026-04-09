@@ -191,19 +191,10 @@ struct HistoryView: View {
 
                     Button("Rescue & Poll") {
                         if let entry = entryToRescue, !rescueJobID.isEmpty {
-                            let rescuedEntry = HistoryEntry(
-                                projectId: entry.projectId,
-                                sourceImagePaths: entry.sourceImagePaths,
-                                outputImagePath: entry.outputImagePath,
-                                prompt: entry.prompt,
-                                aspectRatio: entry.aspectRatio,
-                                imageSize: entry.imageSize,
-                                usedBatchTier: entry.usedBatchTier,
-                                cost: entry.cost,
-                                status: entry.status,
-                                error: entry.error,
+                            let rescuedEntry = entry.rescuing(
                                 externalJobName: rescueJobID.trimmingCharacters(in: .whitespacesAndNewlines)
                             )
+                            historyManager.replaceEntry(byId: entry.id, with: rescuedEntry)
                             onResumePolling?(rescuedEntry)
                         }
                         showingRescueDialog = false

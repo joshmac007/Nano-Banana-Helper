@@ -3,11 +3,12 @@ import UniformTypeIdentifiers
 
 struct NewProjectSheet: View {
     @Binding var projectName: String
-    @Binding var projectDirectory: String
-    var onCreate: () -> Void
+    var onCreate: (URL, Data?) -> Void
     var onCancel: () -> Void
     
     @State private var isSelectingFolder = false
+    @State private var selectedURL: URL?
+    @State private var selectedBookmark: Data?
     
     var body: some View {
         VStack(spacing: 20) {
@@ -19,7 +20,7 @@ struct NewProjectSheet: View {
                     .textFieldStyle(.roundedBorder)
                 
                 HStack {
-                    TextField("Location", text: $projectDirectory)
+                    TextField("Location", text: .constant(selectedURL?.path ?? ""))
                         .textFieldStyle(.roundedBorder)
                         .disabled(true)
                     
@@ -32,9 +33,12 @@ struct NewProjectSheet: View {
             
             HStack {
                 Button("Cancel", role: .cancel, action: onCancel)
-                Button("Create", action: onCreate)
+                Button("Create") {
+                    guard let selectedURL else { return }
+                    onCreate(selectedURL, selectedBookmark)
+                }
                     .buttonStyle(.borderedProminent)
-                    .disabled(projectName.isEmpty || projectDirectory.isEmpty)
+                    .disabled(projectName.isEmpty || selectedURL == nil)
             }
         }
         .padding()
@@ -45,7 +49,8 @@ struct NewProjectSheet: View {
             allowsMultipleSelection: false
         ) { result in
             if case .success(let urls) = result, let url = urls.first {
-                projectDirectory = url.path
+                selectedURL = url
+                selectedBookmark = AppPaths.bookmark(for: url)
             }
         }
     }

@@ -15,6 +15,10 @@ struct CostReportView: View {
     var pricingResolution: AppPricing.PricingResolution {
         AppPricing.pricing(for: selectedModelName)
     }
+
+    var projectBreakdowns: [ProjectUsageBreakdown] {
+        projectManager.projectUsageBreakdowns
+    }
     
     var body: some View {
         VStack(spacing: 0) {
@@ -107,24 +111,23 @@ struct CostReportView: View {
                             .font(.subheadline)
                             .fontWeight(.medium)
                         
-                        ForEach(projects) { project in
-                            let cost = costSummary.byProject[project.id.uuidString] ?? 0
-                            if cost > 0 {
+                        ForEach(projectBreakdowns) { breakdown in
+                            if breakdown.cost != 0 || breakdown.imageCount != 0 {
                                 HStack {
                                     Image(systemName: "folder.fill")
                                         .foregroundStyle(.secondary)
                                     
-                                    Text(project.name)
+                                    Text(breakdown.name)
                                         .font(.subheadline)
                                     
                                     Spacer()
                                     
                                     VStack(alignment: .trailing, spacing: 2) {
-                                        Text(formatCurrency(cost))
+                                        Text(formatCurrency(breakdown.cost))
                                             .font(.subheadline)
                                             .fontWeight(.medium)
                                         
-                                        Text("\(project.imageCount) images")
+                                        Text("\(breakdown.imageCount) images")
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }
@@ -136,7 +139,7 @@ struct CostReportView: View {
                             }
                         }
                         
-                        if projects.allSatisfy({ (costSummary.byProject[$0.id.uuidString] ?? 0) == 0 }) {
+                        if projectBreakdowns.isEmpty {
                             Text("No data yet")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)

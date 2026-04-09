@@ -104,6 +104,13 @@ struct Nano_Banana_HelperTests {
         return try decoder.decode(PersistedQueueState.self, from: data)
     }
 
+    private func loadPersistedUsageLedger(from url: URL) throws -> [UsageLedgerEntry] {
+        let data = try Data(contentsOf: url)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode([UsageLedgerEntry].self, from: data)
+    }
+
     @MainActor
     private func withStoredModelName<T>(
         _ modelName: String?,
@@ -1542,50 +1549,54 @@ struct Nano_Banana_HelperTests {
         #expect(persistedEntries.isEmpty)
     }
 
-    @MainActor @Test func recordCostIncurredPersistsCostSummaryMidSession() throws {
+    @MainActor @Test func appendLedgerEntryPersistsUsageAndDerivesProjectTotals() throws {
         let tempAppSupportURL = try makeTemporaryDirectory()
         let projectsListURL = tempAppSupportURL.appendingPathComponent("projects.json")
         let costSummaryURL = tempAppSupportURL.appendingPathComponent("cost_summary.json")
+        let usageLedgerURL = tempAppSupportURL.appendingPathComponent("usage_ledger.json")
         let projectsDirectoryURL = tempAppSupportURL.appendingPathComponent("projects", isDirectory: true)
         let manager = ProjectManager(
             appSupportURL: tempAppSupportURL,
             projectsListURL: projectsListURL,
             costSummaryURL: costSummaryURL,
+            usageLedgerURL: usageLedgerURL,
             projectsDirectoryURL: projectsDirectoryURL
         )
-        let usage = TokenUsage(promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15)
         let projectId = manager.projects.first!.id
 
-        manager.recordCostIncurred(
+        manager.appendLedgerEntry(
+            UsageLedgerEntry(
+                kind: .jobCompletion,
+                projectId: projectId,
+                projectNameSnapshot: manager.projects.first?.name,
+                costDelta: 0.5,
+                imageDelta: 1,
+                tokenDelta: 15,
+                inputTokenDelta: 10,
+                outputTokenDelta: 5,
+                resolution: "4K",
+                modelName: "gemini-test",
+                relatedHistoryEntryId: UUID(),
+                note: nil
+            )
+        )
+        manager.recordSessionUsage(
             cost: 0.5,
-            resolution: "4K",
-            projectId: projectId,
-            tokenUsage: usage,
-            modelName: "gemini-test"
+            tokens: TokenUsage(promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15)
         )
 
-        let data = try Data(contentsOf: costSummaryURL)
-        let decoder = JSONDecoder()
-        let summary = try decoder.decode(CostSummary.self, from: data)
+        let ledger = try loadPersistedUsageLedger(from: usageLedgerURL)
+        let summary = manager.costSummary
 
-        if summary.totalSpent != 0.5 {
-            Issue.record("Expected persisted totalSpent to remain 0.5")
-        }
-        if summary.imageCount != 1 {
-            Issue.record("Expected persisted imageCount to remain 1")
-        }
-        if summary.byModel["gemini-test"] != 0.5 {
-            Issue.record("Expected persisted byModel entry for gemini-test to remain 0.5")
-        }
-        if manager.sessionCost != 0.5 {
-            Issue.record("Expected sessionCost to remain 0.5")
-        }
-        if manager.sessionTokens != 15 {
-            Issue.record("Expected sessionTokens to remain 15")
-        }
-        if manager.sessionImageCount != 1 {
-            Issue.record("Expected sessionImageCount to remain 1")
-        }
+        #expect(ledger.count == 1)
+        #expect(summary.totalSpent == 0.5)
+        #expect(summary.imageCount == 1)
+        #expect(summary.byModel["gemini-test"] == 0.5)
+        #expect(manager.projects.first?.totalCost == 0.5)
+        #expect(manager.projects.first?.imageCount == 1)
+        #expect(manager.sessionCost == 0.5)
+        #expect(manager.sessionTokens == 15)
+        #expect(manager.sessionImageCount == 1)
     }
 
     @Test func costEstimatorViewUsesModelAwareTotalsAndFallbackWarning() {
@@ -1692,6 +1703,8 @@ struct Nano_Banana_HelperTests {
             activeBatchURL: activeBatchURL,
             autoStartEnqueuedBatches: false
         )
+        let inputBookmark = Data("input-bookmark".utf8)
+        let outputDirectoryBookmark = Data("directory-bookmark".utf8)
         let entry = HistoryEntry(
             projectId: UUID(),
             sourceImagePaths: ["/tmp/input.png"],
@@ -1703,6 +1716,8 @@ struct Nano_Banana_HelperTests {
             cost: 1,
             status: "processing",
             externalJobName: "batches/test-job",
+            sourceImageBookmarks: [inputBookmark],
+            outputDirectoryBookmark: outputDirectoryBookmark,
             modelName: "gemini-3-pro-image-preview"
         )
 
@@ -1711,6 +1726,8 @@ struct Nano_Banana_HelperTests {
         let persistedState = try loadPersistedQueueState(from: activeBatchURL)
         #expect(persistedState.batches.first?.modelName == "gemini-3-pro-image-preview")
         #expect(persistedState.batches.first?.systemPrompt == nil)
+        #expect(persistedState.batches.first?.outputDirectoryBookmark == outputDirectoryBookmark)
+        #expect(persistedState.batches.first?.tasks.first?.inputBookmarks == [inputBookmark])
     }
 
     @MainActor @Test func resumePollingFromLegacyHistoryLeavesModelNameNil() throws {

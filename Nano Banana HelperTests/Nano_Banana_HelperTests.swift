@@ -61,6 +61,10 @@ struct Nano_Banana_HelperTests {
         return url
     }
 
+    private func makeTransparentPNGData() -> Data {
+        Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==")!
+    }
+
     private func makeRestoreEntry(
         projectId: UUID = UUID(),
         sourceImagePaths: [String],
@@ -540,6 +544,228 @@ struct Nano_Banana_HelperTests {
         #expect(manager.stagedFiles == [restoredURL])
         #expect(manager.stagedBookmarks[restoredURL] == secondBookmark)
         #expect(manager.stagedBookmarks[restoredURL] != firstBookmark)
+    }
+
+    @MainActor @Test func imageModeSingleInputVariationsCreateRepeatedTasks() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "source.png")
+
+        let manager = BatchStagingManager()
+        manager.generationMode = .image
+        manager.imageVariationCount = 3
+        manager.addFiles([sourceURL])
+
+        let tasks = manager.makeImageTasks()
+
+        #expect(tasks.count == 3)
+        #expect(tasks.allSatisfy { $0.inputPaths == [sourceURL.path] })
+        #expect(tasks.map(\.variationIndex) == [1, 2, 3])
+        #expect(tasks.allSatisfy { $0.variationTotal == 3 })
+    }
+
+    @MainActor @Test func imageModeMultipleInputsVariationsExpandPerSource() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "one.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "two.png")
+        let thirdURL = try makeTemporaryFile(in: directory, named: "three.png")
+
+        let manager = BatchStagingManager()
+        manager.generationMode = .image
+        manager.imageVariationCount = 2
+        manager.addFiles([firstURL, secondURL, thirdURL])
+
+        let tasks = manager.makeImageTasks()
+
+        #expect(tasks.count == 6)
+        #expect(tasks.filter { $0.inputPaths == [firstURL.path] }.map(\.variationIndex) == [1, 2])
+        #expect(tasks.filter { $0.inputPaths == [secondURL.path] }.map(\.variationIndex) == [1, 2])
+        #expect(tasks.filter { $0.inputPaths == [thirdURL.path] }.map(\.variationIndex) == [1, 2])
+    }
+
+    @MainActor @Test func multiInputVariationsCreateRepeatedMergedTasks() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "one.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "two.png")
+        let thirdURL = try makeTemporaryFile(in: directory, named: "three.png")
+
+        let manager = BatchStagingManager()
+        manager.generationMode = .image
+        manager.isMultiInput = true
+        manager.imageVariationCount = 4
+        manager.addFiles([firstURL, secondURL, thirdURL])
+
+        let tasks = manager.makeImageTasks()
+
+        #expect(tasks.count == 4)
+        #expect(tasks.allSatisfy { $0.inputPaths == [firstURL.path, secondURL.path, thirdURL.path] })
+        #expect(tasks.map(\.variationIndex) == [1, 2, 3, 4])
+        #expect(tasks.allSatisfy { $0.variationTotal == 4 })
+    }
+
+    @MainActor @Test func stagingEffectiveCountsReflectImageVariations() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "one.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "two.png")
+
+        let manager = BatchStagingManager()
+        manager.generationMode = .image
+        manager.imageVariationCount = 3
+        manager.addFiles([firstURL, secondURL])
+
+        #expect(manager.effectiveTaskCount == 6)
+        #expect(manager.effectiveInputCount == 6)
+
+        manager.isMultiInput = true
+
+        #expect(manager.effectiveTaskCount == 3)
+        #expect(manager.effectiveInputCount == 6)
+    }
+
+    @Test func costEstimatorUsesVariationAwareCounts() {
+        let standard = CostEstimatorView(
+            stagedImageCount: 3,
+            variationCount: 2,
+            outputCount: 6,
+            imageSize: "1K",
+            isBatchTier: false,
+            isMultiInput: false,
+            generationMode: .image,
+            modelName: "gemini-2.5-flash-image"
+        )
+        let multiInput = CostEstimatorView(
+            stagedImageCount: 3,
+            variationCount: 4,
+            outputCount: 4,
+            imageSize: "1K",
+            isBatchTier: false,
+            isMultiInput: true,
+            generationMode: .image,
+            modelName: "gemini-2.5-flash-image"
+        )
+
+        #expect(abs(standard.inputTotalCost - (6 * 0.000168)) < floatingPointTolerance)
+        #expect(abs(standard.outputTotalCost - (6 * 0.039)) < floatingPointTolerance)
+        #expect(abs(multiInput.inputTotalCost - (12 * 0.000168)) < floatingPointTolerance)
+        #expect(abs(multiInput.outputTotalCost - (4 * 0.039)) < floatingPointTolerance)
+    }
+
+    @MainActor @Test func imageTaskBackwardCompatibilityDecodesMissingVariationMetadata() throws {
+        let json = """
+        {
+            "id": "00000000-0000-0000-0000-000000000100",
+            "inputPaths": ["/tmp/input.png"],
+            "status": "pending",
+            "phase": "pending",
+            "pollCount": 0
+        }
+        """.data(using: .utf8)!
+
+        let task = try JSONDecoder().decode(ImageTask.self, from: json)
+
+        #expect(task.variationIndex == nil)
+        #expect(task.variationTotal == nil)
+    }
+
+    @MainActor @Test func imageTaskRoundTripsVariationMetadata() throws {
+        let task = ImageTask(
+            inputPath: "/tmp/input.png",
+            variationIndex: 2,
+            variationTotal: 4
+        )
+
+        let data = try JSONEncoder().encode(task)
+        let decoded = try JSONDecoder().decode(ImageTask.self, from: data)
+
+        #expect(decoded.variationIndex == 2)
+        #expect(decoded.variationTotal == 4)
+        #expect(decoded.filename.contains("Variation 2/4"))
+    }
+
+    @MainActor @Test func pngPreflightNormalizesToJPEGAndUsesNormalizedByteCount() async throws {
+        let directory = try makeTemporaryDirectory()
+        let originalPNG = makeTransparentPNGData()
+        let fileURL = try makeTemporaryFile(in: directory, named: "alpha.png", contents: originalPNG)
+        let service = NanoBananaService()
+        let request = ImageEditRequest(
+            inputImageURLs: [fileURL],
+            prompt: "test prompt",
+            systemInstruction: nil,
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            useBatchTier: true
+        )
+
+        let prepared = try await service.prepareInlineImages(for: [fileURL])
+        let diagnostics = try await service.buildRequestDiagnostics(for: request)
+        let preparedSourceMimeType = prepared[0].sourceMimeType
+        let preparedPayloadMimeType = prepared[0].payloadMimeType
+        let preparedPayloadByteCount = prepared[0].payloadByteCount
+        let preparedOriginalByteCount = prepared[0].originalByteCount
+        let totalInlineBytes = diagnostics.totalInlineBytes
+
+        #expect(prepared.count == 1)
+        #expect(preparedSourceMimeType == "image/png")
+        #expect(preparedPayloadMimeType == "image/jpeg")
+        #expect(totalInlineBytes == preparedPayloadByteCount)
+        #expect(totalInlineBytes != preparedOriginalByteCount)
+        #expect(try Data(contentsOf: fileURL) == originalPNG)
+    }
+
+    @Test func parseResponseSurfacesMalformedFunctionCallFinishMessage() async throws {
+        let response = """
+        {
+          "candidates": [
+            {
+              "finishReason": "MALFORMED_FUNCTION_CALL",
+              "finishMessage": "Malformed function call: call:mage_image_0.png"
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+        let service = NanoBananaService()
+
+        do {
+            _ = try await service.parseResponse(response)
+            Issue.record("Expected modelFinishedWithoutImage error")
+        } catch NanoBananaError.modelFinishedWithoutImage(let finishReason, let message) {
+            #expect(finishReason == "MALFORMED_FUNCTION_CALL")
+            #expect(message == "Malformed function call: call:mage_image_0.png")
+        } catch {
+            Issue.record("Expected modelFinishedWithoutImage but got \(error)")
+        }
+    }
+
+    @MainActor @Test func requestLogSummaryRedactsInlineData() {
+        let base64 = String(repeating: "A", count: 512)
+        let diagnostics = RequestBuildDiagnostics(
+            promptCharacterCount: 12,
+            inputCount: 1,
+            totalInlineBytes: 1234,
+            preflightDuration: 0.05,
+            preparedInputs: [
+                PreparedInlineImage(
+                    filename: "alpha.png",
+                    sourceMimeType: "image/png",
+                    payloadMimeType: "image/jpeg",
+                    originalByteCount: 2048,
+                    payloadByteCount: 1234,
+                    data: Data(base64.utf8)
+                )
+            ]
+        )
+
+        let summary = NanoBananaService.requestLogSummary(
+            endpoint: "generateContent",
+            modelName: "gemini-3.1-flash-image-preview",
+            diagnostics: diagnostics,
+            bodyByteCount: 4567,
+            serializationDuration: 0.02
+        )
+
+        #expect(summary.contains("alpha.png"))
+        #expect(summary.contains("image/png->image/jpeg"))
+        #expect(summary.contains("inlineBytes=1234"))
+        #expect(summary.contains(base64) == false)
     }
 
     @MainActor @Test func costSummaryBackwardCompatibility() throws {
@@ -1364,7 +1590,9 @@ struct Nano_Banana_HelperTests {
 
     @Test func costEstimatorViewUsesModelAwareTotalsAndFallbackWarning() {
         let proEstimator = CostEstimatorView(
-            imageCount: 2,
+            stagedImageCount: 2,
+            variationCount: 1,
+            outputCount: 2,
             imageSize: "2K",
             isBatchTier: false,
             isMultiInput: false,
@@ -1372,7 +1600,9 @@ struct Nano_Banana_HelperTests {
             modelName: "gemini-3-pro-image-preview"
         )
         let flashEstimator = CostEstimatorView(
-            imageCount: 2,
+            stagedImageCount: 2,
+            variationCount: 1,
+            outputCount: 2,
             imageSize: "2K",
             isBatchTier: false,
             isMultiInput: false,
@@ -1380,7 +1610,9 @@ struct Nano_Banana_HelperTests {
             modelName: "gemini-2.5-flash-image"
         )
         let fallbackEstimator = CostEstimatorView(
-            imageCount: 1,
+            stagedImageCount: 0,
+            variationCount: 1,
+            outputCount: 1,
             imageSize: "1K",
             isBatchTier: true,
             isMultiInput: false,
@@ -1690,6 +1922,21 @@ struct Nano_Banana_HelperTests {
         #expect(actions.showsPause == false)
         #expect(actions.showsResume == false)
         #expect(actions.showsCancel == false)
+    }
+
+    @Test func queueLayoutMetricsReserveSpaceForWorkbenchAndDock() {
+        let bounds = QueueLayoutMetrics.heightBounds(for: 900)
+
+        #expect(bounds.lowerBound == QueueLayoutMetrics.minimumQueueHeight)
+        #expect(bounds.upperBound == 592)
+        #expect(
+            QueueLayoutMetrics.clampedHeight(1_000, availableHeight: 900)
+            == bounds.upperBound
+        )
+        #expect(
+            QueueLayoutMetrics.clampedHeight(120, availableHeight: 900)
+            == bounds.lowerBound
+        )
     }
 
     @MainActor @Test func pauseStatePersistsAcrossReload() throws {

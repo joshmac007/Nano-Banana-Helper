@@ -1,4 +1,7 @@
+import CoreGraphics
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 /// Request structure for image editing
 struct ImageEditRequest: Sendable {
@@ -58,6 +61,33 @@ struct PollStatusUpdate: Sendable {
     let attempt: Int
     let state: String
     let updatedAt: Date
+}
+
+struct PreparedInlineImage: Sendable {
+    let filename: String
+    let sourceMimeType: String
+    let payloadMimeType: String
+    let originalByteCount: Int
+    let payloadByteCount: Int
+    let data: Data
+
+    var logDescription: String {
+        let normalization = sourceMimeType == payloadMimeType ? "native" : "normalized"
+        return "\(filename) \(sourceMimeType)->\(payloadMimeType) \(originalByteCount)B->\(payloadByteCount)B \(normalization)"
+    }
+}
+
+struct RequestBuildDiagnostics: Sendable {
+    let promptCharacterCount: Int
+    let inputCount: Int
+    let totalInlineBytes: Int
+    let preflightDuration: TimeInterval
+    let preparedInputs: [PreparedInlineImage]
+}
+
+private struct RequestBuildArtifacts {
+    let payload: [String: Any]
+    let diagnostics: RequestBuildDiagnostics
 }
 
 /// Simple config storage — @MainActor ensures all reads/writes are serialized
@@ -159,21 +189,22 @@ actor NanoBananaService {
     // MARK: - Image Editing
     
     /// Maximum payload size for inline batch requests (20MB per documentation)
-    private let maxBatchPayloadSize = 20 * 1024 * 1024
+    private static let maxBatchPayloadSize = 20 * 1024 * 1024
     
     func editImage(_ request: ImageEditRequest, onJobCreated: (@Sendable (String) -> Void)? = nil, onPollUpdate: (@Sendable (PollStatusUpdate) -> Void)? = nil) async throws -> ImageEditResponse {
         guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
         }
+
+        let requestBuild = try await buildRequestPayload(request: request)
         
         if request.useBatchTier {
             // Use split workflow to allow ID capture
-            let jobInfo = try await startBatchJob(request: request)
+            let jobInfo = try await createBatchJobRecord(requestBuild, apiKey: apiKey)
             onJobCreated?(jobInfo.jobName)
             return try await pollBatchJob(jobName: jobInfo.jobName, requestKey: jobInfo.requestKey, onPollUpdate: onPollUpdate)
         } else {
-            let requestPayload = try await buildRequestPayload(request: request)
-            return try await processStandardRequest(requestPayload, apiKey: apiKey)
+            return try await processStandardRequest(requestBuild, apiKey: apiKey)
         }
     }
     
@@ -187,30 +218,20 @@ actor NanoBananaService {
         return try await createBatchJobRecord(payload, apiKey: apiKey)
     }
     
-    private func buildRequestPayload(request: ImageEditRequest) async throws -> [String: Any] {
+    private func buildRequestPayload(request: ImageEditRequest) async throws -> RequestBuildArtifacts {
         // Build multimodal parts
         var parts: [[String: Any]] = []
         parts.append(["text": request.prompt])
-        
-        var totalDataSize = 0
-        for url in request.inputImageURLs {
-            let imageData = try Data(contentsOf: url)
-            totalDataSize += imageData.count
-            let base64Image = imageData.base64EncodedString()
-            let mimeTypeString = mimeType(for: url)
-            
+
+        let diagnostics = try buildRequestDiagnostics(for: request)
+
+        for preparedInput in diagnostics.preparedInputs {
             parts.append([
                 "inlineData": [
-                    "mimeType": mimeTypeString,
-                    "data": base64Image
+                    "mimeType": preparedInput.payloadMimeType,
+                    "data": preparedInput.data.base64EncodedString()
                 ]
             ])
-        }
-        
-        // Validate size for batch requests WITH images (20MB limit for inline requests)
-        // Skip validation for text-to-image mode (empty inputImageURLs)
-        if !request.inputImageURLs.isEmpty && request.useBatchTier && totalDataSize > maxBatchPayloadSize {
-            throw NanoBananaError.batchError(message: "Total image data (\(totalDataSize / 1024 / 1024)MB) exceeds 20MB limit for batch inline requests. Use smaller images or fewer images per batch.")
         }
         
         // Build imageConfig — omit aspectRatio entirely when Auto is selected,
@@ -238,13 +259,16 @@ actor NanoBananaService {
                 ]
             ]
         }
-        
-        return payload
+
+        return RequestBuildArtifacts(
+            payload: payload,
+            diagnostics: diagnostics
+        )
     }
     
     // MARK: - Standard API
     
-    private func processStandardRequest(_ payload: [String: Any], apiKey: String) async throws -> ImageEditResponse {
+    private func processStandardRequest(_ buildArtifacts: RequestBuildArtifacts, apiKey: String) async throws -> ImageEditResponse {
         let currentModelName = await modelName
         var urlRequest = URLRequest(
             url: try Self.generateContentURL(apiKey: apiKey, modelName: currentModelName)
@@ -252,28 +276,42 @@ actor NanoBananaService {
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
-        let httpBody = try JSONSerialization.data(withJSONObject: payload, options: .prettyPrinted)
+        let serializationStart = Date()
+        let httpBody = try JSONSerialization.data(withJSONObject: buildArtifacts.payload)
+        let serializationDuration = Date().timeIntervalSince(serializationStart)
         urlRequest.httpBody = httpBody
         
-        // Log request
-        if let jsonString = String(data: httpBody, encoding: .utf8) {
-            await LogManager.shared.log(.request, payload: jsonString)
-        }
+        await LogManager.shared.log(
+            .request,
+            payload: Self.requestLogSummary(
+                endpoint: "generateContent",
+                modelName: currentModelName,
+                diagnostics: buildArtifacts.diagnostics,
+                bodyByteCount: httpBody.count,
+                serializationDuration: serializationDuration
+            )
+        )
         
         // Execute with retry
+        let requestStart = Date()
         let (data, response) = try await executeWithRetry(urlRequest)
-        
-        // Log response
-        if let jsonString = String(data: data, encoding: .utf8) {
-            await LogManager.shared.log(.response, payload: jsonString)
-        }
+        let requestDuration = Date().timeIntervalSince(requestStart)
         
         guard let httpResponse = response as? HTTPURLResponse else {
             throw NanoBananaError.invalidResponse
         }
+
+        await LogManager.shared.log(
+            .response,
+            payload: Self.responseLogSummary(
+                data: data,
+                httpResponse: httpResponse,
+                requestDuration: requestDuration
+            )
+        )
         
         guard httpResponse.statusCode == 200 else {
-            await LogManager.shared.log(.error, payload: "HTTP \(httpResponse.statusCode): \(String(data: data, encoding: .utf8) ?? "Unknown error")")
+            await LogManager.shared.log(.error, payload: Self.httpErrorLogSummary(statusCode: httpResponse.statusCode, data: data))
             throw NanoBananaError.apiError(statusCode: httpResponse.statusCode, data: data)
         }
         
@@ -308,7 +346,7 @@ actor NanoBananaService {
     
     // MARK: - Batch API (Async Job-Based)
     
-    private func createBatchJobRecord(_ payload: [String: Any], apiKey: String) async throws -> BatchJobInfo {
+    private func createBatchJobRecord(_ buildArtifacts: RequestBuildArtifacts, apiKey: String) async throws -> BatchJobInfo {
         let requestKey = UUID().uuidString
         let batchPayload: [String: Any] = [
             "batch": [
@@ -317,7 +355,7 @@ actor NanoBananaService {
                     "requests": [
                         "requests": [
                             [
-                                "request": payload,
+                                "request": buildArtifacts.payload,
                                 "metadata": ["key": requestKey]
                             ]
                         ]
@@ -333,14 +371,38 @@ actor NanoBananaService {
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
+        let serializationStart = Date()
         let httpBody = try JSONSerialization.data(withJSONObject: batchPayload)
+        let serializationDuration = Date().timeIntervalSince(serializationStart)
         urlRequest.httpBody = httpBody
+
+        await LogManager.shared.log(
+            .request,
+            payload: Self.requestLogSummary(
+                endpoint: "batchGenerateContent",
+                modelName: currentModelName,
+                diagnostics: buildArtifacts.diagnostics,
+                bodyByteCount: httpBody.count,
+                serializationDuration: serializationDuration
+            )
+        )
         
+        let requestStart = Date()
         let (data, response) = try await session.data(for: urlRequest)
+        let requestDuration = Date().timeIntervalSince(requestStart)
         
         guard let httpResponse = response as? HTTPURLResponse else {
             throw NanoBananaError.invalidResponse
         }
+
+        await LogManager.shared.log(
+            .response,
+            payload: Self.responseLogSummary(
+                data: data,
+                httpResponse: httpResponse,
+                requestDuration: requestDuration
+            )
+        )
         
         guard httpResponse.statusCode == 200 else {
             throw NanoBananaError.apiError(statusCode: httpResponse.statusCode, data: data)
@@ -497,12 +559,7 @@ actor NanoBananaService {
     }
     
     private func extractResultFromResponse(_ response: [String: Any], requestKey: String, apiKey: String) async throws -> ImageEditResponse {
-        // Log the response structure for debugging
-        if let responseData = try? JSONSerialization.data(withJSONObject: response, options: .prettyPrinted),
-           let jsonString = String(data: responseData, encoding: .utf8) {
-            let truncatedJson = String(jsonString.prefix(2000))
-            await LogManager.shared.log(.response, payload: "Extracting result from response structure:\n\(truncatedJson)...")
-        }
+        await LogManager.shared.log(.response, payload: Self.batchResultSummary(response))
         
         // Check for inlined responses
         if let inlinedResponses = extractInlinedResponses(from: response) {
@@ -603,19 +660,140 @@ actor NanoBananaService {
         await LogManager.shared.log(.request, payload: "Cancelling batch job: \(jobName)")
         
         let (data, response) = try await session.data(for: urlRequest)
-        
-        if let jsonString = String(data: data, encoding: .utf8) {
-            await LogManager.shared.log(.response, payload: "Cancel response: \(jsonString)")
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw NanoBananaError.invalidResponse
         }
-        
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+
+        await LogManager.shared.log(
+            .response,
+            payload: Self.responseLogSummary(
+                data: data,
+                httpResponse: httpResponse,
+                requestDuration: 0
+            )
+        )
+
+        guard httpResponse.statusCode == 200 else {
             throw NanoBananaError.invalidResponse
         }
     }
     
     
     // MARK: - Private Helpers
-    
+
+    func buildRequestDiagnostics(for request: ImageEditRequest) throws -> RequestBuildDiagnostics {
+        let preflightStart = Date()
+        let preparedInputs = try prepareInlineImages(for: request.inputImageURLs)
+        let preflightDuration = Date().timeIntervalSince(preflightStart)
+        let totalDataSize = preparedInputs.reduce(0) { partialResult, input in
+            partialResult + input.payloadByteCount
+        }
+
+        try Self.validateBatchPayloadSize(
+            totalDataSize: totalDataSize,
+            hasInputImages: !preparedInputs.isEmpty,
+            useBatchTier: request.useBatchTier
+        )
+
+        return RequestBuildDiagnostics(
+            promptCharacterCount: request.prompt.count,
+            inputCount: preparedInputs.count,
+            totalInlineBytes: totalDataSize,
+            preflightDuration: preflightDuration,
+            preparedInputs: preparedInputs
+        )
+    }
+
+    func prepareInlineImages(for urls: [URL]) throws -> [PreparedInlineImage] {
+        try urls.map { url in
+            let originalData = try Data(contentsOf: url)
+            let sourceMimeType = mimeType(for: url)
+
+            if sourceMimeType == "image/png" {
+                let normalizedData = try normalizePNGToJPEG(data: originalData, filename: url.lastPathComponent)
+                return PreparedInlineImage(
+                    filename: url.lastPathComponent,
+                    sourceMimeType: sourceMimeType,
+                    payloadMimeType: "image/jpeg",
+                    originalByteCount: originalData.count,
+                    payloadByteCount: normalizedData.count,
+                    data: normalizedData
+                )
+            }
+
+            return PreparedInlineImage(
+                filename: url.lastPathComponent,
+                sourceMimeType: sourceMimeType,
+                payloadMimeType: sourceMimeType,
+                originalByteCount: originalData.count,
+                payloadByteCount: originalData.count,
+                data: originalData
+            )
+        }
+    }
+
+    static func validateBatchPayloadSize(totalDataSize: Int, hasInputImages: Bool, useBatchTier: Bool) throws {
+        guard hasInputImages, useBatchTier, totalDataSize > Self.maxBatchPayloadSize else {
+            return
+        }
+
+        throw NanoBananaError.batchError(
+            message: "Total image data (\(totalDataSize / 1024 / 1024)MB) exceeds 20MB limit for batch inline requests. Use smaller images or fewer images per batch."
+        )
+    }
+
+    private func normalizePNGToJPEG(data: Data, filename: String) throws -> Data {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw NanoBananaError.inputPreparationFailed(message: "Could not decode PNG input \(filename).")
+        }
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+
+        guard let context = CGContext(
+            data: nil,
+            width: image.width,
+            height: image.height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            throw NanoBananaError.inputPreparationFailed(message: "Could not prepare PNG input \(filename) for JPEG conversion.")
+        }
+
+        context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+
+        guard let flattenedImage = context.makeImage() else {
+            throw NanoBananaError.inputPreparationFailed(message: "Could not flatten PNG input \(filename) before upload.")
+        }
+
+        let destinationData = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            destinationData,
+            UTType.jpeg.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw NanoBananaError.inputPreparationFailed(message: "Could not encode JPEG payload for \(filename).")
+        }
+
+        let options = [
+            kCGImageDestinationLossyCompressionQuality: 0.92
+        ] as CFDictionary
+        CGImageDestinationAddImage(destination, flattenedImage, options)
+
+        guard CGImageDestinationFinalize(destination) else {
+            throw NanoBananaError.inputPreparationFailed(message: "JPEG conversion failed for \(filename).")
+        }
+
+        return destinationData as Data
+    }
+
     private func executeWithRetry(_ request: URLRequest, maxRetries: Int = 3) async throws -> (Data, URLResponse) {
         var lastError: Error?
         
@@ -641,7 +819,9 @@ actor NanoBananaService {
         throw lastError ?? NanoBananaError.unknownError
     }
     
-    private func parseResponse(_ data: Data) async throws -> ImageEditResponse {
+    func parseResponse(_ data: Data) async throws -> ImageEditResponse {
+        let parseStart = Date()
+
         guard let rawJson = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             await LogManager.shared.log(.error, payload: "parseResponse: Could not parse as JSON dictionary")
             throw NanoBananaError.invalidResponseFormat
@@ -667,36 +847,167 @@ actor NanoBananaService {
         }
         
         guard let candidates = json["candidates"] as? [[String: Any]],
-              let firstCandidate = candidates.first,
-              let content = firstCandidate["content"] as? [String: Any],
-              let parts = content["parts"] as? [[String: Any]] else {
+              !candidates.isEmpty else {
             let hasCandidates = json["candidates"] != nil
             let candidatesTypeStr = String(describing: type(of: json["candidates"] as Any))
             let jsonKeysString = json.keys.sorted().joined(separator: ", ")
             await LogManager.shared.log(.error, payload: "parseResponse structure issue - hasCandidates: \(hasCandidates), type: \(candidatesTypeStr), keys: \(jsonKeysString)")
             throw NanoBananaError.invalidResponseFormat
         }
-        
-        for part in parts {
-            // Handle both snake_case and camelCase response formats
-            let inlineData = part["inline_data"] as? [String: Any] ?? part["inlineData"] as? [String: Any]
-            if let inlineData = inlineData,
-               let mimeType = (inlineData["mime_type"] ?? inlineData["mimeType"]) as? String,
-               let base64Data = inlineData["data"] as? String,
-               let imageData = Data(base64Encoded: base64Data) {
-                return ImageEditResponse(imageData: imageData, mimeType: mimeType, tokenUsage: tokenUsage)
+
+        for candidate in candidates {
+            let parts = (candidate["content"] as? [String: Any])?["parts"] as? [[String: Any]] ?? []
+            for part in parts {
+                // Handle both snake_case and camelCase response formats
+                let inlineData = part["inline_data"] as? [String: Any] ?? part["inlineData"] as? [String: Any]
+                if let inlineData = inlineData,
+                   let mimeType = (inlineData["mime_type"] ?? inlineData["mimeType"]) as? String,
+                   let base64Data = inlineData["data"] as? String,
+                   let imageData = Data(base64Encoded: base64Data) {
+                    await LogManager.shared.log(
+                        .response,
+                        payload: Self.cappedLogPayload(
+                            "Response parse completed in \(Self.formatDuration(Date().timeIntervalSince(parseStart))) | mimeType=\(mimeType) imageBytes=\(imageData.count)"
+                        )
+                    )
+                    return ImageEditResponse(imageData: imageData, mimeType: mimeType, tokenUsage: tokenUsage)
+                }
+                // Also handle file_data format
+                let fileData = part["file_data"] as? [String: Any] ?? part["fileData"] as? [String: Any]
+                if let fileData = fileData,
+                   let mimeType = (fileData["mime_type"] ?? fileData["mimeType"]) as? String,
+                   let base64Data = fileData["data"] as? String,
+                   let imageData = Data(base64Encoded: base64Data) {
+                    await LogManager.shared.log(
+                        .response,
+                        payload: Self.cappedLogPayload(
+                            "Response parse completed in \(Self.formatDuration(Date().timeIntervalSince(parseStart))) | mimeType=\(mimeType) imageBytes=\(imageData.count)"
+                        )
+                    )
+                    return ImageEditResponse(imageData: imageData, mimeType: mimeType, tokenUsage: tokenUsage)
+                }
             }
-            // Also handle file_data format
-            let fileData = part["file_data"] as? [String: Any] ?? part["fileData"] as? [String: Any]
-            if let fileData = fileData,
-               let mimeType = (fileData["mime_type"] ?? fileData["mimeType"]) as? String,
-               let base64Data = fileData["data"] as? String,
-               let imageData = Data(base64Encoded: base64Data) {
-                return ImageEditResponse(imageData: imageData, mimeType: mimeType, tokenUsage: tokenUsage)
-            }
+        }
+
+        if let finishError = Self.modelFinishError(from: candidates) {
+            await LogManager.shared.log(
+                .error,
+                payload: Self.cappedLogPayload(
+                    "Response parse failed after \(Self.formatDuration(Date().timeIntervalSince(parseStart))) | \(finishError.localizedDescription)"
+                )
+            )
+            throw finishError
         }
         
         throw NanoBananaError.noImageInResponse
+    }
+
+    static func modelFinishError(from candidates: [[String: Any]]) -> NanoBananaError? {
+        for candidate in candidates {
+            let finishReason = (candidate["finishReason"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let finishMessage = (candidate["finishMessage"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if let finishReason, !finishReason.isEmpty {
+                return .modelFinishedWithoutImage(finishReason: finishReason, message: finishMessage)
+            }
+            if let finishMessage, !finishMessage.isEmpty {
+                return .modelFinishedWithoutImage(finishReason: "UNKNOWN", message: finishMessage)
+            }
+        }
+        return nil
+    }
+
+    static func cappedLogPayload(_ payload: String, limit: Int = 1600) -> String {
+        guard payload.count > limit else { return payload }
+        let clipped = payload.prefix(limit)
+        return "\(clipped)… [truncated \(payload.count - limit) chars]"
+    }
+
+    static func requestLogSummary(
+        endpoint: String,
+        modelName: String,
+        diagnostics: RequestBuildDiagnostics,
+        bodyByteCount: Int,
+        serializationDuration: TimeInterval
+    ) -> String {
+        let inputSummary = diagnostics.preparedInputs.isEmpty
+            ? "none"
+            : diagnostics.preparedInputs.map(\.logDescription).joined(separator: "; ")
+        return cappedLogPayload(
+            "Request \(endpoint) | model=\(modelName) promptChars=\(diagnostics.promptCharacterCount) inputs=\(diagnostics.inputCount) inlineBytes=\(diagnostics.totalInlineBytes) bodyBytes=\(bodyByteCount) preflight=\(formatDuration(diagnostics.preflightDuration)) serialize=\(formatDuration(serializationDuration)) | images=[\(inputSummary)]"
+        )
+    }
+
+    static func responseLogSummary(data: Data, httpResponse: HTTPURLResponse, requestDuration: TimeInterval) -> String {
+        if let rawJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            return cappedLogPayload(
+                "Response HTTP \(httpResponse.statusCode) in \(formatDuration(requestDuration)) | \(responseJSONSummary(rawJson))"
+            )
+        }
+        return cappedLogPayload(
+            "Response HTTP \(httpResponse.statusCode) in \(formatDuration(requestDuration)) | non-JSON body (\(data.count) bytes)"
+        )
+    }
+
+    static func httpErrorLogSummary(statusCode: Int, data: Data) -> String {
+        let body = String(data: data, encoding: .utf8) ?? "Non-text body (\(data.count) bytes)"
+        return cappedLogPayload("HTTP \(statusCode): \(body)", limit: 1200)
+    }
+
+    private static func responseJSONSummary(_ json: [String: Any]) -> String {
+        let effectiveJSON: [String: Any]
+        if let responses = json["responses"] as? [[String: Any]], let first = responses.first {
+            effectiveJSON = first
+        } else {
+            effectiveJSON = json
+        }
+
+        let keys = effectiveJSON.keys.sorted().joined(separator: ",")
+        let candidates = effectiveJSON["candidates"] as? [[String: Any]] ?? []
+        let finishSummary: String
+        if let finishError = modelFinishError(from: candidates) {
+            finishSummary = finishError.localizedDescription
+        } else {
+            finishSummary = "finish=IMAGE"
+        }
+
+        let usageSummary: String
+        if let usageMetadata = json["usageMetadata"] as? [String: Any],
+           let totalTokens = usageMetadata["totalTokenCount"] {
+            usageSummary = " totalTokens=\(totalTokens)"
+        } else {
+            usageSummary = ""
+        }
+
+        return "jsonKeys=[\(keys)] candidates=\(candidates.count) \(finishSummary)\(usageSummary)"
+    }
+
+    private static func batchResultSummary(_ response: [String: Any]) -> String {
+        let keys = response.keys.sorted().joined(separator: ",")
+        let inlinedCount = extractInlinedResponseCount(from: response)
+        let candidateCount = (response["candidates"] as? [[String: Any]])?.count ?? 0
+        return cappedLogPayload(
+            "Batch terminal payload | keys=[\(keys)] inlinedResponses=\(inlinedCount) candidates=\(candidateCount)"
+        )
+    }
+
+    private static func extractInlinedResponseCount(from container: [String: Any]) -> Int {
+        if let directArray = container["inlinedResponses"] as? [[String: Any]] ?? container["inlined_responses"] as? [[String: Any]] {
+            return directArray.count
+        }
+
+        if let nestedObj = container["inlinedResponses"] as? [String: Any] ?? container["inlined_responses"] as? [String: Any],
+           let nestedArray = nestedObj["inlinedResponses"] as? [[String: Any]] ?? nestedObj["inlined_responses"] as? [[String: Any]] {
+            return nestedArray.count
+        }
+
+        return 0
+    }
+
+    private static func formatDuration(_ duration: TimeInterval) -> String {
+        String(format: "%.3fs", duration)
     }
     
     static func inferBatchJobState(done: Bool, metadataState: String?, error: [String: Any]?) -> String {
@@ -874,6 +1185,8 @@ enum NanoBananaError: LocalizedError {
     case invalidResponse
     case invalidResponseFormat
     case noImageInResponse
+    case inputPreparationFailed(message: String)
+    case modelFinishedWithoutImage(finishReason: String, message: String?)
     case invalidRequestURL(path: String)
     case apiError(statusCode: Int, data: Data)
     case batchError(message: String)
@@ -894,6 +1207,13 @@ enum NanoBananaError: LocalizedError {
             return "Could not parse API response."
         case .noImageInResponse:
             return "No image in API response."
+        case .inputPreparationFailed(let message):
+            return message
+        case .modelFinishedWithoutImage(let finishReason, let message):
+            if let message, !message.isEmpty {
+                return "Model finished without image (\(finishReason)): \(message)"
+            }
+            return "Model finished without image (\(finishReason))."
         case .invalidRequestURL(let path):
             return "Could not build a valid API request URL for path: \(path)"
         case .apiError(let code, let data):

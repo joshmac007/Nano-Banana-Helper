@@ -21,7 +21,9 @@ struct VisualEffectView: NSViewRepresentable {
 
 // MARK: - Cost Estimator
 struct CostEstimatorView: View {
-    let imageCount: Int
+    let stagedImageCount: Int
+    let variationCount: Int
+    let outputCount: Int
     let imageSize: String
     let isBatchTier: Bool
     let isMultiInput: Bool
@@ -43,29 +45,32 @@ struct CostEstimatorView: View {
         return size.cost(modelName: modelName, isBatchTier: isBatchTier)
     }
     
-    /// Number of output images: 1 if Multi-Input, otherwise same as input count
-    private var outputCount: Int {
-        isMultiInput ? 1 : imageCount
+    private var billedInputCount: Int {
+        switch generationMode {
+        case .image:
+            return stagedImageCount * variationCount
+        case .text:
+            return 0
+        }
     }
     
     var totalCost: Double {
         switch generationMode {
         case .image:
             // Input cost: charged per input image
-            // Output cost: charged per output image (1 for Multi-Input, N otherwise)
-            let inputTotal = Double(imageCount) * inputCostPerImage
+            let inputTotal = Double(billedInputCount) * inputCostPerImage
             let outputTotal = Double(outputCount) * outputCostPerImage
             return inputTotal + outputTotal
         case .text:
             // Text mode: no input cost, only output cost
-            return Double(imageCount) * outputCostPerImage
+            return Double(outputCount) * outputCostPerImage
         }
     }
 
     var inputTotalCost: Double {
         switch generationMode {
         case .image:
-            return Double(imageCount) * inputCostPerImage
+            return Double(billedInputCount) * inputCostPerImage
         case .text:
             return 0
         }
@@ -76,7 +81,7 @@ struct CostEstimatorView: View {
         case .image:
             return Double(outputCount) * outputCostPerImage
         case .text:
-            return Double(imageCount) * outputCostPerImage
+            return Double(outputCount) * outputCostPerImage
         }
     }
 
@@ -106,15 +111,21 @@ struct CostEstimatorView: View {
 
             switch generationMode {
             case .image:
-                if isMultiInput {
-                    Text("\(imageCount) inputs → 1 output @ \(imageSize)")
+                if isMultiInput && variationCount > 1 {
+                    Text("\(stagedImageCount) inputs × \(variationCount) variations → \(outputCount) outputs @ \(imageSize)")
+                        .font(.subheadline)
+                } else if isMultiInput {
+                    Text("\(stagedImageCount) inputs → 1 output @ \(imageSize)")
+                        .font(.subheadline)
+                } else if variationCount > 1 {
+                    Text("\(stagedImageCount) images × \(variationCount) variations → \(outputCount) outputs @ \(imageSize)")
                         .font(.subheadline)
                 } else {
-                    Text("\(imageCount) images @ \(imageSize)")
+                    Text("\(stagedImageCount) images @ \(imageSize)")
                         .font(.subheadline)
                 }
             case .text:
-                Text("\(imageCount) image\(imageCount == 1 ? "" : "s") @ \(imageSize)")
+                Text("\(outputCount) image\(outputCount == 1 ? "" : "s") @ \(imageSize)")
                     .font(.subheadline)
             }
 

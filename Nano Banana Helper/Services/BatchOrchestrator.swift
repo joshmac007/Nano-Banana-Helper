@@ -1241,7 +1241,15 @@ final class BatchOrchestrator {
         } else {
             let inputName = URL(fileURLWithPath: task.inputPaths.first ?? "image")
                 .deletingPathExtension().lastPathComponent
-            baseName = "\(inputName)_edited"
+            let variationSuffix: String
+            if let variationIndex = task.variationIndex,
+               let variationTotal = task.variationTotal,
+               variationTotal > 1 {
+                variationSuffix = "_v\(variationIndex)of\(variationTotal)"
+            } else {
+                variationSuffix = ""
+            }
+            baseName = "\(inputName)_edited\(variationSuffix)"
         }
 
         var candidate = directoryURL.appendingPathComponent("\(baseName).\(ext)")

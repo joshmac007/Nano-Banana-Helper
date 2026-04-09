@@ -48,31 +48,39 @@ struct InspectorView: View {
                     .padding(.top)
                     .disabled(!stagingManager.isReadyForGeneration)
 
-                    // Variations Stepper (Text Mode Only)
-                    if stagingManager.generationMode == .text {
-                        HStack {
-                            Text("Variations")
-                                .font(.system(size: 11, weight: .bold))
-                                .foregroundStyle(.secondary)
-                                .textCase(.uppercase)
+                    HStack {
+                        Text("Variations")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.secondary)
+                            .textCase(.uppercase)
 
-                            Spacer()
+                        Spacer()
 
-                            HStack(spacing: 12) {
-                                Button(action: { stagingManager.textImageCount -= 1 }) {
-                                    Image(systemName: "minus.circle")
-                                }
-                                .disabled(stagingManager.textImageCount <= Constants.minTextImageVariations)
-
-                                Text("\(stagingManager.textImageCount)")
-                                    .font(.system(.body, design: .rounded))
-                                    .frame(minWidth: 24)
-
-                                Button(action: { stagingManager.textImageCount += 1 }) {
-                                    Image(systemName: "plus.circle")
-                                }
-                                .disabled(stagingManager.textImageCount >= Constants.maxTextImageVariations)
+                        HStack(spacing: 12) {
+                            Button(action: decreaseVariationCount) {
+                                Image(systemName: "minus.circle")
                             }
+                            .disabled(currentVariationCount <= Constants.minTextImageVariations)
+
+                            Text("\(currentVariationCount)")
+                                .font(.system(.body, design: .rounded))
+                                .frame(minWidth: 24)
+
+                            Button(action: increaseVariationCount) {
+                                Image(systemName: "plus.circle")
+                            }
+                            .disabled(currentVariationCount >= Constants.maxTextImageVariations)
+                        }
+                    }
+                    .padding(.horizontal)
+
+                    if stagingManager.generationMode == .image && stagingManager.containsPNGInputs {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "info.circle")
+                                .foregroundStyle(.secondary)
+                            Text("PNG inputs are converted to JPEG before upload for Gemini compatibility. Original files stay unchanged.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                         .padding(.horizontal)
                     }
@@ -161,7 +169,9 @@ struct InspectorView: View {
                     .padding(.horizontal)
 
                     CostEstimatorView(
-                        imageCount: stagingManager.effectiveTaskCount,
+                        stagedImageCount: stagingManager.count,
+                        variationCount: currentVariationCount,
+                        outputCount: stagingManager.effectiveTaskCount,
                         imageSize: stagingManager.imageSize,
                         isBatchTier: stagingManager.isBatchTier,
                         isMultiInput: stagingManager.isMultiInput,
@@ -210,25 +220,7 @@ struct InspectorView: View {
         )
 
         // Handle Multi-Input vs Standard Batch
-        let tasks: [ImageTask]
-        if stagingManager.isMultiInput {
-            // All staged files become ONE task with multiple inputs
-            let inputPaths = stagingManager.stagedFiles.map { $0.path }
-            let inputBookmarks = stagingManager.stagedFiles.compactMap { stagingManager.bookmark(for: $0) }
-            tasks = [ImageTask(
-                inputPaths: inputPaths,
-                inputBookmarks: inputBookmarks.isEmpty ? nil : inputBookmarks
-            )]
-        } else {
-            // Standard: One task per file
-            tasks = stagingManager.stagedFiles.map { url in
-                ImageTask(
-                    inputPath: url.path,
-                    inputBookmark: stagingManager.bookmark(for: url)
-                )
-            }
-        }
-        batch.tasks = tasks
+        batch.tasks = stagingManager.makeImageTasks()
 
         orchestrator.enqueue(batch)
 
@@ -252,6 +244,33 @@ struct InspectorView: View {
 
         // Clear prompt after generation
         stagingManager.prompt = ""
+    }
+
+    private var currentVariationCount: Int {
+        switch stagingManager.generationMode {
+        case .image:
+            return stagingManager.imageVariationCount
+        case .text:
+            return stagingManager.textImageCount
+        }
+    }
+
+    private func decreaseVariationCount() {
+        switch stagingManager.generationMode {
+        case .image:
+            stagingManager.imageVariationCount -= 1
+        case .text:
+            stagingManager.textImageCount -= 1
+        }
+    }
+
+    private func increaseVariationCount() {
+        switch stagingManager.generationMode {
+        case .image:
+            stagingManager.imageVariationCount += 1
+        case .text:
+            stagingManager.textImageCount += 1
+        }
     }
 }
 

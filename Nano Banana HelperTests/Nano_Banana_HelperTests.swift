@@ -12,6 +12,55 @@ import Testing
 struct Nano_Banana_HelperTests {
     private let floatingPointTolerance = 0.000_000_1
 
+    private func usageDate(
+        year: Int,
+        month: Int,
+        day: Int,
+        hour: Int = 12,
+        minute: Int = 0,
+        calendar: Calendar
+    ) -> Date {
+        var components = DateComponents()
+        components.year = year
+        components.month = month
+        components.day = day
+        components.hour = hour
+        components.minute = minute
+        components.timeZone = calendar.timeZone
+        return calendar.date(from: components)!
+    }
+
+    private func makeUsageLedgerEntry(
+        timestamp: Date,
+        kind: UsageLedgerKind = .jobCompletion,
+        projectId: UUID? = nil,
+        projectNameSnapshot: String? = nil,
+        costDelta: Double,
+        imageDelta: Int,
+        tokenDelta: Int = 0,
+        inputTokenDelta: Int = 0,
+        outputTokenDelta: Int = 0,
+        resolution: String? = "2K",
+        modelName: String? = "gemini-test",
+        note: String? = nil
+    ) -> UsageLedgerEntry {
+        UsageLedgerEntry(
+            timestamp: timestamp,
+            kind: kind,
+            projectId: projectId,
+            projectNameSnapshot: projectNameSnapshot,
+            costDelta: costDelta,
+            imageDelta: imageDelta,
+            tokenDelta: tokenDelta,
+            inputTokenDelta: inputTokenDelta,
+            outputTokenDelta: outputTokenDelta,
+            resolution: resolution,
+            modelName: modelName,
+            relatedHistoryEntryId: nil,
+            note: note
+        )
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -1597,6 +1646,201 @@ struct Nano_Banana_HelperTests {
         #expect(manager.sessionCost == 0.5)
         #expect(manager.sessionTokens == 15)
         #expect(manager.sessionImageCount == 1)
+    }
+
+    @Test func usageSnapshotFiltersExpectedRanges() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let now = usageDate(year: 2026, month: 4, day: 9, hour: 18, calendar: calendar)
+        let projectId = UUID()
+
+        let entries = [
+            makeUsageLedgerEntry(
+                timestamp: usageDate(year: 2026, month: 4, day: 1, calendar: calendar),
+                projectId: projectId,
+                projectNameSnapshot: "Alpha",
+                costDelta: 1.0,
+                imageDelta: 1
+            ),
+            makeUsageLedgerEntry(
+                timestamp: usageDate(year: 2026, month: 4, day: 4, calendar: calendar),
+                projectId: projectId,
+                projectNameSnapshot: "Alpha",
+                costDelta: 2.0,
+                imageDelta: 2
+            ),
+            makeUsageLedgerEntry(
+                timestamp: usageDate(year: 2026, month: 4, day: 8, calendar: calendar),
+                projectId: projectId,
+                projectNameSnapshot: "Alpha",
+                costDelta: 3.0,
+                imageDelta: 3
+            ),
+            makeUsageLedgerEntry(
+                timestamp: usageDate(year: 2026, month: 4, day: 9, calendar: calendar),
+                projectId: projectId,
+                projectNameSnapshot: "Alpha",
+                costDelta: 4.0,
+                imageDelta: 4
+            )
+        ]
+
+        let today = UsageSnapshotBuilder.makeSnapshot(
+            entries: entries,
+            filter: .today,
+            now: now,
+            calendar: calendar,
+            projectDisplayName: { _, snapshot in snapshot ?? "Unknown" }
+        )
+        let sevenDays = UsageSnapshotBuilder.makeSnapshot(
+            entries: entries,
+            filter: .sevenDays,
+            now: now,
+            calendar: calendar,
+            projectDisplayName: { _, snapshot in snapshot ?? "Unknown" }
+        )
+        let thirtyDays = UsageSnapshotBuilder.makeSnapshot(
+            entries: entries,
+            filter: .thirtyDays,
+            now: now,
+            calendar: calendar,
+            projectDisplayName: { _, snapshot in snapshot ?? "Unknown" }
+        )
+        let allTime = UsageSnapshotBuilder.makeSnapshot(
+            entries: entries,
+            filter: .allTime,
+            now: now,
+            calendar: calendar,
+            projectDisplayName: { _, snapshot in snapshot ?? "Unknown" }
+        )
+
+        #expect(today.totals.cost == 4.0)
+        #expect(today.dayBuckets.count == 1)
+        #expect(today.filteredEntries.count == 1)
+
+        #expect(sevenDays.totals.cost == 9.0)
+        #expect(sevenDays.dayBuckets.count == 7)
+        #expect(sevenDays.filteredEntries.count == 3)
+
+        #expect(thirtyDays.totals.cost == 10.0)
+        #expect(thirtyDays.dayBuckets.count == 30)
+        #expect(thirtyDays.filteredEntries.count == 4)
+
+        #expect(allTime.totals.cost == 10.0)
+        #expect(allTime.dayBuckets.count == 9)
+        #expect(allTime.filteredEntries.count == 4)
+    }
+
+    @Test func usageSnapshotZeroFillsDailyBucketsAndExcludesAdjustmentsAndLegacyImportsFromCharts() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let now = usageDate(year: 2026, month: 4, day: 9, hour: 18, calendar: calendar)
+        let projectId = UUID()
+
+        let entries = [
+            makeUsageLedgerEntry(
+                timestamp: usageDate(year: 2026, month: 4, day: 7, calendar: calendar),
+                projectId: projectId,
+                projectNameSnapshot: "Alpha",
+                costDelta: 2.0,
+                imageDelta: 1
+            ),
+            makeUsageLedgerEntry(
+                timestamp: usageDate(year: 2026, month: 4, day: 8, calendar: calendar),
+                kind: .adjustment,
+                costDelta: 1.0,
+                imageDelta: 5,
+                note: "Fixed overcount"
+            ),
+            makeUsageLedgerEntry(
+                timestamp: usageDate(year: 2026, month: 4, day: 9, calendar: calendar),
+                kind: .legacyImport,
+                costDelta: 10.0,
+                imageDelta: 10,
+                note: "Imported legacy usage totals"
+            )
+        ]
+
+        let snapshot = UsageSnapshotBuilder.makeSnapshot(
+            entries: entries,
+            filter: .sevenDays,
+            now: now,
+            calendar: calendar,
+            projectDisplayName: { _, snapshot in snapshot ?? "Unknown" }
+        )
+
+        #expect(snapshot.totals.cost == 13.0)
+        #expect(snapshot.totals.images == 16)
+        #expect(snapshot.dayBuckets.count == 7)
+        #expect(snapshot.dayBuckets.reduce(0) { $0 + $1.cost } == 2.0)
+        #expect(snapshot.dayBuckets.reduce(0) { $0 + $1.images } == 1)
+        #expect(snapshot.recentActivity.map(\.title).contains("Manual correction"))
+        #expect(snapshot.recentActivity.map(\.title).contains("Imported total"))
+    }
+
+    @Test func usageSnapshotHandlesEmptyLedger() {
+        let snapshot = UsageSnapshotBuilder.makeSnapshot(
+            entries: [],
+            filter: .allTime,
+            projectDisplayName: { _, snapshot in snapshot ?? "Unknown" }
+        )
+
+        #expect(snapshot.hasEntries == false)
+        #expect(snapshot.dayBuckets.isEmpty)
+        #expect(snapshot.rangeLabel == "No tracked usage yet")
+    }
+
+    @MainActor @Test func exportCostReportUsesSelectedRangeEntries() throws {
+        let tempAppSupportURL = try makeTemporaryDirectory()
+        let projectsListURL = tempAppSupportURL.appendingPathComponent("projects.json")
+        let costSummaryURL = tempAppSupportURL.appendingPathComponent("cost_summary.json")
+        let usageLedgerURL = tempAppSupportURL.appendingPathComponent("usage_ledger.json")
+        let projectsDirectoryURL = tempAppSupportURL.appendingPathComponent("projects", isDirectory: true)
+        let manager = ProjectManager(
+            appSupportURL: tempAppSupportURL,
+            projectsListURL: projectsListURL,
+            costSummaryURL: costSummaryURL,
+            usageLedgerURL: usageLedgerURL,
+            projectsDirectoryURL: projectsDirectoryURL
+        )
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let now = usageDate(year: 2026, month: 4, day: 9, hour: 18, calendar: calendar)
+        let projectId = manager.projects.first!.id
+
+        manager.appendLedgerEntry(
+            makeUsageLedgerEntry(
+                timestamp: usageDate(year: 2026, month: 4, day: 1, calendar: calendar),
+                projectId: projectId,
+                projectNameSnapshot: "Default Project",
+                costDelta: 1.0,
+                imageDelta: 1
+            )
+        )
+        manager.appendLedgerEntry(
+            makeUsageLedgerEntry(
+                timestamp: usageDate(year: 2026, month: 4, day: 9, calendar: calendar),
+                projectId: projectId,
+                projectNameSnapshot: "Default Project",
+                costDelta: 4.0,
+                imageDelta: 2
+            )
+        )
+
+        let snapshot = UsageSnapshotBuilder.makeSnapshot(
+            entries: manager.ledger,
+            filter: .today,
+            now: now,
+            calendar: calendar,
+            projectDisplayName: manager.projectDisplayName(for:projectNameSnapshot:)
+        )
+
+        let exportURL = try #require(manager.exportCostReportCSV(entries: snapshot.filteredEntries))
+        let csv = try String(contentsOf: exportURL, encoding: .utf8)
+
+        #expect(csv.contains("2026-04-09T12:00:00Z"))
+        #expect(csv.contains("2026-04-01T12:00:00Z") == false)
     }
 
     @Test func costEstimatorViewUsesModelAwareTotalsAndFallbackWarning() {

@@ -155,7 +155,7 @@ struct SidebarView: View {
             )
         }
         .sheet(isPresented: $showingCostReport) {
-            CostReportView(costSummary: projectManager.costSummary, projects: projectManager.projects)
+            CostReportView()
         }
         .alert("Rename Project", isPresented: Binding(
             get: { projectToRename != nil },

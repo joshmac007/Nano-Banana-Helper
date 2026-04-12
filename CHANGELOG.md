@@ -2,6 +2,28 @@
 
 All notable changes to Nano Banana Helper will be documented in this file.
 
+## [1.4.2] - 2026-04-12
+
+### Added
+- **Persistent Usage Ledger**: Usage tracking now backed by a persistent ledger system that records every batch operation and cost transaction, with support for manual adjustments and reconciliation.
+- **Usage Snapshot Builder**: Create point-in-time snapshots of usage data with advanced filtering by date, project, model, and resolution for detailed reporting and analysis.
+- **Resizable Queue Drawer**: Queue visualization can now be dynamically resized by dragging, with automatic layout adjustment and improved section headers for better workflow control.
+
+### Changed
+- **Request Diagnostics**: All API requests (batch and standard) now emit structured diagnostic logs with timing, status, retry attempts, and detailed error information for improved debuggability.
+- **Logging Architecture**: Replaced ad-hoc logging with unified structured logging integrated into existing LogManager for cleaner, more parseable session output.
+- **Session Tracking**: Ledger-based session cost tracking replaces previous ad-hoc recording for more accurate usage aggregation and transparency.
+
+### Fixed
+- Improved consistency of usage tracking across batch submissions, polling, and image downloads.
+- Enhanced queue state recovery with better persistence semantics during high-throughput operations.
+- Stabilized concurrent ledger writes during simultaneous batch operations.
+
+### Technical
+- Added comprehensive unit tests for ledger filtering, reporting, and snapshot generation.
+- Implemented atomic append operations for thread-safe ledger access.
+- Backward-compatible migration of existing cost data to ledger format on first launch.
+
 ## [1.4.0] - 2026-04-04
 
 ### Added

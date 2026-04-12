@@ -124,6 +124,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     // Security Scoped Bookmarks
     var sourceImageBookmarks: [Data]?
     var outputImageBookmark: Data?
+    var outputDirectoryBookmark: Data?
     
     var sourceURLs: [URL] {
         // Plain path-based URLs for display and non-file-access contexts only.
@@ -155,11 +156,13 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         case id, projectId, timestamp, sourceImagePaths, outputImagePath
         case prompt, aspectRatio, imageSize, usedBatchTier, cost
         case status, error, externalJobName
-        case sourceImageBookmarks, outputImageBookmark
+        case sourceImageBookmarks, outputImageBookmark, outputDirectoryBookmark
         case tokenUsage, modelName, systemPrompt
     }
     
     init(
+        id: UUID = UUID(),
+        timestamp: Date = Date(),
         projectId: UUID,
         sourceImagePaths: [String],
         outputImagePath: String,
@@ -173,13 +176,14 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         externalJobName: String? = nil,
         sourceImageBookmarks: [Data]? = nil,
         outputImageBookmark: Data? = nil,
+        outputDirectoryBookmark: Data? = nil,
         tokenUsage: TokenUsage? = nil,
         modelName: String? = nil,
         systemPrompt: String? = nil
     ) {
-        self.id = UUID()
+        self.id = id
         self.projectId = projectId
-        self.timestamp = Date()
+        self.timestamp = timestamp
         self.sourceImagePaths = sourceImagePaths
         self.outputImagePath = outputImagePath
         self.prompt = prompt
@@ -192,6 +196,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.externalJobName = externalJobName
         self.sourceImageBookmarks = sourceImageBookmarks
         self.outputImageBookmark = outputImageBookmark
+        self.outputDirectoryBookmark = outputDirectoryBookmark
         self.tokenUsage = tokenUsage
         self.modelName = modelName
         self.systemPrompt = systemPrompt
@@ -214,6 +219,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
         sourceImageBookmarks = try container.decodeIfPresent([Data].self, forKey: .sourceImageBookmarks)
         outputImageBookmark = try container.decodeIfPresent(Data.self, forKey: .outputImageBookmark)
+        outputDirectoryBookmark = try container.decodeIfPresent(Data.self, forKey: .outputDirectoryBookmark)
         tokenUsage = try container.decodeIfPresent(TokenUsage.self, forKey: .tokenUsage)
         modelName = try container.decodeIfPresent(String.self, forKey: .modelName)
         systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt)
@@ -236,9 +242,34 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         try container.encodeIfPresent(externalJobName, forKey: .externalJobName)
         try container.encodeIfPresent(sourceImageBookmarks, forKey: .sourceImageBookmarks)
         try container.encodeIfPresent(outputImageBookmark, forKey: .outputImageBookmark)
+        try container.encodeIfPresent(outputDirectoryBookmark, forKey: .outputDirectoryBookmark)
         try container.encodeIfPresent(tokenUsage, forKey: .tokenUsage)
         try container.encodeIfPresent(modelName, forKey: .modelName)
         try container.encodeIfPresent(systemPrompt, forKey: .systemPrompt)
+    }
+
+    func rescuing(externalJobName: String) -> HistoryEntry {
+        HistoryEntry(
+            id: id,
+            timestamp: timestamp,
+            projectId: projectId,
+            sourceImagePaths: sourceImagePaths,
+            outputImagePath: outputImagePath,
+            prompt: prompt,
+            aspectRatio: aspectRatio,
+            imageSize: imageSize,
+            usedBatchTier: usedBatchTier,
+            cost: cost,
+            status: "processing",
+            error: nil,
+            externalJobName: externalJobName,
+            sourceImageBookmarks: sourceImageBookmarks,
+            outputImageBookmark: outputImageBookmark,
+            outputDirectoryBookmark: outputDirectoryBookmark,
+            tokenUsage: tokenUsage,
+            modelName: modelName,
+            systemPrompt: systemPrompt
+        )
     }
 }
 
@@ -295,12 +326,16 @@ struct CostSummary: Codable {
         try container.encode(byModel, forKey: .byModel)
     }
 
-    mutating func record(cost: Double, resolution: String, projectId: UUID,
+    mutating func record(cost: Double, resolution: String?, projectId: UUID?,
                          tokens: TokenUsage? = nil, modelName: String? = nil) {
         totalSpent += cost
         imageCount += 1
-        byResolution[resolution, default: 0] += cost
-        byProject[projectId.uuidString, default: 0] += cost
+        if let resolution {
+            byResolution[resolution, default: 0] += cost
+        }
+        if let projectId {
+            byProject[projectId.uuidString, default: 0] += cost
+        }
         if let tokens {
             totalTokens += tokens.totalTokenCount
             inputTokens += tokens.promptTokenCount
@@ -398,13 +433,14 @@ class BatchJob: Identifiable, Codable {
     var aspectRatio: String
     var imageSize: String
     var outputDirectory: String
+    var outputDirectoryBookmark: Data?
     var useBatchTier: Bool
     var status: String
     var tasks: [ImageTask]
     var isTextMode: Bool = false // For text-to-image generation
 
     enum CodingKeys: String, CodingKey {
-        case id, createdAt, projectId, modelName, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, useBatchTier, status, tasks, isTextMode
+        case id, createdAt, projectId, modelName, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, outputDirectoryBookmark, useBatchTier, status, tasks, isTextMode
     }
 
     required init(from decoder: Decoder) throws {
@@ -418,6 +454,7 @@ class BatchJob: Identifiable, Codable {
         aspectRatio = try container.decode(String.self, forKey: .aspectRatio)
         imageSize = try container.decode(String.self, forKey: .imageSize)
         outputDirectory = try container.decode(String.self, forKey: .outputDirectory)
+        outputDirectoryBookmark = try container.decodeIfPresent(Data.self, forKey: .outputDirectoryBookmark)
         useBatchTier = try container.decode(Bool.self, forKey: .useBatchTier)
         status = try container.decode(String.self, forKey: .status)
         tasks = try container.decode([ImageTask].self, forKey: .tasks)
@@ -435,6 +472,7 @@ class BatchJob: Identifiable, Codable {
         try container.encode(aspectRatio, forKey: .aspectRatio)
         try container.encode(imageSize, forKey: .imageSize)
         try container.encode(outputDirectory, forKey: .outputDirectory)
+        try container.encodeIfPresent(outputDirectoryBookmark, forKey: .outputDirectoryBookmark)
         try container.encode(useBatchTier, forKey: .useBatchTier)
         try container.encode(status, forKey: .status)
         try container.encode(tasks, forKey: .tasks)
@@ -447,6 +485,7 @@ class BatchJob: Identifiable, Codable {
         aspectRatio: String = "16:9",
         imageSize: String = "4K",
         outputDirectory: String,
+        outputDirectoryBookmark: Data? = nil,
         useBatchTier: Bool = false,
         projectId: UUID? = nil,
         modelName: String? = nil
@@ -460,6 +499,7 @@ class BatchJob: Identifiable, Codable {
         self.aspectRatio = aspectRatio
         self.imageSize = imageSize
         self.outputDirectory = outputDirectory
+        self.outputDirectoryBookmark = outputDirectoryBookmark
         self.useBatchTier = useBatchTier
         self.status = "pending"
         self.tasks = []

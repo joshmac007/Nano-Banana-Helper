@@ -9,7 +9,6 @@ struct SidebarView: View {
     @State private var showingNewProject = false
     @State private var showingCostReport = false
     @State private var newProjectName = ""
-    @State private var newProjectDirectory = ""
     
     // MARK: - Rename State
     @State private var projectToRename: Project?
@@ -151,13 +150,12 @@ struct SidebarView: View {
         .sheet(isPresented: $showingNewProject) {
             NewProjectSheet(
                 projectName: $newProjectName,
-                projectDirectory: $newProjectDirectory,
                 onCreate: createProject,
                 onCancel: { showingNewProject = false }
             )
         }
         .sheet(isPresented: $showingCostReport) {
-            CostReportView(costSummary: projectManager.costSummary, projects: projectManager.projects)
+            CostReportView()
         }
         .alert("Rename Project", isPresented: Binding(
             get: { projectToRename != nil },
@@ -181,15 +179,18 @@ struct SidebarView: View {
         }
     }
     
-    private func createProject() {
-        guard !newProjectName.isEmpty, !newProjectDirectory.isEmpty else { return }
-        
-        let project = projectManager.createProject(name: newProjectName, outputDirectory: newProjectDirectory)
+    private func createProject(outputURL: URL, outputDirectoryBookmark: Data?) {
+        guard !newProjectName.isEmpty else { return }
+
+        let project = projectManager.createProject(
+            name: newProjectName,
+            outputURL: outputURL,
+            outputDirectoryBookmark: outputDirectoryBookmark
+        )
         projectManager.selectProject(project)
         onSelectProject?(project)
         
         newProjectName = ""
-        newProjectDirectory = ""
         showingNewProject = false
     }
     

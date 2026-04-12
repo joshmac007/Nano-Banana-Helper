@@ -214,6 +214,7 @@ struct InspectorView: View {
             aspectRatio: stagingManager.aspectRatio,
             imageSize: stagingManager.imageSize,
             outputDirectory: project.outputDirectory,
+            outputDirectoryBookmark: project.outputDirectoryBookmark,
             useBatchTier: stagingManager.isBatchTier,
             projectId: project.id,
             modelName: AppConfig.load().modelName ?? AppPricing.defaultModelName
@@ -237,6 +238,7 @@ struct InspectorView: View {
             aspectRatio: stagingManager.aspectRatio,
             imageSize: stagingManager.imageSize,
             outputDirectory: project.outputDirectory,
+            outputDirectoryBookmark: project.outputDirectoryBookmark,
             useBatchTier: stagingManager.isBatchTier,
             imageCount: stagingManager.textImageCount,
             projectId: project.id

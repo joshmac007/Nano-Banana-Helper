@@ -16,6 +16,7 @@ struct BatchSettings: Sendable {
     let aspectRatio: String
     let imageSize: String
     let outputDirectory: String
+    let outputDirectoryBookmark: Data?
     let useBatchTier: Bool
     let projectId: UUID?
     let modelName: String?
@@ -173,6 +174,8 @@ final class BatchOrchestrator {
     var onImageCompleted: ((HistoryEntry) -> Void)?
     var onCostIncurred: ((Double, String, UUID, TokenUsage?, String?) -> Void)?
     var onHistoryEntryUpdated: ((String, HistoryEntry) -> Void)?
+    var onLedgerEntryCreated: ((UsageLedgerEntry) -> Void)?
+    var onOutputDirectoryBookmarkRefreshed: ((UUID?, String, Data) -> Void)?
     var onRestoreSettings: ((HistoryEntry) -> Void)?
 
     private let ambiguousSubmittingRecoveryMessage = "App closed before submission completed. Remote job id was not saved; retry manually to avoid duplicate jobs."
@@ -216,6 +219,7 @@ final class BatchOrchestrator {
         aspectRatio: String,
         imageSize: String,
         outputDirectory: String,
+        outputDirectoryBookmark: Data? = nil,
         useBatchTier: Bool,
         imageCount: Int,
         projectId: UUID?
@@ -226,6 +230,7 @@ final class BatchOrchestrator {
             aspectRatio: aspectRatio,
             imageSize: imageSize,
             outputDirectory: outputDirectory,
+            outputDirectoryBookmark: outputDirectoryBookmark,
             useBatchTier: useBatchTier,
             projectId: projectId,
             modelName: AppConfig.load().modelName ?? AppPricing.defaultModelName
@@ -497,6 +502,7 @@ final class BatchOrchestrator {
             aspectRatio: batch.aspectRatio,
             imageSize: batch.imageSize,
             outputDirectory: batch.outputDirectory,
+            outputDirectoryBookmark: batch.outputDirectoryBookmark,
             useBatchTier: batch.useBatchTier,
             projectId: batch.projectId,
             modelName: batch.modelName
@@ -687,21 +693,23 @@ final class BatchOrchestrator {
                 submittedJob.status = "processing"
                 submittedJob.cancelRequestedAt = submittedJob.cancelRequestedAt ?? (submittedJob.phase == .cancelRequested ? Date() : nil)
 
-                if let projectId = settings.projectId {
-                    let entry = HistoryEntry(
-                        projectId: projectId,
-                        sourceImagePaths: submittedJob.inputPaths,
-                        outputImagePath: "",
+                    if let projectId = settings.projectId {
+                        let entry = HistoryEntry(
+                            projectId: projectId,
+                            sourceImagePaths: submittedJob.inputPaths,
+                            outputImagePath: "",
                         prompt: settings.prompt,
                         aspectRatio: settings.aspectRatio,
                         imageSize: settings.imageSize,
-                        usedBatchTier: settings.useBatchTier,
-                        cost: 0,
-                        status: "processing",
-                        externalJobName: jobInfo.jobName,
-                        modelName: settings.modelName,
-                        systemPrompt: settings.systemPrompt
-                    )
+                            usedBatchTier: settings.useBatchTier,
+                            cost: 0,
+                            status: "processing",
+                            externalJobName: jobInfo.jobName,
+                            sourceImageBookmarks: submittedJob.inputBookmarks,
+                            outputDirectoryBookmark: settings.outputDirectoryBookmark,
+                            modelName: settings.modelName,
+                            systemPrompt: settings.systemPrompt
+                        )
                     onImageCompleted?(entry)
                 }
 
@@ -860,15 +868,28 @@ final class BatchOrchestrator {
 
     private func handleSuccess(jobId: UUID, data: JobSubmissionData, settings: BatchSettings, response: ImageEditResponse, jobName: String?) async {
         guard let job = task(for: jobId) else { return }
-
-        let outputURL = generateOutputURL(
-            for: job,
-            in: settings.outputDirectory,
-            mimeType: response.mimeType
-        )
+        let owningBatch = batch(containing: jobId)
 
         do {
-            try response.imageData.write(to: outputURL)
+            let writeResult = try withAccessibleOutputDirectory(
+                path: settings.outputDirectory,
+                bookmark: settings.outputDirectoryBookmark
+            ) { directoryURL in
+                try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+                let outputURL = generateOutputURL(
+                    for: job,
+                    in: directoryURL,
+                    mimeType: response.mimeType
+                )
+                try response.imageData.write(to: outputURL)
+                return (outputURL: outputURL, directoryBookmark: AppPaths.bookmark(for: directoryURL))
+            }
+            let outputURL = writeResult.value.outputURL
+            let outputDirectoryBookmark = writeResult.refreshedBookmark ?? writeResult.value.directoryBookmark
+            if let outputDirectoryBookmark, let batchId = owningBatch?.id {
+                updateOutputBookmark(outputDirectoryBookmark, for: batchId)
+                onOutputDirectoryBookmarkRefreshed?(settings.projectId, settings.outputDirectory, outputDirectoryBookmark)
+            }
 
             let completedDespiteCancel = job.cancelRequestedAt != nil
             job.status = "completed"
@@ -894,10 +915,27 @@ final class BatchOrchestrator {
                     externalJobName: jobName,
                     sourceImageBookmarks: sourceBookmarks.isEmpty ? nil : sourceBookmarks,
                     outputImageBookmark: outputBookmark,
+                    outputDirectoryBookmark: outputDirectoryBookmark ?? settings.outputDirectoryBookmark,
                     tokenUsage: response.tokenUsage,
                     modelName: settings.modelName
                 )
                 persistHistoryEntry(historyEntry, externalJobName: jobName)
+                onLedgerEntryCreated?(
+                    UsageLedgerEntry(
+                        kind: .jobCompletion,
+                        projectId: projectId,
+                        projectNameSnapshot: nil,
+                        costDelta: cost,
+                        imageDelta: 1,
+                        tokenDelta: response.tokenUsage?.totalTokenCount ?? 0,
+                        inputTokenDelta: response.tokenUsage?.promptTokenCount ?? 0,
+                        outputTokenDelta: response.tokenUsage?.candidatesTokenCount ?? 0,
+                        resolution: settings.imageSize,
+                        modelName: settings.modelName,
+                        relatedHistoryEntryId: historyEntry.id,
+                        note: nil
+                    )
+                )
                 onCostIncurred?(cost, settings.imageSize, projectId, response.tokenUsage, settings.modelName)
             }
 
@@ -931,8 +969,9 @@ final class BatchOrchestrator {
                 status: "cancelled",
                 error: message,
                 externalJobName: job.externalJobName ?? jobName,
-                sourceImageBookmarks: nil,
+                sourceImageBookmarks: job.inputBookmarks,
                 outputImageBookmark: nil,
+                outputDirectoryBookmark: settings.outputDirectoryBookmark,
                 tokenUsage: nil,
                 modelName: settings.modelName
             )
@@ -962,8 +1001,9 @@ final class BatchOrchestrator {
                 status: "expired",
                 error: message,
                 externalJobName: job.externalJobName ?? jobName,
-                sourceImageBookmarks: nil,
+                sourceImageBookmarks: job.inputBookmarks,
                 outputImageBookmark: nil,
+                outputDirectoryBookmark: settings.outputDirectoryBookmark,
                 tokenUsage: nil,
                 modelName: settings.modelName
             )
@@ -994,8 +1034,9 @@ final class BatchOrchestrator {
                 status: "failed",
                 error: error.localizedDescription,
                 externalJobName: job.externalJobName,
-                sourceImageBookmarks: nil,
+                sourceImageBookmarks: job.inputBookmarks,
                 outputImageBookmark: nil,
+                outputDirectoryBookmark: settings.outputDirectoryBookmark,
                 tokenUsage: nil,
                 modelName: settings.modelName
             )
@@ -1017,6 +1058,7 @@ final class BatchOrchestrator {
         externalJobName: String?,
         sourceImageBookmarks: [Data]?,
         outputImageBookmark: Data?,
+        outputDirectoryBookmark: Data?,
         tokenUsage: TokenUsage?,
         modelName: String?
     ) -> HistoryEntry {
@@ -1034,6 +1076,7 @@ final class BatchOrchestrator {
             externalJobName: externalJobName,
             sourceImageBookmarks: sourceImageBookmarks,
             outputImageBookmark: outputImageBookmark,
+            outputDirectoryBookmark: outputDirectoryBookmark,
             tokenUsage: tokenUsage,
             modelName: modelName,
             systemPrompt: settings.systemPrompt
@@ -1069,6 +1112,8 @@ final class BatchOrchestrator {
                 status: "cancelled",
                 error: "Cancelled by user",
                 externalJobName: job.externalJobName,
+                sourceImageBookmarks: job.inputBookmarks,
+                outputDirectoryBookmark: batch?.outputDirectoryBookmark,
                 modelName: batch?.modelName,
                 systemPrompt: batch?.systemPrompt
             )
@@ -1225,10 +1270,7 @@ final class BatchOrchestrator {
         activeBatches.lazy.flatMap(\.tasks).first(where: { $0.id == id })
     }
 
-    private func generateOutputURL(for task: ImageTask, in directory: String, mimeType: String) -> URL {
-        let directoryURL = URL(fileURLWithPath: directory)
-        try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-
+    private func generateOutputURL(for task: ImageTask, in directoryURL: URL, mimeType: String) -> URL {
         let ext = mimeType == "image/png" ? "png" : "jpg"
 
         let baseName: String
@@ -1259,6 +1301,12 @@ final class BatchOrchestrator {
             counter += 1
         }
         return candidate
+    }
+
+    private func updateOutputBookmark(_ bookmark: Data, for batchId: UUID) {
+        guard let batch = activeBatches.first(where: { $0.id == batchId }) else { return }
+        batch.outputDirectoryBookmark = bookmark
+        saveActiveBatches()
     }
 
     private func updateProgress() {
@@ -1474,6 +1522,7 @@ final class BatchOrchestrator {
         }
 
         let task = ImageTask(inputPaths: entry.sourceImagePaths, projectId: entry.projectId)
+        task.inputBookmarks = entry.sourceImageBookmarks
         task.externalJobName = jobName
         task.status = "processing"
         task.phase = .pausedLocal
@@ -1499,6 +1548,7 @@ final class BatchOrchestrator {
             aspectRatio: entry.aspectRatio,
             imageSize: entry.imageSize,
             outputDirectory: outputDir,
+            outputDirectoryBookmark: entry.outputDirectoryBookmark,
             useBatchTier: entry.usedBatchTier,
             projectId: entry.projectId,
             modelName: entry.modelName
@@ -1512,5 +1562,39 @@ final class BatchOrchestrator {
         Task {
             await self.startAll()
         }
+    }
+
+    private func withAccessibleOutputDirectory<T>(
+        path: String,
+        bookmark: Data?,
+        operation: (URL) throws -> T
+    ) throws -> (value: T, refreshedBookmark: Data?) {
+        let fallbackPath = canFallbackToPath(for: path) ? path : ""
+        var capturedError: Error?
+        let result = AppPaths.withAccessibleURL(
+            bookmark: bookmark,
+            fallbackPath: fallbackPath,
+            dependencies: bookmarkDependencies
+        ) { directoryURL in
+            do {
+                return try operation(directoryURL)
+            } catch {
+                capturedError = error
+                return nil
+            }
+        }
+
+        switch result {
+        case let .success(value, refreshedBookmark):
+            return (value, refreshedBookmark)
+        case let .fallbackUsed(value):
+            return (value, nil)
+        case .accessDenied:
+            throw capturedError ?? CocoaError(.fileWriteNoPermission)
+        }
+    }
+
+    private func canFallbackToPath(for outputDirectory: String) -> Bool {
+        outputDirectory == AppPaths.defaultOutputDirectory.path
     }
 }

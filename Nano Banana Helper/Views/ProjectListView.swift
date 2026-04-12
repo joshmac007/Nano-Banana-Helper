@@ -7,7 +7,6 @@ struct ProjectListView: View {
     
     @State private var showingNewProject = false
     @State private var newProjectName = ""
-    @State private var newProjectDirectory = ""
     @State private var projectToRename: Project?
     @State private var renameText = ""
     
@@ -94,7 +93,6 @@ struct ProjectListView: View {
         .sheet(isPresented: $showingNewProject) {
             NewProjectSheet(
                 projectName: $newProjectName,
-                projectDirectory: $newProjectDirectory,
                 onCreate: createProject,
                 onCancel: { showingNewProject = false }
             )
@@ -122,15 +120,18 @@ struct ProjectListView: View {
     }
 
     
-    private func createProject() {
-        guard !newProjectName.isEmpty, !newProjectDirectory.isEmpty else { return }
-        
-        let project = projectManager.createProject(name: newProjectName, outputDirectory: newProjectDirectory)
+    private func createProject(outputURL: URL, outputDirectoryBookmark: Data?) {
+        guard !newProjectName.isEmpty else { return }
+
+        let project = projectManager.createProject(
+            name: newProjectName,
+            outputURL: outputURL,
+            outputDirectoryBookmark: outputDirectoryBookmark
+        )
         projectManager.selectProject(project)
         onSelectProject?(project)
         
         newProjectName = ""
-        newProjectDirectory = ""
         showingNewProject = false
     }
     

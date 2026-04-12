@@ -43,6 +43,11 @@ struct AppPaths {
     static var costSummaryURL: URL {
         appSupportURL.appendingPathComponent("cost_summary.json")
     }
+
+    /// Path to the usage ledger file
+    static var usageLedgerURL: URL {
+        appSupportURL.appendingPathComponent("usage_ledger.json")
+    }
     
     /// Path to the currently active batch job for persistence across restarts
     static var activeBatchURL: URL {

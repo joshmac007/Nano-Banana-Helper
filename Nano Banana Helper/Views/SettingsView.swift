@@ -8,8 +8,9 @@ struct SettingsView: View {
     @State private var hasExistingKey: Bool = false
     @State private var isLoaded: Bool = false
     @State private var selectedTab: SettingsTab = .api
-    @State private var selectedModel: String = "gemini-3.1-flash-image-preview"
-    @State private var availableModels: [ModelCatalogEntry] = CuratedModelCatalog.fallbackEntries()
+    @State private var selectedProvider: ModelProvider = .gemini
+    @State private var selectedModel: String = CuratedModelCatalog.defaultModelID(for: .gemini)
+    @State private var availableModels: [ModelCatalogEntry] = CuratedModelCatalog.fallbackEntries(for: .gemini)
     @State private var modelStatusMessage: String = ""
 
     var initialTab: SettingsTab = .api
@@ -29,7 +30,6 @@ struct SettingsView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // Header
             HStack {
                 Text("Settings")
                     .font(.headline)
@@ -68,12 +68,14 @@ struct SettingsView: View {
         }
         .frame(width: 500, height: 650)
         .onAppear {
-            if !isLoaded {
-                selectedTab = initialTab
-                checkExistingKey()
-                loadCurrentSettings()
-                isLoaded = true
-            }
+            guard !isLoaded else { return }
+            selectedTab = initialTab
+            loadCurrentSettings()
+            isLoaded = true
+        }
+        .onChange(of: selectedProvider) { _, newProvider in
+            guard isLoaded else { return }
+            saveProviderSelection(newProvider)
         }
     }
     
@@ -81,17 +83,28 @@ struct SettingsView: View {
         Form {
             Section {
                 VStack(alignment: .leading, spacing: 20) {
-                    // API Key Row
                     HStack(alignment: .center) {
-                        Text("Gemini API Key")
+                        Text("Active Provider")
                             .font(.body)
                             .foregroundStyle(.secondary)
-                        
                         Spacer()
-                        
-                        // Input + Eye Button Container
+                        Picker("", selection: $selectedProvider) {
+                            ForEach(ModelProvider.allCases) { provider in
+                                Text(provider.displayName).tag(provider)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 220)
+                    }
+
+                    HStack(alignment: .center) {
+                        Text(selectedProvider.apiKeyLabel)
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+
+                        Spacer()
+
                         HStack(alignment: .center, spacing: 12) {
-                            // Custom Field Container
                             ZStack(alignment: .leading) {
                                 SecureField("", text: $apiKey)
                                     .textFieldStyle(.plain)
@@ -102,7 +115,7 @@ struct SettingsView: View {
                                     .textFieldStyle(.plain)
                                     .opacity(showKey ? 1 : 0)
                                     .disabled(!showKey)
-                                    .offset(y: -1.0) // Correct macOS baseline shift
+                                    .offset(y: -1.0)
                             }
                             .font(.system(.body, design: .monospaced))
                             .padding(.horizontal, 8)
@@ -124,7 +137,6 @@ struct SettingsView: View {
                         }
                     }
                     
-                    // Model Selection Row
                     HStack(alignment: .center) {
                         Text("Image Model")
                             .font(.body)
@@ -146,13 +158,14 @@ struct SettingsView: View {
                         }
                     }
 
+                    providerCapabilitiesCard
+
                     if !modelStatusMessage.isEmpty {
                         Text(modelStatusMessage)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     
-                    // Status Messages
                     if !statusMessage.isEmpty {
                         Text(statusMessage)
                             .font(.caption)
@@ -160,7 +173,6 @@ struct SettingsView: View {
                             .frame(height: 14)
                     }
                     
-                    // Action Button
                     Group {
                         if hasExistingKey && apiKey == "••••••••••••••••" {
                             Button(role: .destructive, action: clearAPIKey) {
@@ -180,9 +192,8 @@ struct SettingsView: View {
                         }
                     }
                     .frame(height: 32)
-                    
-                    Link("Get API Key from Google AI Studio",
-                         destination: URL(string: "https://aistudio.google.com/apikey")!)
+
+                    Link(apiKeyLinkLabel, destination: apiKeyLinkURL)
                         .font(.caption)
                         .foregroundStyle(.blue)
                 }
@@ -195,6 +206,24 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var providerCapabilitiesCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(selectedProvider == .openAI ? "OpenAI standard generation, edits, and masking are enabled. Batch Tier remains disabled in this release." : "Gemini standard and batch generation remain available.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if selectedProvider == .openAI {
+                Text("When using a mask with multiple inputs, OpenAI applies the mask to the first input image only.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.08))
+        .cornerRadius(8)
     }
     
     private var projectsSection: some View {
@@ -238,7 +267,6 @@ struct SettingsView: View {
         }
     }
 
-
     private var aboutSection: some View {
         Form {
             Section("About Nano Banana Helper") {
@@ -255,30 +283,67 @@ struct SettingsView: View {
                     Text("© 2026 Josh McSwain & Frédéric Guigand")
                 }
                 
-                Text("A powerful interface for high-throughput image editing using the Gemini Batch API.")
+                Text("A high-throughput image generation and editing workbench with Gemini and OpenAI provider support.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 8)
                 
-                Link("Gemini API Documentation",
-                     destination: URL(string: "https://ai.google.dev/gemini-api/docs")!)
+                Link("Gemini API Documentation", destination: URL(string: "https://ai.google.dev/gemini-api/docs")!)
+                    .font(.caption)
+                Link("OpenAI Image API Documentation", destination: URL(string: "https://developers.openai.com/api/docs/guides/image-generation")!)
                     .font(.caption)
             }
         }
         .formStyle(.grouped)
     }
     
-    private func checkExistingKey() {
-        // Use synchronous check to avoid multiple async keychain accesses
-        let service = NanoBananaService()
-        Task {
-            hasExistingKey = await service.hasAPIKey()
-            if hasExistingKey {
-                apiKey = "••••••••••••••••"
-            }
+    private var apiKeyLinkLabel: String {
+        switch selectedProvider {
+        case .gemini: return "Get API Key from Google AI Studio"
+        case .openAI: return "Manage API Keys in OpenAI Platform"
         }
     }
-    
+
+    private var apiKeyLinkURL: URL {
+        switch selectedProvider {
+        case .gemini: return URL(string: "https://aistudio.google.com/apikey")!
+        case .openAI: return URL(string: "https://platform.openai.com/api-keys")!
+        }
+    }
+
+    private func loadCurrentSettings() {
+        let service = NanoBananaService()
+        Task {
+            let provider = await service.getProvider()
+            await MainActor.run {
+                selectedProvider = provider
+                statusMessage = ""
+            }
+            await loadProviderState(using: service, provider: provider)
+        }
+    }
+
+    @MainActor
+    private func loadProviderState(using service: NanoBananaService, provider: ModelProvider) async {
+        selectedModel = await service.getModelName(for: provider)
+        hasExistingKey = await service.hasAPIKey(for: provider)
+        apiKey = hasExistingKey ? "••••••••••••••••" : ""
+        showKey = false
+        availableModels = CuratedModelCatalog.fallbackEntries(for: provider, selectedModelID: selectedModel)
+        await refreshModelCatalog(using: service, provider: provider)
+    }
+
+    private func saveProviderSelection(_ provider: ModelProvider) {
+        let service = NanoBananaService()
+        Task {
+            await service.setProvider(provider)
+            await MainActor.run {
+                statusMessage = "Using \(provider.displayName)."
+            }
+            await loadProviderState(using: service, provider: provider)
+        }
+    }
+
     private func saveSettings() {
         guard !apiKey.isEmpty && apiKey != "••••••••••••••••" else { return }
         
@@ -287,12 +352,14 @@ struct SettingsView: View {
         
         let service = NanoBananaService()
         Task {
-            await service.setAPIKey(apiKey)
-            statusMessage = "API key saved successfully!"
-            hasExistingKey = true
-            apiKey = "••••••••••••••••"
-            isSaving = false
-            await refreshModelCatalog(using: service)
+            await service.setAPIKey(apiKey, for: selectedProvider)
+            await MainActor.run {
+                statusMessage = "API key saved successfully!"
+                hasExistingKey = true
+                apiKey = "••••••••••••••••"
+                isSaving = false
+            }
+            await refreshModelCatalog(using: service, provider: selectedProvider)
         }
     }
     
@@ -300,65 +367,79 @@ struct SettingsView: View {
         isSaving = true
         let service = NanoBananaService()
         Task {
-            await service.setAPIKey("")
-            statusMessage = "API key cleared"
-            hasExistingKey = false
-            isSaving = false
-            availableModels = CuratedModelCatalog.fallbackEntries(selectedModelID: selectedModel)
-            modelStatusMessage = "Using bundled model defaults until an API key is added."
+            await service.setAPIKey("", for: selectedProvider)
+            await MainActor.run {
+                statusMessage = "API key cleared"
+                hasExistingKey = false
+                apiKey = ""
+                isSaving = false
+                availableModels = CuratedModelCatalog.fallbackEntries(for: selectedProvider, selectedModelID: selectedModel)
+                modelStatusMessage = fallbackModelMessage(for: selectedProvider)
+            }
         }
     }
     
     private func toggleKeyVisibility() {
+        let service = NanoBananaService()
+
         if !showKey && apiKey == "••••••••••••••••" {
-            // Need to fetch before revealing
-            let service = NanoBananaService()
             Task {
-                if let realKey = await service.getAPIKey() {
-                    apiKey = realKey
-                    showKey = true
+                if let realKey = await service.getAPIKey(for: selectedProvider) {
+                    await MainActor.run {
+                        apiKey = realKey
+                        showKey = true
+                    }
                 }
             }
         } else if showKey && hasExistingKey {
-            // Hiding - check if we should show mask again
-            let service = NanoBananaService()
             Task {
-                if await service.getAPIKey() == apiKey {
-                    apiKey = "••••••••••••••••"
+                let storedKey = await service.getAPIKey(for: selectedProvider)
+                await MainActor.run {
+                    if storedKey == apiKey {
+                        apiKey = "••••••••••••••••"
+                    }
+                    showKey = false
                 }
-                showKey = false
             }
         } else {
             showKey.toggle()
         }
     }
     
-    private func loadCurrentSettings() {
-        let service = NanoBananaService()
-        Task {
-            selectedModel = await service.getModelName()
-            availableModels = CuratedModelCatalog.fallbackEntries(selectedModelID: selectedModel)
-            await refreshModelCatalog(using: service)
-        }
-    }
-    
     private func saveModelSelection(_ modelName: String) {
         let service = NanoBananaService()
         Task {
-            await service.setModelName(modelName)
+            await service.setModelName(modelName, for: selectedProvider)
+            await MainActor.run {
+                stagingNotification()
+            }
         }
     }
 
     @MainActor
-    private func refreshModelCatalog(using service: NanoBananaService) async {
+    private func refreshModelCatalog(using service: NanoBananaService, provider: ModelProvider) async {
         do {
-            availableModels = try await service.fetchAvailableModels(selectedModelID: selectedModel)
-            modelStatusMessage = hasExistingKey
-                ? "Model catalog synced from Gemini."
-                : "Using bundled model defaults until an API key is added."
+            availableModels = try await service.fetchAvailableModels(for: provider, selectedModelID: selectedModel)
+            modelStatusMessage = provider == .gemini
+                ? (hasExistingKey ? "Model catalog synced from Gemini." : fallbackModelMessage(for: provider))
+                : "Using bundled OpenAI model defaults."
         } catch {
-            availableModels = CuratedModelCatalog.fallbackEntries(selectedModelID: selectedModel)
+            availableModels = CuratedModelCatalog.fallbackEntries(for: provider, selectedModelID: selectedModel)
             modelStatusMessage = "Using bundled model defaults. \(error.localizedDescription)"
         }
+    }
+
+    private func fallbackModelMessage(for provider: ModelProvider) -> String {
+        switch provider {
+        case .gemini:
+            return "Using bundled model defaults until a Gemini API key is added."
+        case .openAI:
+            return "Using bundled OpenAI model defaults until an OpenAI API key is added."
+        }
+    }
+
+    @MainActor
+    private func stagingNotification() {
+        NotificationCenter.default.post(name: .appConfigDidChange, object: nil)
     }
 }

@@ -5,8 +5,11 @@
 //  Created by Josh McSwain on 2/2/26.
 //
 
+import CoreGraphics
 import Foundation
+import ImageIO
 import Testing
+import UniformTypeIdentifiers
 @testable import Nano_Banana_Helper
 
 struct Nano_Banana_HelperTests {
@@ -138,6 +141,44 @@ struct Nano_Banana_HelperTests {
         )
     }
 
+    private func makeBatchSettings(
+        outputDirectory: String,
+        outputDirectoryBookmark: Data? = nil,
+        projectId: UUID? = UUID(),
+        provider: ModelProvider = .openAI,
+        modelName: String? = "gpt-image-2",
+        prompt: String = "prompt",
+        systemPrompt: String? = "system",
+        aspectRatio: String = "1:1",
+        imageSize: String = "1K",
+        useBatchTier: Bool = false,
+        openAIOutputFormat: OpenAIOutputFormat = .png,
+        openAIBackground: OpenAIBackground = .auto,
+        openAIInputFidelity: OpenAIInputFidelity = .high,
+        openAIOutputCompression: Int = 100,
+        openAINCount: Int = 1
+    ) -> BatchSettings {
+        BatchSettings(
+            provider: provider,
+            prompt: prompt,
+            systemPrompt: systemPrompt,
+            aspectRatio: aspectRatio,
+            imageSize: imageSize,
+            outputDirectory: outputDirectory,
+            outputDirectoryBookmark: outputDirectoryBookmark,
+            useBatchTier: useBatchTier,
+            projectId: projectId,
+            modelName: modelName,
+            maskImagePath: nil,
+            maskImageBookmark: nil,
+            openAIOutputFormat: openAIOutputFormat,
+            openAIBackground: openAIBackground,
+            openAIInputFidelity: openAIInputFidelity,
+            openAIOutputCompression: openAIOutputCompression,
+            openAINCount: openAINCount
+        )
+    }
+
     @MainActor
     private func persistQueueState(_ state: PersistedQueueState, to url: URL) throws {
         let encoder = JSONEncoder()
@@ -189,6 +230,77 @@ struct Nano_Banana_HelperTests {
         return try await perform()
     }
 
+    @MainActor
+    private func withStoredConfig<T>(
+        update: (inout AppConfig) -> Void,
+        perform: () async throws -> T
+    ) async rethrows -> T {
+        let fileManager = FileManager.default
+        let configURL = AppConfig.fileURL
+        let originalData = try? Data(contentsOf: configURL)
+
+        try? fileManager.createDirectory(
+            at: configURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        var config = AppConfig.load()
+        update(&config)
+        config.save()
+
+        defer {
+            if let originalData {
+                try? originalData.write(to: configURL)
+            } else {
+                try? fileManager.removeItem(at: configURL)
+            }
+        }
+
+        return try await perform()
+    }
+
+    private func makeImageData(
+        width: Int = 1,
+        height: Int = 1,
+        format: UTType,
+        hasAlpha: Bool
+    ) throws -> Data {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let alphaInfo: CGImageAlphaInfo = hasAlpha ? .premultipliedLast : .noneSkipLast
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | alphaInfo.rawValue
+
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+
+        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+        guard let image = context.makeImage() else {
+            throw CocoaError(.coderInvalidValue)
+        }
+
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, format.identifier as CFString, 1, nil) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+
+        return data as Data
+    }
+
     @Test func example() async throws {
         // Write your test here and use APIs like
         // APIs like `#expect(...)` to check expected conditions.
@@ -235,6 +347,11 @@ struct Nano_Banana_HelperTests {
         #expect(entry.tokenUsage == nil)
         #expect(entry.modelName == nil)
         #expect(entry.cost == 0.067)
+        #expect(entry.openAIOutputFormat == .png)
+        #expect(entry.openAIBackground == .auto)
+        #expect(entry.openAIInputFidelity == .high)
+        #expect(entry.openAIOutputCompression == 100)
+        #expect(entry.openAINCount == 1)
     }
 
     @MainActor @Test func historyEntryWithTokenData() throws {
@@ -356,6 +473,11 @@ struct Nano_Banana_HelperTests {
         #expect(batch.modelName == nil)
         #expect(batch.imageSize == "2K")
         #expect(batch.useBatchTier)
+        #expect(batch.openAIOutputFormat == .png)
+        #expect(batch.openAIBackground == .auto)
+        #expect(batch.openAIInputFidelity == .high)
+        #expect(batch.openAIOutputCompression == 100)
+        #expect(batch.openAINCount == 1)
     }
 
     @Test func batchJobRoundTripsModelName() throws {
@@ -743,12 +865,20 @@ struct Nano_Banana_HelperTests {
         let fileURL = try makeTemporaryFile(in: directory, named: "alpha.png", contents: originalPNG)
         let service = NanoBananaService()
         let request = ImageEditRequest(
+            provider: .gemini,
+            modelName: "gemini-3.1-flash-image-preview",
             inputImageURLs: [fileURL],
+            maskImageURL: nil,
             prompt: "test prompt",
             systemInstruction: nil,
             aspectRatio: "1:1",
             imageSize: "1K",
-            useBatchTier: true
+            useBatchTier: true,
+            openAIOutputFormat: .png,
+            openAIBackground: .auto,
+            openAIInputFidelity: .high,
+            openAIOutputCompression: 100,
+            openAINCount: 1
         )
 
         let prepared = try await service.prepareInlineImages(for: [fileURL])
@@ -1878,7 +2008,7 @@ struct Nano_Banana_HelperTests {
         #expect(abs(proEstimator.totalCost - 0.2702) < floatingPointTolerance)
         #expect(abs(flashEstimator.totalCost - 0.156336) < floatingPointTolerance)
         #expect(proEstimator.totalCost > flashEstimator.totalCost)
-        #expect(fallbackEstimator.fallbackPricingDescription == "Using Nano Banana pricing fallback.")
+        #expect(fallbackEstimator.pricingNote == "Using Nano Banana pricing fallback.")
     }
 
     @MainActor @Test func enqueueTextGenerationLocksConfiguredModelName() async throws {
@@ -1890,6 +2020,8 @@ struct Nano_Banana_HelperTests {
             )
 
             orchestrator.enqueueTextGeneration(
+                provider: .gemini,
+                modelName: "gemini-3-pro-image-preview",
                 prompt: "prompt",
                 aspectRatio: "16:9",
                 imageSize: "2K",
@@ -2455,6 +2587,358 @@ struct Nano_Banana_HelperTests {
 
         if startedCount != 2 {
             Issue.record("Expected startAll() to start both eligible batches")
+        }
+    }
+
+    @MainActor @Test func appConfigBackwardCompatibilityMigratesLegacyGeminiFields() throws {
+        let json = """
+        {
+            "apiKey": "legacy-gemini-key",
+            "modelName": "gemini-3.1-flash-image-preview"
+        }
+        """.data(using: .utf8)!
+
+        let config = try JSONDecoder().decode(AppConfig.self, from: json)
+
+        #expect(config.provider == .gemini)
+        #expect(config.geminiAPIKey == "legacy-gemini-key")
+        #expect(config.geminiModelName == "gemini-3.1-flash-image-preview")
+        #expect(config.apiKey == "legacy-gemini-key")
+        #expect(config.modelName == "gemini-3.1-flash-image-preview")
+    }
+
+    @MainActor @Test func appConfigRoundTripsSeparateProviderSelections() throws {
+        var config = AppConfig()
+        config.provider = .openAI
+        config.setAPIKey("gemini-key", for: .gemini)
+        config.setAPIKey("openai-key", for: .openAI)
+        config.setModelName("gemini-3-pro-image-preview", for: .gemini)
+        config.setModelName("gpt-image-2", for: .openAI)
+
+        let data = try JSONEncoder().encode(config)
+        let decoded = try JSONDecoder().decode(AppConfig.self, from: data)
+
+        #expect(decoded.provider == .openAI)
+        #expect(decoded.apiKey(for: .gemini) == "gemini-key")
+        #expect(decoded.apiKey(for: .openAI) == "openai-key")
+        #expect(decoded.modelName(for: .gemini) == "gemini-3-pro-image-preview")
+        #expect(decoded.modelName(for: .openAI) == "gpt-image-2")
+        #expect(decoded.apiKey == "openai-key")
+        #expect(decoded.modelName == "gpt-image-2")
+    }
+
+    @MainActor @Test func historyEntryRoundTripsProviderAndAdvancedMetadata() throws {
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/input.png"],
+            outputImagePath: "/tmp/output.png",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: false,
+            cost: 0.5,
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            systemPrompt: "system",
+            maskImagePath: "/tmp/mask.png",
+            maskImageBookmark: Data("mask".utf8),
+            openAIOutputFormat: .webp,
+            openAIBackground: .transparent,
+            openAIInputFidelity: .low,
+            openAIOutputCompression: 72,
+            openAINCount: 3
+        )
+
+        let data = try JSONEncoder().encode(entry)
+        let decoded = try JSONDecoder().decode(HistoryEntry.self, from: data)
+
+        #expect(decoded.provider == .openAI)
+        #expect(decoded.maskImagePath == "/tmp/mask.png")
+        #expect(decoded.maskImageBookmark == Data("mask".utf8))
+        #expect(decoded.openAIOutputFormat == .webp)
+        #expect(decoded.openAIBackground == .transparent)
+        #expect(decoded.openAIInputFidelity == .low)
+        #expect(decoded.openAIOutputCompression == 72)
+        #expect(decoded.openAINCount == 3)
+    }
+
+    @Test func batchJobRoundTripsProviderAndAdvancedMetadata() throws {
+        let batch = BatchJob(
+            prompt: "prompt",
+            systemPrompt: "system",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            outputDirectory: "/tmp",
+            useBatchTier: false,
+            projectId: UUID(),
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            maskImagePath: "/tmp/mask.png",
+            maskImageBookmark: Data("mask".utf8),
+            openAIOutputFormat: .webp,
+            openAIBackground: .transparent,
+            openAIInputFidelity: .low,
+            openAIOutputCompression: 72,
+            openAINCount: 3
+        )
+
+        let data = try JSONEncoder().encode(batch)
+        let decoded = try JSONDecoder().decode(BatchJob.self, from: data)
+
+        #expect(decoded.provider == .openAI)
+        #expect(decoded.maskImagePath == "/tmp/mask.png")
+        #expect(decoded.maskImageBookmark == Data("mask".utf8))
+        #expect(decoded.openAIOutputFormat == .webp)
+        #expect(decoded.openAIBackground == .transparent)
+        #expect(decoded.openAIInputFidelity == .low)
+        #expect(decoded.openAIOutputCompression == 72)
+        #expect(decoded.openAINCount == 3)
+    }
+
+    @Test func openAIOutputFormatFlagsMatchProviderCapabilities() {
+        #expect(OpenAIOutputFormat.png.supportsBackground)
+        #expect(OpenAIOutputFormat.webp.supportsBackground)
+        #expect(OpenAIOutputFormat.jpeg.supportsBackground == false)
+        #expect(OpenAIOutputFormat.jpeg.supportsCompression)
+        #expect(OpenAIOutputFormat.webp.supportsCompression)
+    }
+
+
+    @MainActor @Test func imageTaskRoundTripsProviderAndMaskMetadata() throws {
+        let task = ImageTask(
+            inputPath: "/tmp/input.png",
+            provider: .openAI,
+            inputBookmark: Data("input".utf8),
+            maskImagePath: "/tmp/mask.png",
+            maskImageBookmark: Data("mask".utf8),
+            variationIndex: 1,
+            variationTotal: 2
+        )
+
+        let data = try JSONEncoder().encode(task)
+        let decoded = try JSONDecoder().decode(ImageTask.self, from: data)
+
+        #expect(decoded.provider == .openAI)
+        #expect(decoded.maskImagePath == "/tmp/mask.png")
+        #expect(decoded.maskImageBookmark == Data("mask".utf8))
+    }
+
+    @MainActor @Test func stagingRestoreRestoresProviderMaskAndAdvancedSettings() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "input.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: [sourceURL.path],
+            outputImagePath: "/tmp/output.png",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: false,
+            cost: 1,
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            systemPrompt: "system",
+            maskImagePath: maskURL.path,
+            maskImageBookmark: Data("mask".utf8),
+            openAIOutputFormat: .webp,
+            openAIBackground: .transparent,
+            openAIInputFidelity: .low,
+            openAIOutputCompression: 67,
+            openAINCount: 4
+        )
+
+        let manager = BatchStagingManager()
+        manager.restore(from: entry)
+
+        #expect(manager.provider == .openAI)
+        #expect(manager.modelName == "gpt-image-2")
+        #expect(manager.maskFile == maskURL)
+        #expect(manager.maskBookmark == Data("mask".utf8))
+        #expect(manager.openAIOutputFormat == .webp)
+        #expect(manager.openAIBackground == .transparent)
+        #expect(manager.openAIInputFidelity == .low)
+        #expect(manager.openAIOutputCompression == 67)
+        #expect(manager.openAINCount == 4)
+    }
+
+    @MainActor @Test func imageTasksCarryProviderAndMaskMetadata() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "input.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+
+        let manager = BatchStagingManager()
+        manager.applyProviderSelection(.openAI, modelName: "gpt-image-2")
+        manager.addFiles([sourceURL])
+        manager.setMaskFile(maskURL, bookmark: Data("mask".utf8))
+
+        let task = try #require(manager.makeImageTasks().first)
+        #expect(task.provider == .openAI)
+        #expect(task.maskImagePath == maskURL.path)
+        #expect(task.maskImageBookmark == Data("mask".utf8))
+    }
+
+    @MainActor @Test func openAIPreflightPreservesPNGPayload() async throws {
+        let directory = try makeTemporaryDirectory()
+        let originalPNG = try makeImageData(format: .png, hasAlpha: true)
+        let fileURL = try makeTemporaryFile(in: directory, named: "alpha.png", contents: originalPNG)
+        let service = NanoBananaService()
+
+        let prepared = try await service.prepareInlineImages(for: [fileURL], provider: .openAI)
+
+        #expect(prepared.count == 1)
+        #expect(prepared[0].sourceMimeType == "image/png")
+        #expect(prepared[0].payloadMimeType == "image/png")
+        #expect(prepared[0].payloadByteCount == prepared[0].originalByteCount)
+        #expect(prepared[0].data == originalPNG)
+    }
+
+    @MainActor @Test func openAIResponseParsingCapturesDetailedTokenUsageAndAllImages() async throws {
+        let payload = """
+        {
+          "data": [
+            { "b64_json": "aGVsbG8=" },
+            { "b64_json": "d29ybGQ=" }
+          ],
+          "output_format": "png",
+          "usage": {
+            "input_tokens": 11,
+            "input_tokens_details": { "image_tokens": 7, "text_tokens": 4 },
+            "output_tokens": 13,
+            "output_tokens_details": { "image_tokens": 10, "text_tokens": 3 },
+            "total_tokens": 24
+          }
+        }
+        """.data(using: .utf8)!
+
+        let service = NanoBananaService()
+        let responses = try await service.parseOpenAIResponse(payload)
+        let first = try #require(responses.first)
+        let second = try #require(responses.dropFirst().first)
+        let usage = try #require(first.tokenUsage)
+
+        #expect(responses.count == 2)
+        #expect(first.mimeType == "image/png")
+        #expect(first.imageData == Data("hello".utf8))
+        #expect(second.imageData == Data("world".utf8))
+        #expect(usage.promptTokenCount == 11)
+        #expect(usage.promptImageTokenCount == 7)
+        #expect(usage.promptTextTokenCount == 4)
+        #expect(usage.candidateImageTokenCount == 10)
+        #expect(usage.candidateTextTokenCount == 3)
+        #expect(second.tokenUsage == nil)
+    }
+
+    @MainActor @Test func persistResponsesWritesMultiOutputFilesAndAllocatesUsageOnce() throws {
+        let directory = try makeTemporaryDirectory()
+        let inputFilename = "input-\(UUID().uuidString).png"
+        let inputURL = try makeTemporaryFile(in: directory, named: inputFilename, contents: makeTransparentPNGData())
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: directory.appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false
+        )
+        let settings = makeBatchSettings(
+            outputDirectory: AppPaths.defaultOutputDirectory.path,
+            projectId: UUID(),
+            openAIOutputFormat: .webp,
+            openAIBackground: .transparent,
+            openAIInputFidelity: .high,
+            openAIOutputCompression: 80,
+            openAINCount: 2
+        )
+        let job = ImageTask(inputPath: inputURL.path, projectId: settings.projectId, provider: .openAI)
+        let responses = [
+            ImageEditResponse(
+                imageData: Data("first".utf8),
+                mimeType: "image/webp",
+                tokenUsage: TokenUsage(
+                    promptTokenCount: 11,
+                    candidatesTokenCount: 13,
+                    totalTokenCount: 24,
+                    promptImageTokenCount: 7,
+                    promptTextTokenCount: 4,
+                    candidateImageTokenCount: 10,
+                    candidateTextTokenCount: 3
+                )
+            ),
+            ImageEditResponse(
+                imageData: Data("second".utf8),
+                mimeType: "image/webp",
+                tokenUsage: nil
+            )
+        ]
+
+        let persisted = try orchestrator.persistResponses(
+            responses,
+            for: job,
+            settings: settings,
+            resolvedModelName: "gpt-image-2",
+            owningBatchId: nil
+        )
+
+        #expect(persisted.outputs.count == 2)
+        #expect(persisted.outputs[0].outputURL.pathExtension == "webp")
+        #expect(persisted.outputs[0].outputURL.lastPathComponent.contains("img1of2"))
+        #expect(persisted.outputs[1].outputURL.lastPathComponent.contains("img2of2"))
+        #expect(try Data(contentsOf: persisted.outputs[0].outputURL) == Data("first".utf8))
+        #expect(try Data(contentsOf: persisted.outputs[1].outputURL) == Data("second".utf8))
+        #expect(abs(persisted.outputs.reduce(0) { $0 + $1.cost } - persisted.totalCost) < floatingPointTolerance)
+        #expect(persisted.outputs[0].tokenUsage?.totalTokenCount == 24)
+        #expect(persisted.outputs[1].tokenUsage == nil)
+    }
+
+    @Test func openAIOutputSizeRejectsExtremeAspectRatios() {
+        do {
+            _ = try NanoBananaService.openAIOutputSize(aspectRatio: "8:1", imageSize: "1K")
+            Issue.record("Expected extreme aspect ratios to be rejected for OpenAI")
+        } catch NanoBananaError.inputPreparationFailed {
+            // Expected path.
+        } catch {
+            Issue.record("Expected inputPreparationFailed but got \(error)")
+        }
+    }
+
+    @Test func openAIMaskValidationRejectsFormatMismatch() throws {
+        let directory = try makeTemporaryDirectory()
+        let primaryURL = try makeTemporaryFile(
+            in: directory,
+            named: "source.jpg",
+            contents: try makeImageData(format: .jpeg, hasAlpha: false)
+        )
+        let maskURL = try makeTemporaryFile(
+            in: directory,
+            named: "mask.png",
+            contents: try makeImageData(format: .png, hasAlpha: true)
+        )
+
+        do {
+            try NanoBananaService.validateOpenAIMask(primaryImageURL: primaryURL, maskImageURL: maskURL)
+            Issue.record("Expected format mismatch to fail mask validation")
+        } catch NanoBananaError.inputPreparationFailed(let message) {
+            #expect(message.contains("same file format"))
+        } catch {
+            Issue.record("Expected inputPreparationFailed but got \(error)")
+        }
+    }
+
+    @MainActor @Test func openAIBatchGuardRejectsBatchSubmission() async throws {
+        let service = NanoBananaService()
+        let request = ImageEditRequest.textOnly(
+            provider: .openAI,
+            modelName: "gpt-image-2",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            useBatchTier: true
+        )
+
+        do {
+            _ = try await service.startBatchJob(request: request)
+            Issue.record("Expected OpenAI batch submissions to be rejected")
+        } catch NanoBananaError.batchError(let message) {
+            #expect(message.contains("OpenAI Batch Tier"))
+        } catch {
+            Issue.record("Expected batchError but got \(error)")
         }
     }
 }

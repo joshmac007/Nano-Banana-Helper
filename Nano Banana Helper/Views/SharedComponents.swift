@@ -85,9 +85,8 @@ struct CostEstimatorView: View {
         }
     }
 
-    var fallbackPricingDescription: String? {
-        guard pricingResolution.isFallback else { return nil }
-        return "Using \(pricingResolution.pricingDisplayName) pricing fallback."
+    var pricingNote: String? {
+        pricingResolution.note
     }
     
     var body: some View {
@@ -104,7 +103,7 @@ struct CostEstimatorView: View {
 
                 Spacer()
 
-                Text("≈ $\(totalCost, specifier: "%.2f")")
+                Text(pricingResolution.pricingMode == .tokenBased ? "After completion" : "≈ $\(totalCost, specifier: "%.2f")")
                     .font(.headline)
                     .foregroundStyle(.green)
             }
@@ -115,10 +114,13 @@ struct CostEstimatorView: View {
                     Text("\(stagedImageCount) inputs × \(variationCount) variations → \(outputCount) outputs @ \(imageSize)")
                         .font(.subheadline)
                 } else if isMultiInput {
-                    Text("\(stagedImageCount) inputs → 1 output @ \(imageSize)")
+                    Text("\(stagedImageCount) inputs → \(outputCount) outputs @ \(imageSize)")
                         .font(.subheadline)
                 } else if variationCount > 1 {
                     Text("\(stagedImageCount) images × \(variationCount) variations → \(outputCount) outputs @ \(imageSize)")
+                        .font(.subheadline)
+                } else if outputCount != stagedImageCount {
+                    Text("\(stagedImageCount) images → \(outputCount) outputs @ \(imageSize)")
                         .font(.subheadline)
                 } else {
                     Text("\(stagedImageCount) images @ \(imageSize)")
@@ -129,26 +131,32 @@ struct CostEstimatorView: View {
                     .font(.subheadline)
             }
 
-            HStack(spacing: 12) {
-                if generationMode == .image {
+            if pricingResolution.pricingMode == .tokenBased {
+                Text("Token-based pricing uses provider-reported usage details after completion.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 12) {
+                    if generationMode == .image {
+                        estimatorMetric(
+                            title: "Inputs",
+                            detail: String(format: "$%.4f each", inputCostPerImage),
+                            total: inputTotalCost
+                        )
+                    }
+
                     estimatorMetric(
-                        title: "Inputs",
-                        detail: String(format: "$%.4f each", inputCostPerImage),
-                        total: inputTotalCost
+                        title: "Outputs",
+                        detail: String(format: "$%.3f each", outputCostPerImage),
+                        total: outputTotalCost
+                    )
+
+                    estimatorMetric(
+                        title: "Total",
+                        detail: isBatchTier ? "Batch tier" : "Standard tier",
+                        total: totalCost
                     )
                 }
-
-                estimatorMetric(
-                    title: "Outputs",
-                    detail: String(format: "$%.3f each", outputCostPerImage),
-                    total: outputTotalCost
-                )
-
-                estimatorMetric(
-                    title: "Total",
-                    detail: isBatchTier ? "Batch tier" : "Standard tier",
-                    total: totalCost
-                )
             }
 
             if let modelName {
@@ -158,10 +166,10 @@ struct CostEstimatorView: View {
                     .lineLimit(1)
             }
 
-            if let fallbackPricingDescription {
-                Text(fallbackPricingDescription)
+            if let pricingNote {
+                Text(pricingNote)
                     .font(.caption2)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(pricingResolution.pricingMode == .tokenBased ? Color.secondary : Color.orange)
             }
         }
         .padding(12)

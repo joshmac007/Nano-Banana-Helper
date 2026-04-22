@@ -12,8 +12,12 @@ struct CostReportView: View {
         AppConfig.load().modelName
     }
 
+    private var selectedProvider: ModelProvider {
+        AppConfig.load().provider
+    }
+
     private var pricingResolution: AppPricing.PricingResolution {
-        AppPricing.pricing(for: selectedModelName)
+        AppPricing.pricing(for: selectedModelName, provider: selectedProvider)
     }
 
     private var snapshot: UsageSnapshot {
@@ -110,49 +114,55 @@ struct CostReportView: View {
                 .fontWeight(.medium)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(selectedModelName ?? AppPricing.defaultModelName)
+                Text(selectedModelName ?? AppPricing.defaultModelName(for: pricingResolution.provider))
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                if pricingResolution.isFallback {
-                    Text("Using \(pricingResolution.pricingDisplayName) pricing fallback.")
+                if let note = pricingResolution.note {
+                    Text(note)
                         .font(.caption2)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(pricingResolution.pricingMode == .tokenBased ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
                 }
             }
 
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
-                GridRow {
-                    Text("Tier")
-                        .fontWeight(.medium)
-                    Text("Input")
-                        .fontWeight(.medium)
-                    Text("Output (4K)")
-                        .fontWeight(.medium)
-                    Text("Output (2K)")
-                        .fontWeight(.medium)
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            if pricingResolution.pricingMode == .perImage {
+                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+                    GridRow {
+                        Text("Tier")
+                            .fontWeight(.medium)
+                        Text("Input")
+                            .fontWeight(.medium)
+                        Text("Output (4K)")
+                            .fontWeight(.medium)
+                        Text("Output (2K)")
+                            .fontWeight(.medium)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
-                GridRow {
-                    Text("Standard")
-                    Text("$\(AppPricing.inputRate(modelName: selectedModelName, isBatchTier: false), specifier: "%.4f")")
-                    Text("$\(ImageSize.size4K.cost(modelName: selectedModelName, isBatchTier: false), specifier: "%.3f")")
-                    Text("$\(ImageSize.size2K.cost(modelName: selectedModelName, isBatchTier: false), specifier: "%.3f")")
-                }
-                .font(.caption)
+                    GridRow {
+                        Text("Standard")
+                        Text("$\(AppPricing.inputRate(modelName: selectedModelName, provider: pricingResolution.provider, isBatchTier: false), specifier: "%.4f")")
+                        Text("$\(ImageSize.size4K.cost(modelName: selectedModelName, isBatchTier: false), specifier: "%.3f")")
+                        Text("$\(ImageSize.size2K.cost(modelName: selectedModelName, isBatchTier: false), specifier: "%.3f")")
+                    }
+                    .font(.caption)
 
-                GridRow {
-                    Text("Batch")
-                    Text("$\(AppPricing.inputRate(modelName: selectedModelName, isBatchTier: true), specifier: "%.4f")")
-                    Text("$\(ImageSize.size4K.cost(modelName: selectedModelName, isBatchTier: true), specifier: "%.3f")")
-                    Text("$\(ImageSize.size2K.cost(modelName: selectedModelName, isBatchTier: true), specifier: "%.3f")")
+                    GridRow {
+                        Text("Batch")
+                        Text("$\(AppPricing.inputRate(modelName: selectedModelName, provider: pricingResolution.provider, isBatchTier: true), specifier: "%.4f")")
+                        Text("$\(ImageSize.size4K.cost(modelName: selectedModelName, isBatchTier: true), specifier: "%.3f")")
+                        Text("$\(ImageSize.size2K.cost(modelName: selectedModelName, isBatchTier: true), specifier: "%.3f")")
+                    }
+                    .font(.caption)
                 }
-                .font(.caption)
+            } else {
+                Text("Tracked OpenAI spend is computed from token usage returned by completed requests. Preflight image-size estimates are not exact for token-based pricing.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
-            Text("Usage data is based on app tracking only. These values are estimated and may differ from actual Google billing.")
+            Text("Usage data is based on app tracking only and may differ from provider billing.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.top, 4)

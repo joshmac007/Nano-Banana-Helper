@@ -90,6 +90,10 @@ struct WorkbenchView: View {
 
     private func reuseEntry(_ entry: HistoryEntry) {
         stagingManager.restore(from: entry)
+        var config = AppConfig.load()
+        config.provider = entry.provider
+        config.setModelName(entry.modelName ?? AppPricing.defaultModelName(for: entry.provider), for: entry.provider)
+        config.save()
         selectedTab = .staging
     }
 }

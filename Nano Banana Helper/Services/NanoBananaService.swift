@@ -3,35 +3,59 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-/// Request structure for image editing
+/// Request structure for image generation or editing
 struct ImageEditRequest: Sendable {
+    let provider: ModelProvider
+    let modelName: String
     let inputImageURLs: [URL] // Empty array for text-to-image generation
+    let maskImageURL: URL?
     let prompt: String
     let systemInstruction: String?
     let aspectRatio: String
     let imageSize: String
     let useBatchTier: Bool
-    
+    // OpenAI advanced parameters (ignored by Gemini path)
+    let openAIOutputFormat: OpenAIOutputFormat
+    let openAIBackground: OpenAIBackground
+    let openAIInputFidelity: OpenAIInputFidelity
+    let openAIOutputCompression: Int
+    let openAINCount: Int
+
     /// Convenience initializer for text-to-image generation (no input images)
     static func textOnly(
+        provider: ModelProvider,
+        modelName: String,
         prompt: String,
         systemInstruction: String? = nil,
         aspectRatio: String,
         imageSize: String,
-        useBatchTier: Bool
+        useBatchTier: Bool,
+        openAIOutputFormat: OpenAIOutputFormat = .png,
+        openAIBackground: OpenAIBackground = .auto,
+        openAIInputFidelity: OpenAIInputFidelity = .high,
+        openAIOutputCompression: Int = 100,
+        openAINCount: Int = 1
     ) -> ImageEditRequest {
         ImageEditRequest(
+            provider: provider,
+            modelName: modelName,
             inputImageURLs: [],
+            maskImageURL: nil,
             prompt: prompt,
             systemInstruction: systemInstruction,
             aspectRatio: aspectRatio,
             imageSize: imageSize,
-            useBatchTier: useBatchTier
+            useBatchTier: useBatchTier,
+            openAIOutputFormat: openAIOutputFormat,
+            openAIBackground: openAIBackground,
+            openAIInputFidelity: openAIInputFidelity,
+            openAIOutputCompression: openAIOutputCompression,
+            openAINCount: openAINCount
         )
     }
 }
 
-/// Response structure from Gemini API
+/// Response structure from the active image provider
 struct ImageEditResponse: Sendable {
     let imageData: Data
     let mimeType: String
@@ -90,13 +114,51 @@ private struct RequestBuildArtifacts {
     let diagnostics: RequestBuildDiagnostics
 }
 
+private struct MultipartFile {
+    let fieldName: String
+    let filename: String
+    let mimeType: String
+    let data: Data
+}
+
 /// Simple config storage — @MainActor ensures all reads/writes are serialized
 @MainActor
 struct AppConfig: Codable {
-    var apiKey: String?
-    var modelName: String?
+    var provider: ModelProvider = .gemini
+    var geminiAPIKey: String?
+    var openAIAPIKey: String?
+    var geminiModelName: String?
+    var openAIModelName: String?
     
     static let fileURL: URL = AppPaths.configURL
+    
+    enum CodingKeys: String, CodingKey {
+        case provider
+        case geminiAPIKey, openAIAPIKey, geminiModelName, openAIModelName
+        case apiKey, modelName
+    }
+    
+    init() {}
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decodeIfPresent(ModelProvider.self, forKey: .provider) ?? .gemini
+        let legacyAPIKey = try container.decodeIfPresent(String.self, forKey: .apiKey)
+        let legacyModelName = try container.decodeIfPresent(String.self, forKey: .modelName)
+        geminiAPIKey = try container.decodeIfPresent(String.self, forKey: .geminiAPIKey) ?? legacyAPIKey
+        openAIAPIKey = try container.decodeIfPresent(String.self, forKey: .openAIAPIKey)
+        geminiModelName = try container.decodeIfPresent(String.self, forKey: .geminiModelName) ?? legacyModelName
+        openAIModelName = try container.decodeIfPresent(String.self, forKey: .openAIModelName)
+    }
+    
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(provider, forKey: .provider)
+        try container.encodeIfPresent(geminiAPIKey, forKey: .geminiAPIKey)
+        try container.encodeIfPresent(openAIAPIKey, forKey: .openAIAPIKey)
+        try container.encodeIfPresent(geminiModelName, forKey: .geminiModelName)
+        try container.encodeIfPresent(openAIModelName, forKey: .openAIModelName)
+    }
     
     static func load() -> AppConfig {
         guard let data = try? Data(contentsOf: fileURL),
@@ -105,26 +167,61 @@ struct AppConfig: Codable {
         }
         return config
     }
+
+    var apiKey: String? {
+        get { apiKey(for: provider) }
+        set { setAPIKey(newValue, for: provider) }
+    }
+
+    var modelName: String? {
+        get { modelName(for: provider) }
+        set { setModelName(newValue, for: provider) }
+    }
+    
+    func apiKey(for provider: ModelProvider) -> String? {
+        switch provider {
+        case .gemini: return geminiAPIKey
+        case .openAI: return openAIAPIKey
+        }
+    }
+    
+    mutating func setAPIKey(_ key: String?, for provider: ModelProvider) {
+        switch provider {
+        case .gemini: geminiAPIKey = key
+        case .openAI: openAIAPIKey = key
+        }
+    }
+    
+    func modelName(for provider: ModelProvider) -> String? {
+        switch provider {
+        case .gemini: return geminiModelName
+        case .openAI: return openAIModelName
+        }
+    }
+    
+    mutating func setModelName(_ name: String?, for provider: ModelProvider) {
+        switch provider {
+        case .gemini: geminiModelName = name
+        case .openAI: openAIModelName = name
+        }
+    }
     
     func save() {
         try? JSONEncoder().encode(self).write(to: Self.fileURL)
+        NotificationCenter.default.post(name: .appConfigDidChange, object: nil)
     }
 }
 
-/// Service for communicating with the Gemini API
+extension Notification.Name {
+    static let appConfigDidChange = Notification.Name("AppConfigDidChange")
+}
+
 actor NanoBananaService {
+    private let session: URLSession
+
     enum BatchTerminalResolution {
         case response([String: Any])
         case dest([String: Any])
-    }
-
-    // private let modelName = "gemini-3-pro-image-preview" // Removed hardcoded
-    private let session: URLSession
-    
-    private var modelName: String {
-        get async {
-            await MainActor.run { AppConfig.load().modelName } ?? "gemini-3.1-flash-image-preview"
-        }
     }
     
     init() {
@@ -134,56 +231,108 @@ actor NanoBananaService {
         self.session = URLSession(configuration: config)
     }
     
-    // MARK: - API Key Management
+    // MARK: - Provider Configuration
     
-    func getAPIKey() async -> String? {
-        await MainActor.run { AppConfig.load().apiKey }
+    func getProvider() async -> ModelProvider {
+        await MainActor.run { AppConfig.load().provider }
     }
     
-    func setAPIKey(_ key: String) async {
+    func setProvider(_ provider: ModelProvider) async {
         await MainActor.run {
             var config = AppConfig.load()
-            config.apiKey = key.isEmpty ? nil : key
+            config.provider = provider
             config.save()
         }
     }
     
+    // MARK: - API Key Management
+    
+    func getAPIKey(for provider: ModelProvider) async -> String? {
+        await MainActor.run { AppConfig.load().apiKey(for: provider) }
+    }
+    
+    func getAPIKey() async -> String? {
+        let provider = await getProvider()
+        return await getAPIKey(for: provider)
+    }
+    
+    func setAPIKey(_ key: String, for provider: ModelProvider) async {
+        await MainActor.run {
+            var config = AppConfig.load()
+            config.setAPIKey(key.isEmpty ? nil : key, for: provider)
+            config.save()
+        }
+    }
+    
+    func setAPIKey(_ key: String) async {
+        let provider = await getProvider()
+        await setAPIKey(key, for: provider)
+    }
+    
+    func hasAPIKey(for provider: ModelProvider) async -> Bool {
+        if let key = await getAPIKey(for: provider) {
+            return !key.isEmpty
+        }
+        return false
+    }
+    
     func hasAPIKey() async -> Bool {
-        await getAPIKey() != nil
+        let provider = await getProvider()
+        return await hasAPIKey(for: provider)
     }
     
     // MARK: - Model Name Management
     
-    func setModelName(_ name: String) async {
+    func setModelName(_ name: String, for provider: ModelProvider) async {
         await MainActor.run {
             var config = AppConfig.load()
-            config.modelName = name.isEmpty ? nil : name
+            config.setModelName(name.isEmpty ? nil : name, for: provider)
             config.save()
         }
     }
     
+    func setModelName(_ name: String) async {
+        let provider = await getProvider()
+        await setModelName(name, for: provider)
+    }
+    
+    func getModelName(for provider: ModelProvider) async -> String {
+        await MainActor.run { AppConfig.load().modelName(for: provider) } ?? CuratedModelCatalog.defaultModelID(for: provider)
+    }
+    
     func getModelName() async -> String {
-        await MainActor.run { AppConfig.load().modelName } ?? "gemini-3.1-flash-image-preview"
+        let provider = await getProvider()
+        return await getModelName(for: provider)
+    }
+    
+    func fetchAvailableModels(for provider: ModelProvider, selectedModelID: String? = nil) async throws -> [ModelCatalogEntry] {
+        switch provider {
+        case .gemini:
+            guard let apiKey = await getAPIKey(for: provider), !apiKey.isEmpty else {
+                return CuratedModelCatalog.fallbackEntries(for: provider, selectedModelID: selectedModelID)
+            }
+
+            var request = URLRequest(url: try Self.listModelsURL(apiKey: apiKey, pageSize: 100))
+            request.httpMethod = "GET"
+            let (data, response) = try await session.data(for: request)
+
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                throw NanoBananaError.invalidResponse
+            }
+
+            let entries = try CuratedModelCatalog.entries(from: data, provider: provider, selectedModelID: selectedModelID)
+            if entries.isEmpty {
+                return CuratedModelCatalog.fallbackEntries(for: provider, selectedModelID: selectedModelID)
+            }
+            return entries
+        case .openAI:
+            return CuratedModelCatalog.fallbackEntries(for: provider, selectedModelID: selectedModelID)
+        }
     }
 
     func fetchAvailableModels(selectedModelID: String? = nil) async throws -> [ModelCatalogEntry] {
-        guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
-            return CuratedModelCatalog.fallbackEntries(selectedModelID: selectedModelID)
-        }
-
-        var request = URLRequest(url: try Self.listModelsURL(apiKey: apiKey, pageSize: 100))
-        request.httpMethod = "GET"
-        let (data, response) = try await session.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            throw NanoBananaError.invalidResponse
-        }
-
-        let entries = try CuratedModelCatalog.entries(from: data, selectedModelID: selectedModelID)
-        if entries.isEmpty {
-            return CuratedModelCatalog.fallbackEntries(selectedModelID: selectedModelID)
-        }
-        return entries
+        let provider = await getProvider()
+        return try await fetchAvailableModels(for: provider, selectedModelID: selectedModelID)
     }
     
     // MARK: - Image Editing
@@ -192,30 +341,50 @@ actor NanoBananaService {
     private static let maxBatchPayloadSize = 20 * 1024 * 1024
     
     func editImage(_ request: ImageEditRequest, onJobCreated: (@Sendable (String) -> Void)? = nil, onPollUpdate: (@Sendable (PollStatusUpdate) -> Void)? = nil) async throws -> ImageEditResponse {
-        guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
+        guard let apiKey = await getAPIKey(for: request.provider), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
         }
 
-        let requestBuild = try await buildRequestPayload(request: request)
-        
-        if request.useBatchTier {
-            // Use split workflow to allow ID capture
-            let jobInfo = try await createBatchJobRecord(requestBuild, apiKey: apiKey)
-            onJobCreated?(jobInfo.jobName)
-            return try await pollBatchJob(jobName: jobInfo.jobName, requestKey: jobInfo.requestKey, onPollUpdate: onPollUpdate)
-        } else {
-            return try await processStandardRequest(requestBuild, apiKey: apiKey)
+        switch request.provider {
+        case .gemini:
+            let requestBuild = try await buildRequestPayload(request: request)
+
+            if request.useBatchTier {
+                let jobInfo = try await createBatchJobRecord(requestBuild, apiKey: apiKey, modelName: request.modelName)
+                onJobCreated?(jobInfo.jobName)
+                return try await pollBatchJob(jobName: jobInfo.jobName, requestKey: jobInfo.requestKey, onPollUpdate: onPollUpdate)
+            }
+
+            return try await processStandardRequest(requestBuild, apiKey: apiKey, modelName: request.modelName)
+        case .openAI:
+            let responses = try await processOpenAIResponses(request, apiKey: apiKey)
+            return try firstOpenAIResponse(from: responses)
+        }
+    }
+
+    func editImages(_ request: ImageEditRequest, onJobCreated: (@Sendable (String) -> Void)? = nil, onPollUpdate: (@Sendable (PollStatusUpdate) -> Void)? = nil) async throws -> [ImageEditResponse] {
+        switch request.provider {
+        case .gemini:
+            return [try await editImage(request, onJobCreated: onJobCreated, onPollUpdate: onPollUpdate)]
+        case .openAI:
+            guard let apiKey = await getAPIKey(for: request.provider), !apiKey.isEmpty else {
+                throw NanoBananaError.missingAPIKey
+            }
+            return try await processOpenAIResponses(request, apiKey: apiKey)
         }
     }
     
     /// Starts a batch job and returns the job name and request key immediately
     func startBatchJob(request: ImageEditRequest) async throws -> BatchJobInfo {
-        guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
+        guard request.provider == .gemini else {
+            throw NanoBananaError.batchError(message: "OpenAI Batch Tier is not implemented yet. Disable Batch Tier for OpenAI jobs.")
+        }
+        guard let apiKey = await getAPIKey(for: request.provider), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
         }
         
         let payload = try await buildRequestPayload(request: request)
-        return try await createBatchJobRecord(payload, apiKey: apiKey)
+        return try await createBatchJobRecord(payload, apiKey: apiKey, modelName: request.modelName)
     }
     
     private func buildRequestPayload(request: ImageEditRequest) async throws -> RequestBuildArtifacts {
@@ -265,13 +434,169 @@ actor NanoBananaService {
             diagnostics: diagnostics
         )
     }
+
+    private func firstOpenAIResponse(from responses: [ImageEditResponse]) throws -> ImageEditResponse {
+        guard let first = responses.first else {
+            throw NanoBananaError.noImageInResponse
+        }
+        return first
+    }
+
+    private func processOpenAIResponses(_ request: ImageEditRequest, apiKey: String) async throws -> [ImageEditResponse] {
+        guard request.useBatchTier == false else {
+            throw NanoBananaError.batchError(message: "OpenAI Batch Tier is not implemented yet. Disable Batch Tier for OpenAI jobs.")
+        }
+
+        if request.inputImageURLs.isEmpty {
+            return try await processOpenAIGenerationRequest(request, apiKey: apiKey)
+        }
+
+        return try await processOpenAIEditRequest(request, apiKey: apiKey)
+    }
+
+    private func processOpenAIGenerationRequest(_ request: ImageEditRequest, apiKey: String) async throws -> [ImageEditResponse] {
+        let size = try Self.openAIOutputSize(aspectRatio: request.aspectRatio, imageSize: request.imageSize)
+        let quality = Self.openAIQuality(for: request.imageSize)
+        var payload: [String: Any] = [
+            "model": request.modelName,
+            "prompt": Self.combinedOpenAIPrompt(from: request),
+            "size": size,
+            "quality": quality,
+            "output_format": request.openAIOutputFormat.rawValue,
+            "n": request.openAINCount
+        ]
+        if request.openAIOutputFormat.supportsBackground {
+            if request.modelName == "gpt-image-2" && request.openAIBackground == .transparent {
+                // gpt-image-2 does not support transparent background; omit parameter
+            } else {
+                payload["background"] = request.openAIBackground.rawValue
+            }
+        }
+        if request.openAIOutputFormat.supportsCompression {
+            payload["output_compression"] = request.openAIOutputCompression
+        }
+
+        var urlRequest = URLRequest(url: Self.openAIImagesGenerationsURL())
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let serializationStart = Date()
+        let httpBody = try JSONSerialization.data(withJSONObject: payload)
+        let serializationDuration = Date().timeIntervalSince(serializationStart)
+        urlRequest.httpBody = httpBody
+
+        await LogManager.shared.log(
+            .request,
+            payload: "OpenAI images.generate | model=\(request.modelName) size=\(size) quality=\(quality) format=\(request.openAIOutputFormat.rawValue) n=\(request.openAINCount) bodyBytes=\(httpBody.count) serialize=\(Self.formatDuration(serializationDuration))"
+        )
+
+        let requestStart = Date()
+        let (data, response) = try await executeWithRetry(urlRequest)
+        let requestDuration = Date().timeIntervalSince(requestStart)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw NanoBananaError.invalidResponse
+        }
+
+        await LogManager.shared.log(
+            .response,
+            payload: Self.responseLogSummary(data: data, httpResponse: httpResponse, requestDuration: requestDuration)
+        )
+
+        guard httpResponse.statusCode == 200 else {
+            throw NanoBananaError.apiError(statusCode: httpResponse.statusCode, data: data)
+        }
+
+        return try await parseOpenAIResponse(data)
+    }
+
+    private func processOpenAIEditRequest(_ request: ImageEditRequest, apiKey: String) async throws -> [ImageEditResponse] {
+        guard request.inputImageURLs.count <= 16 else {
+            throw NanoBananaError.inputPreparationFailed(message: "OpenAI supports up to 16 input images per edit request.")
+        }
+        guard request.maskImageURL == nil || request.inputImageURLs.isEmpty == false else {
+            throw NanoBananaError.inputPreparationFailed(message: "A mask requires at least one source image.")
+        }
+
+        if let maskImageURL = request.maskImageURL, let primaryImageURL = request.inputImageURLs.first {
+            try Self.validateOpenAIMask(primaryImageURL: primaryImageURL, maskImageURL: maskImageURL)
+        }
+
+        let size = try Self.openAIOutputSize(aspectRatio: request.aspectRatio, imageSize: request.imageSize)
+        let quality = Self.openAIQuality(for: request.imageSize)
+        let boundary = "Boundary-\(UUID().uuidString)"
+        let files = try request.inputImageURLs.map { url in
+            MultipartFile(fieldName: "image[]", filename: url.lastPathComponent, mimeType: mimeType(for: url), data: try Data(contentsOf: url))
+        }
+        let maskFile = try request.maskImageURL.map { url in
+            MultipartFile(fieldName: "mask", filename: url.lastPathComponent, mimeType: mimeType(for: url), data: try Data(contentsOf: url))
+        }
+
+        var fields: [(String, String)] = [
+            ("model", request.modelName),
+            ("prompt", Self.combinedOpenAIPrompt(from: request)),
+            ("size", size),
+            ("quality", quality),
+            ("output_format", request.openAIOutputFormat.rawValue),
+            ("n", "\(request.openAINCount)")
+        ]
+        if request.modelName != "gpt-image-2" {
+            fields.append(("input_fidelity", request.openAIInputFidelity.rawValue))
+        }
+        if request.openAIOutputFormat.supportsBackground {
+            if request.modelName == "gpt-image-2" && request.openAIBackground == .transparent {
+                // gpt-image-2 does not support transparent background; omit parameter
+            } else {
+                fields.append(("background", request.openAIBackground.rawValue))
+            }
+        }
+        if request.openAIOutputFormat.supportsCompression {
+            fields.append(("output_compression", "\(request.openAIOutputCompression)"))
+        }
+
+        let body = Self.makeMultipartBody(
+            boundary: boundary,
+            fields: fields,
+            files: files + (maskFile.map { [$0] } ?? [])
+        )
+
+        var urlRequest = URLRequest(url: Self.openAIImagesEditsURL())
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        urlRequest.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        urlRequest.httpBody = body
+
+        await LogManager.shared.log(
+            .request,
+            payload: "OpenAI images.edit | model=\(request.modelName) inputs=\(request.inputImageURLs.count) mask=\(request.maskImageURL != nil) size=\(size) quality=\(quality) format=\(request.openAIOutputFormat.rawValue) n=\(request.openAINCount) bodyBytes=\(body.count)"
+        )
+
+        let requestStart = Date()
+        let (data, response) = try await executeWithRetry(urlRequest)
+        let requestDuration = Date().timeIntervalSince(requestStart)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw NanoBananaError.invalidResponse
+        }
+
+        await LogManager.shared.log(
+            .response,
+            payload: Self.responseLogSummary(data: data, httpResponse: httpResponse, requestDuration: requestDuration)
+        )
+
+        guard httpResponse.statusCode == 200 else {
+            throw NanoBananaError.apiError(statusCode: httpResponse.statusCode, data: data)
+        }
+
+        return try await parseOpenAIResponse(data)
+    }
     
     // MARK: - Standard API
     
-    private func processStandardRequest(_ buildArtifacts: RequestBuildArtifacts, apiKey: String) async throws -> ImageEditResponse {
-        let currentModelName = await modelName
+    private func processStandardRequest(_ buildArtifacts: RequestBuildArtifacts, apiKey: String, modelName: String) async throws -> ImageEditResponse {
         var urlRequest = URLRequest(
-            url: try Self.generateContentURL(apiKey: apiKey, modelName: currentModelName)
+            url: try Self.generateContentURL(apiKey: apiKey, modelName: modelName)
         )
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -285,14 +610,13 @@ actor NanoBananaService {
             .request,
             payload: Self.requestLogSummary(
                 endpoint: "generateContent",
-                modelName: currentModelName,
+                modelName: modelName,
                 diagnostics: buildArtifacts.diagnostics,
                 bodyByteCount: httpBody.count,
                 serializationDuration: serializationDuration
             )
         )
         
-        // Execute with retry
         let requestStart = Date()
         let (data, response) = try await executeWithRetry(urlRequest)
         let requestDuration = Date().timeIntervalSince(requestStart)
@@ -346,7 +670,7 @@ actor NanoBananaService {
     
     // MARK: - Batch API (Async Job-Based)
     
-    private func createBatchJobRecord(_ buildArtifacts: RequestBuildArtifacts, apiKey: String) async throws -> BatchJobInfo {
+    private func createBatchJobRecord(_ buildArtifacts: RequestBuildArtifacts, apiKey: String, modelName: String) async throws -> BatchJobInfo {
         let requestKey = UUID().uuidString
         let batchPayload: [String: Any] = [
             "batch": [
@@ -364,9 +688,7 @@ actor NanoBananaService {
             ]
         ]
         
-        // POST to :batchGenerateContent endpoint
-        let currentModelName = await modelName
-        let url = try Self.batchGenerateContentURL(apiKey: apiKey, modelName: currentModelName)
+        let url = try Self.batchGenerateContentURL(apiKey: apiKey, modelName: modelName)
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -375,12 +697,12 @@ actor NanoBananaService {
         let httpBody = try JSONSerialization.data(withJSONObject: batchPayload)
         let serializationDuration = Date().timeIntervalSince(serializationStart)
         urlRequest.httpBody = httpBody
-
+        
         await LogManager.shared.log(
             .request,
             payload: Self.requestLogSummary(
                 endpoint: "batchGenerateContent",
-                modelName: currentModelName,
+                modelName: modelName,
                 diagnostics: buildArtifacts.diagnostics,
                 bodyByteCount: httpBody.count,
                 serializationDuration: serializationDuration
@@ -684,7 +1006,7 @@ actor NanoBananaService {
 
     func buildRequestDiagnostics(for request: ImageEditRequest) throws -> RequestBuildDiagnostics {
         let preflightStart = Date()
-        let preparedInputs = try prepareInlineImages(for: request.inputImageURLs)
+        let preparedInputs = try prepareInlineImages(for: request.inputImageURLs, provider: request.provider)
         let preflightDuration = Date().timeIntervalSince(preflightStart)
         let totalDataSize = preparedInputs.reduce(0) { partialResult, input in
             partialResult + input.payloadByteCount
@@ -705,12 +1027,12 @@ actor NanoBananaService {
         )
     }
 
-    func prepareInlineImages(for urls: [URL]) throws -> [PreparedInlineImage] {
+    func prepareInlineImages(for urls: [URL], provider: ModelProvider = .gemini) throws -> [PreparedInlineImage] {
         try urls.map { url in
             let originalData = try Data(contentsOf: url)
             let sourceMimeType = mimeType(for: url)
 
-            if sourceMimeType == "image/png" {
+            if provider == .gemini, sourceMimeType == "image/png" {
                 let normalizedData = try normalizePNGToJPEG(data: originalData, filename: url.lastPathComponent)
                 return PreparedInlineImage(
                     filename: url.lastPathComponent,
@@ -731,6 +1053,120 @@ actor NanoBananaService {
                 data: originalData
             )
         }
+    }
+
+    static func combinedOpenAIPrompt(from request: ImageEditRequest) -> String {
+        guard let systemInstruction = request.systemInstruction?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !systemInstruction.isEmpty else {
+            return request.prompt
+        }
+        return "\(systemInstruction)\n\n\(request.prompt)"
+    }
+
+    static func openAIQuality(for imageSize: String) -> String {
+        switch imageSize {
+        case "4K": return "high"
+        case "2K": return "medium"
+        default: return "low"
+        }
+    }
+
+    static func openAIOutputSize(aspectRatio: String, imageSize: String) throws -> String {
+        let aspect = AspectRatio.from(string: aspectRatio)
+        guard aspect.id != "Auto" else { return "auto" }
+
+        let ratio = Double(aspect.width / aspect.height)
+        guard ratio <= 3.0, ratio >= (1.0 / 3.0) else {
+            throw NanoBananaError.inputPreparationFailed(
+                message: "OpenAI currently supports aspect ratios up to 3:1. Select Auto or a less extreme aspect ratio."
+            )
+        }
+
+        let profile = openAISizeProfile(for: imageSize)
+        let longEdgeCandidate = min(Double(profile.maxLongEdge), sqrt(profile.maxPixels * max(ratio, 1.0 / ratio)))
+
+        if ratio >= 1 {
+            let width = floorToMultipleOf16(longEdgeCandidate)
+            let height = floorToMultipleOf16(Double(width) / ratio)
+            return "\(width)x\(height)"
+        }
+
+        let height = floorToMultipleOf16(longEdgeCandidate)
+        let width = floorToMultipleOf16(Double(height) * ratio)
+        return "\(width)x\(height)"
+    }
+
+    private static func openAISizeProfile(for imageSize: String) -> (maxPixels: Double, maxLongEdge: Int) {
+        switch imageSize {
+        case "4K": return (8_294_400, 3840)
+        case "2K": return (4_194_304, 2048)
+        default: return (1_572_864, 1536)
+        }
+    }
+
+    private static func floorToMultipleOf16(_ value: Double) -> Int {
+        max(16, Int((value / 16).rounded(.down)) * 16)
+    }
+
+    static func validateOpenAIMask(primaryImageURL: URL, maskImageURL: URL) throws {
+        let primaryDescriptor = try openAIImageDescriptor(for: primaryImageURL)
+        let maskDescriptor = try openAIImageDescriptor(for: maskImageURL)
+
+        let maxBytes = 50 * 1024 * 1024
+        guard primaryDescriptor.byteCount < maxBytes, maskDescriptor.byteCount < maxBytes else {
+            throw NanoBananaError.inputPreparationFailed(message: "OpenAI masks and source images must be smaller than 50MB.")
+        }
+        guard primaryDescriptor.pixelWidth == maskDescriptor.pixelWidth,
+              primaryDescriptor.pixelHeight == maskDescriptor.pixelHeight else {
+            throw NanoBananaError.inputPreparationFailed(message: "OpenAI masks must match the primary source image dimensions.")
+        }
+        guard primaryDescriptor.formatIdentifier == maskDescriptor.formatIdentifier else {
+            throw NanoBananaError.inputPreparationFailed(message: "OpenAI masks must use the same file format as the primary source image.")
+        }
+        guard maskDescriptor.hasAlpha else {
+            throw NanoBananaError.inputPreparationFailed(message: "OpenAI masks must include an alpha channel.")
+        }
+    }
+
+    private static func openAIImageDescriptor(for url: URL) throws -> (pixelWidth: Int, pixelHeight: Int, formatIdentifier: String, hasAlpha: Bool, byteCount: Int) {
+        let data = try Data(contentsOf: url)
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+              let format = CGImageSourceGetType(source) as String? else {
+            throw NanoBananaError.inputPreparationFailed(message: "Could not inspect image file \(url.lastPathComponent).")
+        }
+
+        let alphaInfo = image.alphaInfo
+        let hasAlpha = alphaInfo != .none && alphaInfo != .noneSkipFirst && alphaInfo != .noneSkipLast
+
+        return (
+            pixelWidth: image.width,
+            pixelHeight: image.height,
+            formatIdentifier: format,
+            hasAlpha: hasAlpha,
+            byteCount: data.count
+        )
+    }
+
+    private static func makeMultipartBody(boundary: String, fields: [(String, String)], files: [MultipartFile]) -> Data {
+        var body = Data()
+
+        for (name, value) in fields {
+            body.append(Data("--\(boundary)\r\n".utf8))
+            body.append(Data("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".utf8))
+            body.append(Data("\(value)\r\n".utf8))
+        }
+
+        for file in files {
+            body.append(Data("--\(boundary)\r\n".utf8))
+            body.append(Data("Content-Disposition: form-data; name=\"\(file.fieldName)\"; filename=\"\(file.filename)\"\r\n".utf8))
+            body.append(Data("Content-Type: \(file.mimeType)\r\n\r\n".utf8))
+            body.append(file.data)
+            body.append(Data("\r\n".utf8))
+        }
+
+        body.append(Data("--\(boundary)--\r\n".utf8))
+        return body
     }
 
     static func validateBatchPayloadSize(totalDataSize: Int, hasInputImages: Bool, useBatchTier: Bool) throws {
@@ -819,6 +1255,62 @@ actor NanoBananaService {
         throw lastError ?? NanoBananaError.unknownError
     }
     
+    /// Parses an OpenAI image response. Returns one `ImageEditResponse` per image in `data[]`.
+    /// When `n > 1`, callers receive the full array and can persist each image separately.
+    func parseOpenAIResponse(_ data: Data) async throws -> [ImageEditResponse] {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NanoBananaError.invalidResponseFormat
+        }
+
+        let usageObject = json["usage"] as? [String: Any]
+        let tokenUsage: TokenUsage?
+        if let usageObject,
+           let inputTokens = usageObject["input_tokens"] as? Int,
+           let outputTokens = usageObject["output_tokens"] as? Int,
+           let totalTokens = usageObject["total_tokens"] as? Int {
+            let inputDetails = usageObject["input_tokens_details"] as? [String: Any]
+            let outputDetails = usageObject["output_tokens_details"] as? [String: Any]
+            tokenUsage = TokenUsage(
+                promptTokenCount: inputTokens,
+                candidatesTokenCount: outputTokens,
+                totalTokenCount: totalTokens,
+                promptImageTokenCount: inputDetails?["image_tokens"] as? Int,
+                promptTextTokenCount: inputDetails?["text_tokens"] as? Int,
+                candidateImageTokenCount: outputDetails?["image_tokens"] as? Int,
+                candidateTextTokenCount: outputDetails?["text_tokens"] as? Int
+            )
+        } else {
+            tokenUsage = nil
+        }
+
+        let outputFormat = (json["output_format"] as? String ?? "png").lowercased()
+        let mimeType: String
+        switch outputFormat {
+        case "jpeg": mimeType = "image/jpeg"
+        case "webp": mimeType = "image/webp"
+        default: mimeType = "image/png"
+        }
+
+        guard let images = json["data"] as? [[String: Any]], !images.isEmpty else {
+            throw NanoBananaError.noImageInResponse
+        }
+
+        // Only the first image carries tokenUsage — it covers the full API call cost.
+        var result: [ImageEditResponse] = []
+        for (index, imageObj) in images.enumerated() {
+            guard let base64Data = imageObj["b64_json"] as? String,
+                  let imageData = Data(base64Encoded: base64Data) else { continue }
+            result.append(ImageEditResponse(
+                imageData: imageData,
+                mimeType: mimeType,
+                tokenUsage: index == 0 ? tokenUsage : nil
+            ))
+        }
+
+        guard !result.isEmpty else { throw NanoBananaError.noImageInResponse }
+        return result
+    }
+
     func parseResponse(_ data: Data) async throws -> ImageEditResponse {
         let parseStart = Date()
 
@@ -1116,6 +1608,14 @@ actor NanoBananaService {
         }
     }
 
+    static func openAIImagesGenerationsURL() -> URL {
+        URL(string: "https://api.openai.com/v1/images/generations")!
+    }
+
+    static func openAIImagesEditsURL() -> URL {
+        URL(string: "https://api.openai.com/v1/images/edits")!
+    }
+
     static func generateContentURL(apiKey: String, modelName: String) throws -> URL {
         try apiURL(
             path: "/v1beta/models/\(modelName):generateContent",
@@ -1200,7 +1700,7 @@ enum NanoBananaError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .missingAPIKey:
-            return "No API key configured. Add your Gemini API key in Settings."
+            return "No API key configured. Add the active provider API key in Settings."
         case .invalidResponse:
             return "Invalid response from API. If this is a batch job recovery, double check that the Job ID is correct (no extra spaces, l vs 1, etc)."
         case .invalidResponseFormat:

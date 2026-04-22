@@ -11,6 +11,7 @@ struct JobSubmissionData: Sendable {
 }
 
 struct BatchSettings: Sendable {
+    let provider: ModelProvider
     let prompt: String
     let systemPrompt: String?
     let aspectRatio: String
@@ -20,6 +21,13 @@ struct BatchSettings: Sendable {
     let useBatchTier: Bool
     let projectId: UUID?
     let modelName: String?
+    let maskImagePath: String?
+    let maskImageBookmark: Data?
+    let openAIOutputFormat: OpenAIOutputFormat
+    let openAIBackground: OpenAIBackground
+    let openAIInputFidelity: OpenAIInputFidelity
+    let openAIOutputCompression: Int
+    let openAINCount: Int
 
     func cost(inputCount: Int) -> Double {
         ImageSize.calculateCost(
@@ -29,6 +37,20 @@ struct BatchSettings: Sendable {
             modelName: modelName
         )
     }
+}
+
+struct PersistedResponseOutput: Sendable {
+    let outputURL: URL
+    let outputBookmark: Data?
+    let cost: Double
+    let tokenUsage: TokenUsage?
+}
+
+struct PersistedResponseBatch: Sendable {
+    let outputs: [PersistedResponseOutput]
+    let outputDirectoryBookmark: Data?
+    let totalCost: Double
+    let totalTokenUsage: TokenUsage?
 }
 
 struct PersistedQueueState: Codable {
@@ -200,6 +222,9 @@ final class BatchOrchestrator {
 
         for task in batch.tasks {
             task.projectId = batch.projectId
+            task.provider = batch.provider
+            task.maskImagePath = batch.maskImagePath
+            task.maskImageBookmark = batch.maskImageBookmark
         }
 
         normalizeBatchStatus(batch)
@@ -214,6 +239,8 @@ final class BatchOrchestrator {
     }
 
     func enqueueTextGeneration(
+        provider: ModelProvider,
+        modelName: String,
         prompt: String,
         systemPrompt: String? = nil,
         aspectRatio: String,
@@ -222,7 +249,12 @@ final class BatchOrchestrator {
         outputDirectoryBookmark: Data? = nil,
         useBatchTier: Bool,
         imageCount: Int,
-        projectId: UUID?
+        projectId: UUID?,
+        openAIOutputFormat: OpenAIOutputFormat = .png,
+        openAIBackground: OpenAIBackground = .auto,
+        openAIInputFidelity: OpenAIInputFidelity = .high,
+        openAIOutputCompression: Int = 100,
+        openAINCount: Int = 1
     ) {
         let batch = BatchJob(
             prompt: prompt,
@@ -233,11 +265,17 @@ final class BatchOrchestrator {
             outputDirectoryBookmark: outputDirectoryBookmark,
             useBatchTier: useBatchTier,
             projectId: projectId,
-            modelName: AppConfig.load().modelName ?? AppPricing.defaultModelName
+            modelName: modelName,
+            provider: provider,
+            openAIOutputFormat: openAIOutputFormat,
+            openAIBackground: openAIBackground,
+            openAIInputFidelity: openAIInputFidelity,
+            openAIOutputCompression: openAIOutputCompression,
+            openAINCount: openAINCount
         )
         batch.isTextMode = true
         batch.tasks = (0..<imageCount).map { _ in
-            ImageTask(inputPaths: [], projectId: projectId)
+            ImageTask(inputPaths: [], projectId: projectId, provider: provider)
         }
         enqueue(batch)
     }
@@ -497,6 +535,7 @@ final class BatchOrchestrator {
 
     private func processQueue(batch: BatchJob) async {
         let batchSettings = BatchSettings(
+            provider: batch.provider,
             prompt: batch.prompt,
             systemPrompt: batch.systemPrompt,
             aspectRatio: batch.aspectRatio,
@@ -505,7 +544,14 @@ final class BatchOrchestrator {
             outputDirectoryBookmark: batch.outputDirectoryBookmark,
             useBatchTier: batch.useBatchTier,
             projectId: batch.projectId,
-            modelName: batch.modelName
+            modelName: batch.modelName,
+            maskImagePath: batch.maskImagePath,
+            maskImageBookmark: batch.maskImageBookmark,
+            openAIOutputFormat: batch.openAIOutputFormat,
+            openAIBackground: batch.openAIBackground,
+            openAIInputFidelity: batch.openAIInputFidelity,
+            openAIOutputCompression: batch.openAIOutputCompression,
+            openAINCount: batch.openAINCount
         )
 
         if controlState != .cancelling {
@@ -657,23 +703,51 @@ final class BatchOrchestrator {
         saveActiveBatches()
         updateProgress()
 
+        let resolvedMaskBookmark = settings.maskImageBookmark.flatMap {
+            AppPaths.resolveBookmark($0, dependencies: bookmarkDependencies)
+        }
+        if let refreshedMaskBookmark = resolvedMaskBookmark?.refreshedBookmarkData, let owningBatch = batch(containing: data.id) {
+            owningBatch.maskImageBookmark = refreshedMaskBookmark
+            job.maskImageBookmark = refreshedMaskBookmark
+            saveActiveBatches()
+        }
+        let maskImageURL = resolvedMaskBookmark?.url ?? settings.maskImagePath.map { URL(fileURLWithPath: $0) }
+        let resolvedModelName = settings.modelName ?? AppPricing.defaultModelName(for: settings.provider)
+        defer {
+            resolvedMaskBookmark?.url.stopAccessingSecurityScopedResource()
+        }
         let request: ImageEditRequest
         if data.inputURLs.isEmpty {
             request = ImageEditRequest.textOnly(
+                provider: settings.provider,
+                modelName: resolvedModelName,
                 prompt: settings.prompt,
                 systemInstruction: settings.systemPrompt,
                 aspectRatio: settings.aspectRatio,
                 imageSize: settings.imageSize,
-                useBatchTier: settings.useBatchTier
+                useBatchTier: settings.useBatchTier,
+                openAIOutputFormat: settings.openAIOutputFormat,
+                openAIBackground: settings.openAIBackground,
+                openAIInputFidelity: settings.openAIInputFidelity,
+                openAIOutputCompression: settings.openAIOutputCompression,
+                openAINCount: settings.openAINCount
             )
         } else {
             request = ImageEditRequest(
+                provider: settings.provider,
+                modelName: resolvedModelName,
                 inputImageURLs: data.inputURLs,
+                maskImageURL: maskImageURL,
                 prompt: settings.prompt,
                 systemInstruction: settings.systemPrompt,
                 aspectRatio: settings.aspectRatio,
                 imageSize: settings.imageSize,
-                useBatchTier: settings.useBatchTier
+                useBatchTier: settings.useBatchTier,
+                openAIOutputFormat: settings.openAIOutputFormat,
+                openAIBackground: settings.openAIBackground,
+                openAIInputFidelity: settings.openAIInputFidelity,
+                openAIOutputCompression: settings.openAIOutputCompression,
+                openAINCount: settings.openAINCount
             )
         }
 
@@ -693,23 +767,31 @@ final class BatchOrchestrator {
                 submittedJob.status = "processing"
                 submittedJob.cancelRequestedAt = submittedJob.cancelRequestedAt ?? (submittedJob.phase == .cancelRequested ? Date() : nil)
 
-                    if let projectId = settings.projectId {
-                        let entry = HistoryEntry(
-                            projectId: projectId,
-                            sourceImagePaths: submittedJob.inputPaths,
-                            outputImagePath: "",
+                if let projectId = settings.projectId {
+                    let entry = HistoryEntry(
+                        projectId: projectId,
+                        sourceImagePaths: submittedJob.inputPaths,
+                        outputImagePath: "",
                         prompt: settings.prompt,
                         aspectRatio: settings.aspectRatio,
                         imageSize: settings.imageSize,
-                            usedBatchTier: settings.useBatchTier,
-                            cost: 0,
-                            status: "processing",
-                            externalJobName: jobInfo.jobName,
-                            sourceImageBookmarks: submittedJob.inputBookmarks,
-                            outputDirectoryBookmark: settings.outputDirectoryBookmark,
-                            modelName: settings.modelName,
-                            systemPrompt: settings.systemPrompt
-                        )
+                        usedBatchTier: settings.useBatchTier,
+                        cost: 0,
+                        status: "processing",
+                        externalJobName: jobInfo.jobName,
+                        sourceImageBookmarks: submittedJob.inputBookmarks,
+                        outputDirectoryBookmark: settings.outputDirectoryBookmark,
+                        modelName: resolvedModelName,
+                        provider: settings.provider,
+                        systemPrompt: settings.systemPrompt,
+                        maskImagePath: submittedJob.maskImagePath,
+                        maskImageBookmark: submittedJob.maskImageBookmark,
+                        openAIOutputFormat: settings.openAIOutputFormat,
+                        openAIBackground: settings.openAIBackground,
+                        openAIInputFidelity: settings.openAIInputFidelity,
+                        openAIOutputCompression: settings.openAIOutputCompression,
+                        openAINCount: settings.openAINCount
+                    )
                     onImageCompleted?(entry)
                 }
 
@@ -730,7 +812,7 @@ final class BatchOrchestrator {
                 saveActiveBatches()
                 updateProgress()
             } else {
-                let response = try await service.editImage(request)
+                let responses = try await service.editImages(request)
                 if data.hasSecurityScope {
                     data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
                 }
@@ -738,7 +820,7 @@ final class BatchOrchestrator {
                     jobId: data.id,
                     data: data,
                     settings: settings,
-                    response: response,
+                    responses: responses,
                     jobName: nil
                 )
             }
@@ -788,7 +870,7 @@ final class BatchOrchestrator {
                 jobId: jobId,
                 data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false),
                 settings: settings,
-                response: response,
+                responses: [response],
                 jobName: jobName
             )
         } catch NanoBananaError.jobCancelled {
@@ -866,77 +948,67 @@ final class BatchOrchestrator {
         updateProgress()
     }
 
-    private func handleSuccess(jobId: UUID, data: JobSubmissionData, settings: BatchSettings, response: ImageEditResponse, jobName: String?) async {
+    private func handleSuccess(jobId: UUID, data: JobSubmissionData, settings: BatchSettings, responses: [ImageEditResponse], jobName: String?) async {
         guard let job = task(for: jobId) else { return }
         let owningBatch = batch(containing: jobId)
+        let resolvedModelName = settings.modelName ?? AppPricing.defaultModelName(for: settings.provider)
 
         do {
-            let writeResult = try withAccessibleOutputDirectory(
-                path: settings.outputDirectory,
-                bookmark: settings.outputDirectoryBookmark
-            ) { directoryURL in
-                try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-                let outputURL = generateOutputURL(
-                    for: job,
-                    in: directoryURL,
-                    mimeType: response.mimeType
-                )
-                try response.imageData.write(to: outputURL)
-                return (outputURL: outputURL, directoryBookmark: AppPaths.bookmark(for: directoryURL))
-            }
-            let outputURL = writeResult.value.outputURL
-            let outputDirectoryBookmark = writeResult.refreshedBookmark ?? writeResult.value.directoryBookmark
-            if let outputDirectoryBookmark, let batchId = owningBatch?.id {
-                updateOutputBookmark(outputDirectoryBookmark, for: batchId)
-                onOutputDirectoryBookmarkRefreshed?(settings.projectId, settings.outputDirectory, outputDirectoryBookmark)
-            }
+            let persisted = try persistResponses(
+                responses,
+                for: job,
+                settings: settings,
+                resolvedModelName: resolvedModelName,
+                owningBatchId: owningBatch?.id
+            )
 
             let completedDespiteCancel = job.cancelRequestedAt != nil
             job.status = "completed"
             job.phase = .completed
-            job.outputPath = outputURL.path
+            job.outputPath = persisted.outputs.first?.outputURL.path
             job.completedAt = Date()
             job.error = nil
             job.stalledAt = nil
             job.cancelRequestedAt = nil
 
-            let cost = settings.cost(inputCount: job.inputPaths.count)
             if let projectId = settings.projectId {
                 let sourceBookmarks = job.inputBookmarks ?? []
-                let outputBookmark = AppPaths.bookmark(for: outputURL)
-                let historyEntry = makeHistoryEntry(
-                    projectId: projectId,
-                    job: job,
-                    settings: settings,
-                    outputImagePath: outputURL.path,
-                    cost: cost,
-                    status: "completed",
-                    error: nil,
-                    externalJobName: jobName,
-                    sourceImageBookmarks: sourceBookmarks.isEmpty ? nil : sourceBookmarks,
-                    outputImageBookmark: outputBookmark,
-                    outputDirectoryBookmark: outputDirectoryBookmark ?? settings.outputDirectoryBookmark,
-                    tokenUsage: response.tokenUsage,
-                    modelName: settings.modelName
-                )
-                persistHistoryEntry(historyEntry, externalJobName: jobName)
-                onLedgerEntryCreated?(
-                    UsageLedgerEntry(
-                        kind: .jobCompletion,
+                let outputDirectoryBookmark = persisted.outputDirectoryBookmark ?? settings.outputDirectoryBookmark
+                for output in persisted.outputs {
+                    let historyEntry = makeHistoryEntry(
                         projectId: projectId,
-                        projectNameSnapshot: nil,
-                        costDelta: cost,
-                        imageDelta: 1,
-                        tokenDelta: response.tokenUsage?.totalTokenCount ?? 0,
-                        inputTokenDelta: response.tokenUsage?.promptTokenCount ?? 0,
-                        outputTokenDelta: response.tokenUsage?.candidatesTokenCount ?? 0,
-                        resolution: settings.imageSize,
-                        modelName: settings.modelName,
-                        relatedHistoryEntryId: historyEntry.id,
-                        note: nil
+                        job: job,
+                        settings: settings,
+                        outputImagePath: output.outputURL.path,
+                        cost: output.cost,
+                        status: "completed",
+                        error: nil,
+                        externalJobName: jobName,
+                        sourceImageBookmarks: sourceBookmarks.isEmpty ? nil : sourceBookmarks,
+                        outputImageBookmark: output.outputBookmark,
+                        outputDirectoryBookmark: outputDirectoryBookmark,
+                        tokenUsage: output.tokenUsage,
+                        modelName: resolvedModelName
                     )
-                )
-                onCostIncurred?(cost, settings.imageSize, projectId, response.tokenUsage, settings.modelName)
+                    persistHistoryEntry(historyEntry, externalJobName: jobName)
+                    onLedgerEntryCreated?(
+                        UsageLedgerEntry(
+                            kind: .jobCompletion,
+                            projectId: projectId,
+                            projectNameSnapshot: nil,
+                            costDelta: output.cost,
+                            imageDelta: 1,
+                            tokenDelta: output.tokenUsage?.totalTokenCount ?? 0,
+                            inputTokenDelta: output.tokenUsage?.promptTokenCount ?? 0,
+                            outputTokenDelta: output.tokenUsage?.candidatesTokenCount ?? 0,
+                            resolution: settings.imageSize,
+                            modelName: resolvedModelName,
+                            relatedHistoryEntryId: historyEntry.id,
+                            note: nil
+                        )
+                    )
+                }
+                onCostIncurred?(persisted.totalCost, settings.imageSize, projectId, persisted.totalTokenUsage, resolvedModelName)
             }
 
             if completedDespiteCancel, !hasCancellationInProgress {
@@ -1047,6 +1119,81 @@ final class BatchOrchestrator {
         updateProgress()
     }
 
+    func persistResponses(
+        _ responses: [ImageEditResponse],
+        for job: ImageTask,
+        settings: BatchSettings,
+        resolvedModelName: String,
+        owningBatchId: UUID?
+    ) throws -> PersistedResponseBatch {
+        guard !responses.isEmpty else {
+            throw NanoBananaError.noImageInResponse
+        }
+
+        let totalTokenUsage = responses.compactMap(\.tokenUsage).first
+        let totalCost = AppPricing.usageCost(
+            modelName: resolvedModelName,
+            provider: settings.provider,
+            tokenUsage: totalTokenUsage,
+            isBatchTier: settings.useBatchTier
+        ) ?? settings.cost(inputCount: job.inputPaths.count)
+        let costShares = splitTotalCost(totalCost, across: responses.count)
+
+        let writeResult = try withAccessibleOutputDirectory(
+            path: settings.outputDirectory,
+            bookmark: settings.outputDirectoryBookmark
+        ) { directoryURL in
+            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+
+            let outputURLs = try responses.enumerated().map { index, response in
+                let outputURL = generateOutputURL(
+                    for: job,
+                    in: directoryURL,
+                    mimeType: response.mimeType,
+                    outputIndex: responses.count > 1 ? index + 1 : nil,
+                    outputCount: responses.count
+                )
+                try response.imageData.write(to: outputURL)
+                return outputURL
+            }
+
+            return (outputURLs: outputURLs, directoryBookmark: AppPaths.bookmark(for: directoryURL))
+        }
+
+        let outputDirectoryBookmark = writeResult.refreshedBookmark ?? writeResult.value.directoryBookmark
+        if let outputDirectoryBookmark, let batchId = owningBatchId {
+            updateOutputBookmark(outputDirectoryBookmark, for: batchId)
+            onOutputDirectoryBookmarkRefreshed?(settings.projectId, settings.outputDirectory, outputDirectoryBookmark)
+        }
+
+        let outputs = writeResult.value.outputURLs.enumerated().map { index, outputURL in
+            PersistedResponseOutput(
+                outputURL: outputURL,
+                outputBookmark: AppPaths.bookmark(for: outputURL),
+                cost: costShares[index],
+                tokenUsage: index == 0 ? totalTokenUsage : nil
+            )
+        }
+
+        return PersistedResponseBatch(
+            outputs: outputs,
+            outputDirectoryBookmark: outputDirectoryBookmark,
+            totalCost: totalCost,
+            totalTokenUsage: totalTokenUsage
+        )
+    }
+
+    private func splitTotalCost(_ totalCost: Double, across outputCount: Int) -> [Double] {
+        guard outputCount > 0 else { return [] }
+        guard outputCount > 1 else { return [totalCost] }
+
+        let share = totalCost / Double(outputCount)
+        var shares = Array(repeating: share, count: outputCount)
+        shares[outputCount - 1] = totalCost - shares.dropLast().reduce(0, +)
+        return shares
+    }
+
+
     private func makeHistoryEntry(
         projectId: UUID,
         job: ImageTask,
@@ -1079,7 +1226,15 @@ final class BatchOrchestrator {
             outputDirectoryBookmark: outputDirectoryBookmark,
             tokenUsage: tokenUsage,
             modelName: modelName,
-            systemPrompt: settings.systemPrompt
+            provider: settings.provider,
+            systemPrompt: settings.systemPrompt,
+            maskImagePath: job.maskImagePath,
+            maskImageBookmark: job.maskImageBookmark,
+            openAIOutputFormat: settings.openAIOutputFormat,
+            openAIBackground: settings.openAIBackground,
+            openAIInputFidelity: settings.openAIInputFidelity,
+            openAIOutputCompression: settings.openAIOutputCompression,
+            openAINCount: settings.openAINCount
         )
     }
 
@@ -1115,7 +1270,15 @@ final class BatchOrchestrator {
                 sourceImageBookmarks: job.inputBookmarks,
                 outputDirectoryBookmark: batch?.outputDirectoryBookmark,
                 modelName: batch?.modelName,
-                systemPrompt: batch?.systemPrompt
+                provider: batch?.provider ?? job.provider,
+                systemPrompt: batch?.systemPrompt,
+                maskImagePath: job.maskImagePath,
+                maskImageBookmark: job.maskImageBookmark,
+                openAIOutputFormat: batch?.openAIOutputFormat ?? .png,
+                openAIBackground: batch?.openAIBackground ?? .auto,
+                openAIInputFidelity: batch?.openAIInputFidelity ?? .high,
+                openAIOutputCompression: batch?.openAIOutputCompression ?? 100,
+                openAINCount: batch?.openAINCount ?? 1
             )
             persistHistoryEntry(entry, externalJobName: job.externalJobName)
         }
@@ -1270,10 +1433,24 @@ final class BatchOrchestrator {
         activeBatches.lazy.flatMap(\.tasks).first(where: { $0.id == id })
     }
 
-    private func generateOutputURL(for task: ImageTask, in directoryURL: URL, mimeType: String) -> URL {
-        let ext = mimeType == "image/png" ? "png" : "jpg"
+    private func generateOutputURL(
+        for task: ImageTask,
+        in directoryURL: URL,
+        mimeType: String,
+        outputIndex: Int? = nil,
+        outputCount: Int = 1
+    ) -> URL {
+        let ext: String
+        switch mimeType {
+        case "image/png":
+            ext = "png"
+        case "image/webp":
+            ext = "webp"
+        default:
+            ext = "jpg"
+        }
 
-        let baseName: String
+        var baseName: String
         if task.inputPaths.isEmpty {
             let formatter = DateFormatter()
             formatter.dateFormat = "yyyyMMdd_HHmmss"
@@ -1292,6 +1469,10 @@ final class BatchOrchestrator {
                 variationSuffix = ""
             }
             baseName = "\(inputName)_edited\(variationSuffix)"
+        }
+
+        if let outputIndex, outputCount > 1 {
+            baseName += "_img\(outputIndex)of\(outputCount)"
         }
 
         var candidate = directoryURL.appendingPathComponent("\(baseName).\(ext)")
@@ -1485,6 +1666,16 @@ final class BatchOrchestrator {
         var didRefresh = false
 
         for batch in activeBatches {
+            if let maskBookmark = batch.maskImageBookmark,
+               let resolution = AppPaths.resolveBookmarkToPath(maskBookmark, dependencies: bookmarkDependencies),
+               let refreshedBookmark = resolution.refreshedBookmarkData {
+                batch.maskImageBookmark = refreshedBookmark
+                for task in batch.tasks {
+                    task.maskImageBookmark = refreshedBookmark
+                }
+                didRefresh = true
+            }
+
             for task in batch.tasks {
                 guard let inputBookmarks = task.inputBookmarks else { continue }
                 var updatedBookmarks = inputBookmarks
@@ -1521,8 +1712,14 @@ final class BatchOrchestrator {
             return
         }
 
-        let task = ImageTask(inputPaths: entry.sourceImagePaths, projectId: entry.projectId)
-        task.inputBookmarks = entry.sourceImageBookmarks
+        let task = ImageTask(
+            inputPaths: entry.sourceImagePaths,
+            projectId: entry.projectId,
+            provider: entry.provider,
+            inputBookmarks: entry.sourceImageBookmarks,
+            maskImagePath: entry.maskImagePath,
+            maskImageBookmark: entry.maskImageBookmark
+        )
         task.externalJobName = jobName
         task.status = "processing"
         task.phase = .pausedLocal
@@ -1551,7 +1748,10 @@ final class BatchOrchestrator {
             outputDirectoryBookmark: entry.outputDirectoryBookmark,
             useBatchTier: entry.usedBatchTier,
             projectId: entry.projectId,
-            modelName: entry.modelName
+            modelName: entry.modelName,
+            provider: entry.provider,
+            maskImagePath: entry.maskImagePath,
+            maskImageBookmark: entry.maskImageBookmark
         )
         batch.tasks = [task]
         batch.status = "pending"

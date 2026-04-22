@@ -326,7 +326,7 @@ struct ProgressQueueView: View {
 
         switch orchestrator.controlState {
         case .pausedLocal:
-            return "Paused locally. Gemini may still finish already-submitted work remotely."
+            return "Paused locally. Already-submitted remote work may still finish while local polling is paused."
         case .cancelling:
             return "Cancelling remotely where possible and reconciling final job states."
         case .interrupted:

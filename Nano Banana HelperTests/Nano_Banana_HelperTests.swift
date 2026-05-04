@@ -780,6 +780,31 @@ struct Nano_Banana_HelperTests {
         #expect(tasks.allSatisfy { $0.variationTotal == 4 })
     }
 
+    @MainActor @Test func submissionDataKeepsAllInputPathsWhenBookmarksArePartial() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "one.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "two.png")
+        let thirdURL = try makeTemporaryFile(in: directory, named: "three.png")
+        let inputPaths = [firstURL.path, secondURL.path, thirdURL.path]
+        let batch = BatchJob(prompt: "prompt", outputDirectory: directory.path)
+        batch.tasks = [
+            ImageTask(
+                inputPaths: inputPaths,
+                inputBookmarks: [Data("invalid-bookmark".utf8)]
+            )
+        ]
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: directory.appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false
+        )
+
+        let submissionData = try #require(orchestrator.buildSubmissionDataList(for: batch).first)
+
+        #expect(submissionData.inputURLs.map(\.path) == inputPaths)
+        #expect(submissionData.inputPaths == inputPaths)
+        #expect(submissionData.securityScopedInputURLs.isEmpty)
+    }
+
     @MainActor @Test func stagingEffectiveCountsReflectImageVariations() throws {
         let directory = try makeTemporaryDirectory()
         let firstURL = try makeTemporaryFile(in: directory, named: "one.png")
@@ -1690,6 +1715,32 @@ struct Nano_Banana_HelperTests {
         orchestrator.reset()
 
         #expect(!FileManager.default.fileExists(atPath: activeBatchURL.path))
+    }
+
+    @MainActor @Test func enqueueClearsTerminalQueueBeforeStartingFreshBatch() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        let staleBatch = BatchJob(prompt: "old", outputDirectory: "/tmp")
+        let staleTask = ImageTask(inputPaths: ["/tmp/one.png", "/tmp/two.png", "/tmp/three.png"])
+        staleTask.status = "failed"
+        staleTask.phase = .failed
+        staleTask.error = "API error (400)"
+        staleBatch.tasks = [staleTask]
+
+        orchestrator.enqueue(staleBatch)
+        #expect(orchestrator.failedJobs.count == 1)
+
+        let freshBatch = BatchJob(prompt: "new", outputDirectory: "/tmp")
+        freshBatch.tasks = [ImageTask(inputPath: "/tmp/single.png")]
+
+        orchestrator.enqueue(freshBatch)
+
+        #expect(orchestrator.failedJobs.isEmpty)
+        #expect(orchestrator.pendingJobs.count == 1)
+        #expect(orchestrator.pendingJobs.first?.inputPaths == ["/tmp/single.png"])
     }
 
     @Test func clearHistoryRemovesEntriesFromGlobalCacheAndDisk() throws {

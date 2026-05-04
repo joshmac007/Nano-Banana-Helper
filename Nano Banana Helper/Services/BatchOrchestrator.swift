@@ -7,7 +7,11 @@ struct JobSubmissionData: Sendable {
     let id: UUID
     let inputURLs: [URL]       // Security-scoped URLs (already started access)
     let inputPaths: [String]
-    let hasSecurityScope: Bool // Whether we need to stop access after use
+    let securityScopedInputURLs: [URL]
+
+    func stopAccessingSecurityScopedResources() {
+        securityScopedInputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+    }
 }
 
 struct BatchSettings: Sendable {
@@ -218,6 +222,7 @@ final class BatchOrchestrator {
     }
 
     func enqueue(_ batch: BatchJob) {
+        discardTerminalQueueItemsBeforeNewBatch()
         activeBatches.append(batch)
 
         for task in batch.tasks {
@@ -236,6 +241,16 @@ final class BatchOrchestrator {
                 await start(batch: batch)
             }
         }
+    }
+
+    private func discardTerminalQueueItemsBeforeNewBatch() {
+        guard !activeBatches.isEmpty else { return }
+        guard activeBatches.allSatisfy({ $0.tasks.allSatisfy(\.isTerminal) }) else { return }
+
+        activeBatches.removeAll()
+        controlState = .idle
+        currentProgress = 0
+        statusMessage = "Ready"
     }
 
     func enqueueTextGeneration(
@@ -629,45 +644,47 @@ final class BatchOrchestrator {
         }
     }
 
-    private func buildSubmissionDataList(for batch: BatchJob) -> [JobSubmissionData] {
+    func buildSubmissionDataList(for batch: BatchJob) -> [JobSubmissionData] {
         var didRefreshInputBookmarks = false
 
         let submissionDataList: [JobSubmissionData] = batch.tasks.compactMap { job in
             guard shouldSubmit(task: job) else { return nil }
+
+            var inputURLs: [URL] = []
+            var securityScopedInputURLs: [URL] = []
+
             if let bookmarks = job.inputBookmarks, !bookmarks.isEmpty {
                 var updatedBookmarks = bookmarks
-                let resolvedBookmarks: [AppPaths.ResolvedBookmark] = bookmarks.enumerated().compactMap { item in
-                    guard let resolution = AppPaths.resolveBookmark(
-                        item.element,
+
+                for (index, path) in job.inputPaths.enumerated() {
+                    if bookmarks.indices.contains(index),
+                       let resolution = AppPaths.resolveBookmark(
+                        bookmarks[index],
                         dependencies: bookmarkDependencies
-                    ) else {
-                        return nil
+                       ) {
+                        inputURLs.append(resolution.url)
+                        securityScopedInputURLs.append(resolution.url)
+                        if let refreshedBookmark = resolution.refreshedBookmarkData {
+                            updatedBookmarks[index] = refreshedBookmark
+                        }
+                    } else {
+                        inputURLs.append(URL(fileURLWithPath: path))
                     }
-                    if let refreshedBookmark = resolution.refreshedBookmarkData {
-                        updatedBookmarks[item.offset] = refreshedBookmark
-                    }
-                    return resolution
                 }
 
                 if updatedBookmarks != bookmarks {
                     job.inputBookmarks = updatedBookmarks
                     didRefreshInputBookmarks = true
                 }
-
-                if !resolvedBookmarks.isEmpty {
-                    return JobSubmissionData(
-                        id: job.id,
-                        inputURLs: resolvedBookmarks.map(\.url),
-                        inputPaths: job.inputPaths,
-                        hasSecurityScope: true
-                    )
-                }
+            } else {
+                inputURLs = job.inputPaths.map { URL(fileURLWithPath: $0) }
             }
+
             return JobSubmissionData(
                 id: job.id,
-                inputURLs: job.inputPaths.map { URL(fileURLWithPath: $0) },
+                inputURLs: inputURLs,
                 inputPaths: job.inputPaths,
-                hasSecurityScope: false
+                securityScopedInputURLs: securityScopedInputURLs
             )
         }
 
@@ -754,9 +771,7 @@ final class BatchOrchestrator {
         do {
             if settings.useBatchTier {
                 let jobInfo = try await service.startBatchJob(request: request)
-                if data.hasSecurityScope {
-                    data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
-                }
+                data.stopAccessingSecurityScopedResources()
 
                 guard let submittedJob = task(for: data.id) else { return }
                 submittedJob.externalJobName = jobInfo.jobName
@@ -813,9 +828,7 @@ final class BatchOrchestrator {
                 updateProgress()
             } else {
                 let responses = try await service.editImages(request)
-                if data.hasSecurityScope {
-                    data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
-                }
+                data.stopAccessingSecurityScopedResources()
                 await handleSuccess(
                     jobId: data.id,
                     data: data,
@@ -825,9 +838,7 @@ final class BatchOrchestrator {
                 )
             }
         } catch {
-            if data.hasSecurityScope {
-                data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
-            }
+            data.stopAccessingSecurityScopedResources()
             await handleError(jobId: data.id, data: data, settings: settings, error: error)
         }
     }
@@ -868,7 +879,7 @@ final class BatchOrchestrator {
 
             await handleSuccess(
                 jobId: jobId,
-                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false),
+                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], securityScopedInputURLs: []),
                 settings: settings,
                 responses: [response],
                 jobName: jobName
@@ -884,7 +895,7 @@ final class BatchOrchestrator {
         } catch {
             await handleError(
                 jobId: jobId,
-                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false),
+                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], securityScopedInputURLs: []),
                 settings: settings,
                 error: error
             )
@@ -970,6 +981,9 @@ final class BatchOrchestrator {
             job.error = nil
             job.stalledAt = nil
             job.cancelRequestedAt = nil
+            if let owningBatch {
+                normalizeBatchStatus(owningBatch)
+            }
 
             if let projectId = settings.projectId {
                 let sourceBookmarks = job.inputBookmarks ?? []
@@ -1030,6 +1044,9 @@ final class BatchOrchestrator {
         job.completedAt = Date()
         job.stalledAt = nil
         job.cancelRequestedAt = nil
+        if let batch = batch(containing: jobId) {
+            normalizeBatchStatus(batch)
+        }
 
         if let projectId = settings.projectId {
             let historyEntry = makeHistoryEntry(

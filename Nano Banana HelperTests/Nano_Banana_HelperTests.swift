@@ -2566,6 +2566,53 @@ struct Nano_Banana_HelperTests {
         }
     }
 
+    @MainActor @Test func launchRecoveryFinalizesStaleCancellationRequests() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .cancelRequested
+        task.externalJobName = "batches/stuck-cancel-job"
+        task.cancelRequestedAt = Date(timeIntervalSinceNow: -(31 * 60))
+        task.error = "Cancel requested. Waiting for the final remote status."
+        batch.tasks = [task]
+        batch.status = "processing"
+        try persistQueueState(PersistedQueueState(controlState: .cancelling, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        if orchestrator.controlState != .idle {
+            Issue.record("Expected stale cancellation recovery to finish locally instead of staying cancelling")
+        }
+        if orchestrator.cancelledJobs.count != 1 {
+            Issue.record("Expected stale cancellation request to move into cancelled jobs")
+        }
+        if orchestrator.cancelledJobs.first?.error != "Cancelled locally. Remote final status was not confirmed before polling timed out." {
+            Issue.record("Expected stale cancellation to explain that final remote status was not confirmed")
+        }
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if await probe.startedCount() != 0 {
+            Issue.record("Expected launch recovery to avoid polling stale cancellation requests again")
+        }
+
+        let persisted = try loadPersistedQueueState(from: activeBatchURL)
+        if persisted.controlState != .idle {
+            Issue.record("Expected stale cancellation normalization to be persisted as idle")
+        }
+        if persisted.batches.first?.tasks.first?.status != "cancelled" {
+            Issue.record("Expected stale cancellation normalization to persist cancelled status")
+        }
+    }
+
     @MainActor @Test func launchRecoveryAutoResumesRemotePollingStates() async throws {
         let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
         let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")

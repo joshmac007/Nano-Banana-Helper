@@ -207,6 +207,7 @@ final class BatchOrchestrator {
     var onRestoreSettings: ((HistoryEntry) -> Void)?
 
     private let ambiguousSubmittingRecoveryMessage = "App closed before submission completed. Remote job id was not saved; retry manually to avoid duplicate jobs."
+    private let cancellationFinalStatusTimedOutMessage = "Cancelled locally. Remote final status was not confirmed before polling timed out."
 
     init(
         service: NanoBananaService = NanoBananaService(),
@@ -943,15 +944,15 @@ final class BatchOrchestrator {
     private func markJobAsStalled(jobId: UUID, state: String) async {
         guard let batch = batch(containing: jobId), let job = task(for: jobId) else { return }
         if job.phase == .cancelRequested || job.cancelRequestedAt != nil || controlState == .cancelling {
-            job.phase = .cancelRequested
-            job.status = "processing"
             job.lastPollState = state
             job.lastPollUpdatedAt = Date()
-            job.stalledAt = Date()
-            job.error = "Cancel requested. Waiting for the final remote status."
-            batch.status = "processing"
-            controlState = .cancelling
-            statusMessage = cancellationStatusMessage
+            finalizeLocalCancellation(
+                job: job,
+                batch: batch,
+                message: cancellationFinalStatusTimedOutMessage
+            )
+            normalizeBatchStatus(batch)
+            recomputeControlStateAfterWork()
             saveActiveBatches()
             updateProgress()
             return
@@ -1329,10 +1330,14 @@ final class BatchOrchestrator {
         }
     }
 
-    private func finalizeLocalCancellation(job: ImageTask, batch: BatchJob?) {
+    private func finalizeLocalCancellation(
+        job: ImageTask,
+        batch: BatchJob?,
+        message: String = "Cancelled by user"
+    ) {
         job.status = "cancelled"
         job.phase = .cancelled
-        job.error = "Cancelled by user"
+        job.error = message
         job.completedAt = Date()
         job.cancelRequestedAt = nil
         job.stalledAt = nil
@@ -1348,7 +1353,7 @@ final class BatchOrchestrator {
                 usedBatchTier: batch?.useBatchTier ?? false,
                 cost: 0,
                 status: "cancelled",
-                error: "Cancelled by user",
+                error: message,
                 externalJobName: job.externalJobName,
                 sourceImageBookmarks: job.inputBookmarks,
                 outputDirectoryBookmark: batch?.outputDirectoryBookmark,
@@ -1593,6 +1598,16 @@ final class BatchOrchestrator {
         30 * 60
     }
 
+    private func hasTimedOutCancellationRequest(_ task: ImageTask, now: Date) -> Bool {
+        guard !task.isTerminal,
+              task.phase == .cancelRequested,
+              let cancelRequestedAt = task.cancelRequestedAt else {
+            return false
+        }
+
+        return now.timeIntervalSince(cancelRequestedAt) >= softPollTimeout
+    }
+
     private func sendCompletionNotification() async {
         guard !isTesting && Bundle.main.bundleIdentifier != nil else { return }
 
@@ -1681,10 +1696,18 @@ final class BatchOrchestrator {
     private func normalizeLoadedQueueState(persistedControlState: QueueControlState) -> StartupRecoveryNormalizationResult {
         var didChangePersistedState = false
         var hadAmbiguousSubmittingTasks = false
+        let now = Date()
 
         for batch in activeBatches {
             for task in batch.tasks {
-                if task.phase == .submitting && task.externalJobName == nil {
+                if hasTimedOutCancellationRequest(task, now: now) {
+                    finalizeLocalCancellation(
+                        job: task,
+                        batch: batch,
+                        message: cancellationFinalStatusTimedOutMessage
+                    )
+                    didChangePersistedState = true
+                } else if task.phase == .submitting && task.externalJobName == nil {
                     task.status = "failed"
                     task.phase = .failed
                     task.error = ambiguousSubmittingRecoveryMessage

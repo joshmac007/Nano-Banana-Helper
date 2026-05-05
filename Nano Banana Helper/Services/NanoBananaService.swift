@@ -651,7 +651,7 @@ actor NanoBananaService {
         softTimeout: TimeInterval? = nil,
         shouldContinue: (@Sendable () async -> Bool)? = nil
     ) async throws -> ImageEditResponse {
-        guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
+        guard let apiKey = await getAPIKey(for: .gemini), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
         }
         
@@ -746,7 +746,7 @@ actor NanoBananaService {
         softTimeout: TimeInterval? = nil,
         shouldContinue: (@Sendable () async -> Bool)? = nil
     ) async throws -> ImageEditResponse {
-        guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
+        guard let apiKey = await getAPIKey(for: .gemini), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
         }
         return try await pollBatchJob(
@@ -971,7 +971,7 @@ actor NanoBananaService {
     // MARK: - Batch Management
     
     func cancelBatchJob(jobName: String) async throws {
-        guard let apiKey = await getAPIKey(), !apiKey.isEmpty else {
+        guard let apiKey = await getAPIKey(for: .gemini), !apiKey.isEmpty else {
             throw NanoBananaError.missingAPIKey
         }
         

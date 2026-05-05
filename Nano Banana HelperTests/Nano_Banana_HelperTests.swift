@@ -422,6 +422,50 @@ struct Nano_Banana_HelperTests {
         #expect(AppPricing.outputFallbackRate(modelName: "legacy-image-model", isBatchTier: false) == 0.039)
     }
 
+    @Test func openAIUsageCostChargesAggregateTokensWhenDetailsAreMissing() throws {
+        let usage = TokenUsage(
+            promptTokenCount: 11,
+            candidatesTokenCount: 13,
+            totalTokenCount: 24
+        )
+
+        let cost = try #require(AppPricing.usageCost(
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            tokenUsage: usage,
+            isBatchTier: false
+        ))
+
+        let expected = (11.0 * 5.0 / 1_000_000.0) + (13.0 * 30.0 / 1_000_000.0)
+        #expect(abs(cost - expected) < floatingPointTolerance)
+    }
+
+    @Test func openAIUsageCostKeepsDetailedTextAndImageSplit() throws {
+        let usage = TokenUsage(
+            promptTokenCount: 11,
+            candidatesTokenCount: 13,
+            totalTokenCount: 24,
+            promptImageTokenCount: 7,
+            promptTextTokenCount: 4,
+            candidateImageTokenCount: 10,
+            candidateTextTokenCount: 3
+        )
+
+        let cost = try #require(AppPricing.usageCost(
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            tokenUsage: usage,
+            isBatchTier: false
+        ))
+
+        let expected =
+            (7.0 * 8.0 / 1_000_000.0) +
+            (4.0 * 5.0 / 1_000_000.0) +
+            (10.0 * 30.0 / 1_000_000.0) +
+            (3.0 * 10.0 / 1_000_000.0)
+        #expect(abs(cost - expected) < floatingPointTolerance)
+    }
+
     @Test func imageSizeCostCalculationsUseSelectedModelRates() {
         let proImageCost = ImageSize.calculateCost(
             imageSize: "2K",

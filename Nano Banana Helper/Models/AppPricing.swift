@@ -157,8 +157,16 @@ struct AppPricing {
             }
 
             let inputImageTokens = Double(tokenUsage.promptImageTokenCount ?? 0)
-            let inputTextTokens = Double(tokenUsage.promptTextTokenCount ?? 0)
-            let outputImageTokens = Double(tokenUsage.candidateImageTokenCount ?? 0)
+            let inputTextTokens = Double(
+                tokenUsage.promptImageTokenCount == nil && tokenUsage.promptTextTokenCount == nil
+                    ? tokenUsage.promptTokenCount
+                    : tokenUsage.promptTextTokenCount ?? 0
+            )
+            let outputImageTokens = Double(
+                tokenUsage.candidateImageTokenCount == nil && tokenUsage.candidateTextTokenCount == nil
+                    ? tokenUsage.candidatesTokenCount
+                    : tokenUsage.candidateImageTokenCount ?? 0
+            )
             let outputTextTokens = Double(tokenUsage.candidateTextTokenCount ?? 0)
 
             let standardCost =

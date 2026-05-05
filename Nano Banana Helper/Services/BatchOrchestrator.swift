@@ -55,6 +55,7 @@ struct PersistedResponseBatch: Sendable {
     let outputDirectoryBookmark: Data?
     let totalCost: Double
     let totalTokenUsage: TokenUsage?
+    let usedRecoveryDirectory: Bool
 }
 
 struct PersistedQueueState: Codable {
@@ -187,6 +188,7 @@ final class BatchOrchestrator {
     private let service: NanoBananaService
     private let concurrencyLimit = 5
     private let activeBatchURL: URL
+    private let recoveredOutputsDirectoryURL: URL
     private let bookmarkDependencies: AppPaths.BookmarkResolutionDependencies
     private let autoStartEnqueuedBatches: Bool
     private let processQueueOverride: ProcessQueueOverride?
@@ -209,12 +211,14 @@ final class BatchOrchestrator {
     init(
         service: NanoBananaService = NanoBananaService(),
         activeBatchURL: URL? = nil,
+        recoveredOutputsDirectoryURL: URL? = nil,
         bookmarkDependencies: AppPaths.BookmarkResolutionDependencies? = nil,
         autoStartEnqueuedBatches: Bool = true,
         processQueueOverride: ProcessQueueOverride? = nil
     ) {
         self.service = service
         self.activeBatchURL = activeBatchURL ?? AppPaths.activeBatchURL
+        self.recoveredOutputsDirectoryURL = recoveredOutputsDirectoryURL ?? AppPaths.recoveredOutputsDirectoryURL
         self.bookmarkDependencies = bookmarkDependencies ?? .live
         self.autoStartEnqueuedBatches = autoStartEnqueuedBatches
         self.processQueueOverride = processQueueOverride
@@ -546,6 +550,27 @@ final class BatchOrchestrator {
 
     func resumeInterruptedJobs() async {
         await startAll()
+    }
+
+    func resumeIssueTask(_ task: ImageTask) {
+        resumeIssueTask(id: task.id)
+    }
+
+    func resumeIssueTask(id taskId: UUID) {
+        guard let batch = batch(containing: taskId), let job = task(for: taskId) else {
+            LogManager.shared.log(.error, payload: "Queue resume ignored: task \(taskId.uuidString) is no longer in the active queue.")
+            return
+        }
+
+        guard let jobName = job.externalJobName else {
+            LogManager.shared.log(.error, payload: "Queue resume ignored: task \(taskId.uuidString) has no remote batch job id.")
+            return
+        }
+
+        rearmRemoteJobForPolling(job, in: batch, jobName: jobName, source: "queue issue")
+        Task {
+            await self.startAll()
+        }
     }
 
     private func processQueue(batch: BatchJob) async {
@@ -978,7 +1003,9 @@ final class BatchOrchestrator {
             job.phase = .completed
             job.outputPath = persisted.outputs.first?.outputURL.path
             job.completedAt = Date()
-            job.error = nil
+            job.error = persisted.usedRecoveryDirectory
+                ? "Output folder could not be accessed. Saved to the recovery folder instead."
+                : nil
             job.stalledAt = nil
             job.cancelRequestedAt = nil
             if let owningBatch {
@@ -987,7 +1014,9 @@ final class BatchOrchestrator {
 
             if let projectId = settings.projectId {
                 let sourceBookmarks = job.inputBookmarks ?? []
-                let outputDirectoryBookmark = persisted.outputDirectoryBookmark ?? settings.outputDirectoryBookmark
+                let outputDirectoryBookmark = persisted.usedRecoveryDirectory
+                    ? nil
+                    : (persisted.outputDirectoryBookmark ?? settings.outputDirectoryBookmark)
                 for output in persisted.outputs {
                     let historyEntry = makeHistoryEntry(
                         projectId: projectId,
@@ -1156,29 +1185,43 @@ final class BatchOrchestrator {
         ) ?? settings.cost(inputCount: job.inputPaths.count)
         let costShares = splitTotalCost(totalCost, across: responses.count)
 
-        let writeResult = try withAccessibleOutputDirectory(
-            path: settings.outputDirectory,
-            bookmark: settings.outputDirectoryBookmark
-        ) { directoryURL in
-            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        let writeResult: (value: (outputURLs: [URL], directoryBookmark: Data?), refreshedBookmark: Data?)
+        let usedRecoveryDirectory: Bool
 
-            let outputURLs = try responses.enumerated().map { index, response in
-                let outputURL = generateOutputURL(
+        do {
+            writeResult = try withAccessibleOutputDirectory(
+                path: settings.outputDirectory,
+                bookmark: settings.outputDirectoryBookmark
+            ) { directoryURL in
+                try writeResponses(
+                    responses,
                     for: job,
-                    in: directoryURL,
-                    mimeType: response.mimeType,
-                    outputIndex: responses.count > 1 ? index + 1 : nil,
-                    outputCount: responses.count
+                    in: directoryURL
                 )
-                try response.imageData.write(to: outputURL)
-                return outputURL
             }
-
-            return (outputURLs: outputURLs, directoryBookmark: AppPaths.bookmark(for: directoryURL))
+            usedRecoveryDirectory = false
+        } catch {
+            LogManager.shared.log(
+                .error,
+                payload: "Primary output write failed for task \(job.id.uuidString): \(error.localizedDescription). Saving returned image data to recovery folder."
+            )
+            let recovered = try writeResponses(
+                responses,
+                for: job,
+                in: recoveredOutputsDirectoryURL
+            )
+            writeResult = (value: recovered, refreshedBookmark: nil)
+            usedRecoveryDirectory = true
+            LogManager.shared.log(
+                .response,
+                payload: "Recovered \(responses.count) output image(s) for task \(job.id.uuidString) in \(recoveredOutputsDirectoryURL.path)."
+            )
         }
 
-        let outputDirectoryBookmark = writeResult.refreshedBookmark ?? writeResult.value.directoryBookmark
-        if let outputDirectoryBookmark, let batchId = owningBatchId {
+        let outputDirectoryBookmark = usedRecoveryDirectory
+            ? nil
+            : (writeResult.refreshedBookmark ?? writeResult.value.directoryBookmark)
+        if !usedRecoveryDirectory, let outputDirectoryBookmark, let batchId = owningBatchId {
             updateOutputBookmark(outputDirectoryBookmark, for: batchId)
             onOutputDirectoryBookmarkRefreshed?(settings.projectId, settings.outputDirectory, outputDirectoryBookmark)
         }
@@ -1196,8 +1239,31 @@ final class BatchOrchestrator {
             outputs: outputs,
             outputDirectoryBookmark: outputDirectoryBookmark,
             totalCost: totalCost,
-            totalTokenUsage: totalTokenUsage
+            totalTokenUsage: totalTokenUsage,
+            usedRecoveryDirectory: usedRecoveryDirectory
         )
+    }
+
+    private func writeResponses(
+        _ responses: [ImageEditResponse],
+        for job: ImageTask,
+        in directoryURL: URL
+    ) throws -> (outputURLs: [URL], directoryBookmark: Data?) {
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+
+        let outputURLs = try responses.enumerated().map { index, response in
+            let outputURL = generateOutputURL(
+                for: job,
+                in: directoryURL,
+                mimeType: response.mimeType,
+                outputIndex: responses.count > 1 ? index + 1 : nil,
+                outputCount: responses.count
+            )
+            try response.imageData.write(to: outputURL)
+            return outputURL
+        }
+
+        return (outputURLs: outputURLs, directoryBookmark: AppPaths.bookmark(for: directoryURL))
     }
 
     private func splitTotalCost(_ totalCost: Double, across outputCount: Int) -> [Double] {
@@ -1722,7 +1788,13 @@ final class BatchOrchestrator {
     func resumePollingFromHistory(for entry: HistoryEntry) {
         guard let jobName = entry.externalJobName else { return }
 
-        if activeBatches.contains(where: { $0.tasks.contains(where: { $0.externalJobName == jobName }) }) {
+        if let existingBatch = activeBatches.first(where: { $0.tasks.contains(where: { $0.externalJobName == jobName }) }),
+           let existingTask = existingBatch.tasks.first(where: { $0.externalJobName == jobName }) {
+            if existingTask.isIssue {
+                rearmRemoteJobForPolling(existingTask, in: existingBatch, jobName: jobName, source: "history")
+            } else {
+                LogManager.shared.log(.request, payload: "Resume polling requested for existing active job \(jobName).")
+            }
             Task {
                 await self.startAll()
             }
@@ -1775,10 +1847,27 @@ final class BatchOrchestrator {
 
         enqueue(batch)
         statusMessage = "Resuming job from history..."
+        LogManager.shared.log(.request, payload: "Resume polling enqueued recovered history job \(jobName).")
 
         Task {
             await self.startAll()
         }
+    }
+
+    private func rearmRemoteJobForPolling(_ job: ImageTask, in batch: BatchJob, jobName: String, source: String) {
+        job.status = "processing"
+        job.phase = .pausedLocal
+        job.error = "Resuming remote job. Reconciling final status."
+        job.completedAt = nil
+        job.stalledAt = nil
+        job.cancelRequestedAt = nil
+        job.lastPollUpdatedAt = Date()
+        batch.status = "pending"
+        controlState = .interrupted
+        statusMessage = "Resuming remote job..."
+        saveActiveBatches()
+        updateProgress()
+        LogManager.shared.log(.request, payload: "Resume polling re-armed \(source) job \(jobName) for task \(job.id.uuidString).")
     }
 
     private func withAccessibleOutputDirectory<T>(

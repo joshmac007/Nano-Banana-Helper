@@ -39,7 +39,7 @@ struct StagingView: View {
                     }
                 }
                 DispatchQueue.main.async {
-                    stagingManager.addFiles(urls)
+                    stagingManager.addFiles(urls, bookmarks: makeBookmarks(for: urls))
                 }
             }
             return true
@@ -50,21 +50,19 @@ struct StagingView: View {
             allowsMultipleSelection: true
         ) { result in
             if case .success(let urls) = result {
-                // Create security-scoped bookmarks for each URL so we can
-                // access the files later when the batch job runs.
-                var bookmarks: [URL: Data] = [:]
-                for url in urls {
-                    let didStart = url.startAccessingSecurityScopedResource()
-                    if let bookmark = AppPaths.bookmark(for: url) {
-                        bookmarks[url] = bookmark
-                    }
-                    if didStart {
-                        url.stopAccessingSecurityScopedResource()
-                    }
-                }
-                stagingManager.addFiles(urls, bookmarks: bookmarks)
+                stagingManager.addFiles(urls, bookmarks: makeBookmarks(for: urls))
             }
         }
+    }
+
+    private func makeBookmarks(for urls: [URL]) -> [URL: Data] {
+        var bookmarks: [URL: Data] = [:]
+        for url in urls {
+            if let bookmark = AppPaths.bookmark(for: url) {
+                bookmarks[url] = bookmark
+            }
+        }
+        return bookmarks
     }
     
     // MARK: - Image Mode View
@@ -78,7 +76,10 @@ struct StagingView: View {
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 200), spacing: 16)], spacing: 16) {
                     ForEach(stagingManager.stagedFiles, id: \.self) { url in
-                        StagedImageCell(url: url) {
+                        StagedImageCell(
+                            url: url,
+                            bookmark: stagingManager.bookmark(for: url)
+                        ) {
                             stagingManager.removeFile(url)
                         }
                         .onDrag {
@@ -225,15 +226,18 @@ private struct StagedImageDropDelegate: DropDelegate {
 
 struct StagedImageCell: View {
     let url: URL
+    let bookmark: Data?
     let onDelete: () -> Void
     
     // Load synchronously — AsyncImage uses URLSession which can't access
     // security-scoped sandbox URLs after stopAccessingSecurityScopedResource.
     private var thumbnail: NSImage? {
-        // Try direct load first (works for drag-and-drop and accessible paths)
-        if let img = NSImage(contentsOfFile: url.path) { return img }
-        // Try resolving via bookmark if stored in BatchStagingManager
-        return nil
+        switch AppPaths.loadImageData(bookmark: bookmark, fallbackPath: url.path) {
+        case let .success(data, _), let .fallbackUsed(data):
+            return NSImage(data: data)
+        case .accessDenied:
+            return nil
+        }
     }
     
     var body: some View {

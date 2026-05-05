@@ -36,6 +36,7 @@ BUILD_OUTPUT=$(xcodebuild \
     -project "$PROJECT_NAME.xcodeproj" \
     -scheme "$SCHEME" \
     -configuration Release \
+    -derivedDataPath "$DERIVED_DATA_DIR" \
     DEVELOPMENT_TEAM="$TEAM" \
     MACOSX_DEPLOYMENT_TARGET=26.2 \
     CODE_SIGNING_ALLOWED=NO \

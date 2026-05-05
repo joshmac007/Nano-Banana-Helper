@@ -53,6 +53,14 @@ struct AppPaths {
     static var activeBatchURL: URL {
         appSupportURL.appendingPathComponent("active_batch.json")
     }
+
+    /// App-controlled fallback for generated images that were returned by the API
+    /// but could not be written to the selected output folder.
+    static var recoveredOutputsDirectoryURL: URL {
+        let url = appSupportURL.appendingPathComponent("Recovered Outputs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
     
     /// Subdirectory for individual project data
     static var projectsDirectoryURL: URL {
@@ -107,6 +115,13 @@ struct AppPaths {
     
     /// Create a security scoped bookmark for a URL
     static func bookmark(for url: URL) -> Data? {
+        let didStart = url.startAccessingSecurityScopedResource()
+        defer {
+            if didStart {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
         do {
             let data = try url.bookmarkData(
                 options: .withSecurityScope,

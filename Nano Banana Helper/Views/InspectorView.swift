@@ -423,12 +423,57 @@ struct InspectorView: View {
 
     private func startBatch() {
         guard let project = projectManager.currentProject else { return }
+        guard ensureOutputDirectoryAccess(for: project) else { return }
 
         switch stagingManager.generationMode {
         case .image:
             startImageBatch(project: project)
         case .text:
             startTextBatch(project: project)
+        }
+    }
+
+    private func ensureOutputDirectoryAccess(for project: Project) -> Bool {
+        let fallbackPath = project.outputDirectory == AppPaths.defaultOutputDirectory.path
+            ? project.outputDirectory
+            : ""
+        var capturedError: Error?
+
+        let result = AppPaths.withAccessibleURL(
+            bookmark: project.outputDirectoryBookmark,
+            fallbackPath: fallbackPath
+        ) { directoryURL in
+            do {
+                try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+                let probeURL = directoryURL.appendingPathComponent(".nano-banana-write-test-\(UUID().uuidString)")
+                try Data().write(to: probeURL)
+                try? FileManager.default.removeItem(at: probeURL)
+                return true
+            } catch {
+                capturedError = error
+                return nil
+            }
+        }
+
+        switch result {
+        case let .success(_, refreshedBookmark):
+            if let refreshedBookmark {
+                project.outputDirectoryBookmark = refreshedBookmark
+                projectManager.saveProjects()
+            }
+            return true
+        case .fallbackUsed:
+            return true
+        case .accessDenied:
+            if let capturedError {
+                print("Output directory access denied before generation: \(capturedError.localizedDescription)")
+            }
+            BookmarkReauthorization.reauthorizeOutputFolder(
+                for: project,
+                projectManager: projectManager,
+                historyManager: historyManager
+            )
+            return false
         }
     }
 

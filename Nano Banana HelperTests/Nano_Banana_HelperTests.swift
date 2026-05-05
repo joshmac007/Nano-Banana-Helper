@@ -2182,6 +2182,60 @@ struct Nano_Banana_HelperTests {
         #expect(persistedState.batches.first?.modelName == nil)
     }
 
+    @MainActor @Test func resumePollingFromHistoryRearmsExistingFailedRemoteJob() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let jobName = "batches/permission-recovery-job"
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { _ in }
+        )
+        let projectId = UUID()
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: "/tmp",
+            useBatchTier: true,
+            projectId: projectId
+        )
+        let task = ImageTask(inputPaths: ["/tmp/input.png"], projectId: projectId)
+        task.status = "failed"
+        task.phase = .failed
+        task.error = "The file couldn't be saved because you don't have permission."
+        task.externalJobName = jobName
+        batch.tasks = [task]
+        LogManager.shared.clear()
+
+        orchestrator.enqueue(batch)
+        let entry = HistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: ["/tmp/input.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "16:9",
+            imageSize: "2K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            error: task.error,
+            externalJobName: jobName
+        )
+
+        orchestrator.resumePollingFromHistory(for: entry)
+
+        #expect(orchestrator.failedJobs.isEmpty)
+        let resumedTask = try #require(orchestrator.processingJobs.first)
+        #expect(resumedTask.externalJobName == jobName)
+        #expect(resumedTask.phase == .pausedLocal)
+        #expect(resumedTask.error == "Resuming remote job. Reconciling final status.")
+        #expect(LogManager.shared.entries.contains { $0.payload.contains(jobName) })
+
+        let persistedState = try loadPersistedQueueState(from: activeBatchURL)
+        let persistedTask = try #require(persistedState.batches.first?.tasks.first)
+        #expect(persistedTask.status == "processing")
+        #expect(persistedTask.phase == .pausedLocal)
+        #expect(persistedTask.externalJobName == jobName)
+    }
+
     @MainActor @Test func cancelHandlesSubmittingPhaseTasks() throws {
         let orchestrator = BatchOrchestrator(
             activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
@@ -2936,6 +2990,54 @@ struct Nano_Banana_HelperTests {
         #expect(abs(persisted.outputs.reduce(0) { $0 + $1.cost } - persisted.totalCost) < floatingPointTolerance)
         #expect(persisted.outputs[0].tokenUsage?.totalTokenCount == 24)
         #expect(persisted.outputs[1].tokenUsage == nil)
+    }
+
+    @MainActor @Test func persistResponsesFallsBackToRecoveryDirectoryWhenOutputAccessIsDenied() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "input.png", contents: makeTransparentPNGData())
+        let outputURL = directory.appendingPathComponent("Desktop Project", isDirectory: true)
+        let recoveryURL = directory.appendingPathComponent("Recovered Outputs", isDirectory: true)
+        let deniedBookmark = Data("denied-output-bookmark".utf8)
+        let dependencies = AppPaths.BookmarkResolutionDependencies(
+            resolveURL: { data in
+                #expect(data == deniedBookmark)
+                return (outputURL, false)
+            },
+            refreshBookmarkData: { _ in Data("refreshed".utf8) },
+            startAccessing: { _ in false },
+            stopAccessing: { _ in }
+        )
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: directory.appendingPathComponent("active_batch.json"),
+            recoveredOutputsDirectoryURL: recoveryURL,
+            bookmarkDependencies: dependencies,
+            autoStartEnqueuedBatches: false
+        )
+        let settings = makeBatchSettings(
+            outputDirectory: outputURL.path,
+            outputDirectoryBookmark: deniedBookmark,
+            projectId: UUID()
+        )
+        let job = ImageTask(inputPath: sourceURL.path, projectId: settings.projectId, provider: .openAI)
+        let response = ImageEditResponse(
+            imageData: Data("rescued-image".utf8),
+            mimeType: "image/png",
+            tokenUsage: nil
+        )
+
+        let persisted = try orchestrator.persistResponses(
+            [response],
+            for: job,
+            settings: settings,
+            resolvedModelName: "gpt-image-2",
+            owningBatchId: nil
+        )
+
+        let recoveredOutput = try #require(persisted.outputs.first?.outputURL)
+        #expect(persisted.usedRecoveryDirectory)
+        #expect(persisted.outputDirectoryBookmark == nil)
+        #expect(recoveredOutput.path.hasPrefix(recoveryURL.path))
+        #expect(try Data(contentsOf: recoveredOutput) == Data("rescued-image".utf8))
     }
 
     @Test func openAIOutputSizeRejectsExtremeAspectRatios() {

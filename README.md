@@ -1,37 +1,41 @@
-# Nano Banana Helper 🍌
+# Nano Banana Helper
 
-Nano Banana Helper is a powerful macOS application for batch processing image edits using Google's generative AI (Gemini). It allows users to orchestrate complex image transformation workflows, manage costs, and organize projects efficiently.
+Nano Banana Helper is a macOS workbench for high-throughput image generation and editing with Gemini and OpenAI. It helps stage image jobs, run standard or provider-side Batch Tier workflows, track costs, recover returned outputs, and organize work by project.
 
 ![MainScreen](https://github.com/joshmac007/Nano-Banana-Helper/blob/main/MainScreen.jpeg)
 
 ![Latest Release](https://img.shields.io/github/v/release/joshmac007/Nano-Banana-Helper?color=success&label=Release)
-![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)
+![Version](https://img.shields.io/badge/version-2.0-blue.svg)
 ![Swift 6.0](https://img.shields.io/badge/Swift-6.0-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
 ## Features
 
-### 🚀 Core Capabilities
+### Core Capabilities
 - **Batch Orchestration**: Process hundreds of images concurrently with robust queue management, including pause, resume, and cancel capabilities.
-- **Smart Staging**: Drag and drop support for individual images or entire directories.
-- **Text-to-Image**: Generate images from text prompts without input images. Create 1-4 variations per request.
+- **Provider Selection**: Switch between Gemini and OpenAI in Settings, with separate API keys and model defaults for each provider.
+- **Smart Staging**: Drag and drop support for individual images, masks, or entire directories.
+- **Text-to-Image**: Generate images from text prompts without input images. Create 1-4 queued generations per run, with OpenAI able to return up to 4 images per request.
 - **Multi-Input Mode**: Merge multiple input images into a single output using advanced prompt instructions.
-- **Cost Estimation**: Real-time cost calculation based on image size, count, and selected model tier.
+- **Cost Estimation**: Real-time cost calculation based on provider, image size, count, token usage, and selected model tier.
 - **Usage Analytics**: Track token usage and estimated spend over time using rich dashboard charts, filtering by session, models, or specific time ranges.
-- **Model Selection**: Choose between Nano Banana 2 (fastest), Nano Banana (stable), or Nano Banana Pro (highest quality) in Settings.
+- **Model Selection**: Choose Gemini image models or OpenAI GPT Image 2 in Settings.
 
-### 🛠️ Advanced Tools
+### Advanced Tools
 - **Inspector Panel**: 
   - Fine-tune aspect ratios including panoramic (4:1, 8:1) and vertical (1:4, 1:8) formats.
   - Select output resolution (512, 1K, 2K, 4K).
-  - Toggle **Batch Tier** for 50% cost savings on non-urgent jobs.
+  - Toggle **Batch Tier** for provider-side asynchronous processing on non-urgent jobs.
+  - Configure OpenAI output format, background, input fidelity, compression, and images per request.
 - **Prompt Library**: Save and reuse your most effective prompt templates.
 - **History Tracking**: Comprehensive log of all jobs with parameters, costs, and status. Resumable workflows from history.
+- **Result Details**: Review generated outputs with prompt metadata, system prompts, model details, output ratio, size, and tier context.
 
-### 🏗️ Project Management
+### Project Management
 - **Project Gallery**: Organize work into distinct projects with isolated output directories.
 - **Auto-Saving**: Active batches and application state are automatically preserved.
+- **Recovered Outputs**: Returned provider images are saved into an app-managed recovery folder if the selected output folder cannot be accessed.
 
 ## Technology Stack
 
@@ -45,15 +49,16 @@ Nano Banana Helper is a powerful macOS application for batch processing image ed
 
 - macOS 14.0 (Sonoma) or later
 - Xcode 15.0+ (for building from source)
-- A Google Cloud Project with Vertex AI / Gemini API access
+- A Gemini API key, an OpenAI API key, or both
 
-## Supported Models
+## Supported Providers and Models
 
-| Model | Display Name | Best For |
-|-------|--------------|----------|
-| `gemini-3.1-flash-image-preview` | Nano Banana 2 | Speed, high-volume workflows (default) |
-| `gemini-2.5-flash-image-preview` | Nano Banana | Stable, reliable image generation |
-| `gemini-3-pro-image-preview` | Nano Banana Pro | Complex, multi-turn image editing |
+| Provider | Model | Display Name | Best For |
+|----------|-------|--------------|----------|
+| Gemini | `gemini-3.1-flash-image-preview` | Nano Banana 2 | Speed, high-volume workflows (default Gemini option) |
+| Gemini | `gemini-3-pro-image-preview` | Nano Banana Pro | Complex, high-quality image editing |
+| Gemini | `gemini-2.5-flash-image` | Nano Banana | Legacy/stable Gemini workflows |
+| OpenAI | `gpt-image-2` | GPT Image 2 | OpenAI generation, edits, masks, and Batch Tier |
 
 ## Installation
 
@@ -83,25 +88,28 @@ The easiest way to install Nano Banana Helper is to download the compiled versio
 
 ## Usage Guide
 
-1. **Setup API Key**: On first launch, go to **Settings** (`Cmd+,`) and enter your Gemini API Key.
-2. **Select Model** (optional): In Settings, choose your preferred image generation model.
-3. **Create a Project**: Use the "+" button in the gallery to start a new workspace.
+1. **Setup Provider**: On first launch, go to **Settings** (`Cmd+,`) and choose Gemini or OpenAI.
+2. **Add API Key**: Enter the API key for the selected provider. You can store separate Gemini and OpenAI keys.
+3. **Select Model** (optional): In Settings, choose your preferred image generation model for the active provider.
+4. **Create a Project**: Use the "+" button in the gallery to start a new workspace.
 
 ### Image Mode (Edit Existing Images)
-4. **Stage Images**: Drag images onto the "Drop Zone" in the Workbench.
-5. **Configure**: 
+5. **Stage Images**: Drag images onto the "Drop Zone" in the Workbench. OpenAI workflows can also use a mask image.
+6. **Configure**:
    - Enter your prompt in the Inspector.
    - Choose your desired resolution and aspect ratio.
-   - Enable "Batch Tier" if speed is not critical to save costs.
-6. **Execute**: Click **Start Batch**. Monitor progress in the "Results" tab.
+   - Enable "Batch Tier" if speed is not critical.
+   - For OpenAI, expand **Advanced** to set format, background, fidelity, compression, or images per request.
+7. **Execute**: Click **Start Batch**. Monitor progress in the "Results" tab.
 
 ### Text Mode (Generate from Scratch)
-4. **Select Text Mode**: Click "Text" in the Inspector header mode toggle.
-5. **Configure**: 
+5. **Select Text Mode**: Click "Text" in the Inspector header mode toggle.
+6. **Configure**:
    - Enter your prompt in the Inspector (be descriptive about style, mood, composition).
    - Set the number of variations (1-4 images).
    - Choose resolution and aspect ratio.
-6. **Execute**: Click **Generate Images**. Monitor progress in the "Results" tab.
+   - For OpenAI, optionally request up to 4 images per API call from **Advanced**.
+7. **Execute**: Click **Generate Images**. Monitor progress in the "Results" tab.
 
 ## Contributing
 

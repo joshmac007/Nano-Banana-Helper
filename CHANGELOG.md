@@ -2,6 +2,36 @@
 
 All notable changes to Nano Banana Helper will be documented in this file.
 
+## [2.0] - 2026-05-06
+
+### Added
+- **OpenAI Provider Support**: Settings now supports Gemini and OpenAI as first-class providers, with separate API keys, model selection, documentation links, and provider-aware defaults.
+- **GPT Image 2 Workflows**: Added OpenAI `gpt-image-2` support for text-to-image generation and image editing, including masking, multi-input edits, and up to 4 images per request.
+- **OpenAI Advanced Controls**: The Inspector now exposes OpenAI-specific output controls for PNG/JPEG/WebP format, transparent or opaque backgrounds where supported, input fidelity, output compression, and images per request.
+- **OpenAI Batch Tier**: Batch Tier now works for OpenAI through the OpenAI Batch API, with remote batch/request tracking, partial-success handling, result replay protection, cancellation, and history/project-gallery resume support.
+- **Recovered Outputs Folder**: If the selected output directory cannot be accessed when provider images return, the app now saves returned outputs into an app-managed `Recovered Outputs` folder instead of losing them.
+- **Generation Detail Viewer**: Results now include a refreshed detail popup with full-resolution viewing, prompt/system-prompt metadata, model details, ratio, size, and tier context.
+
+### Changed
+- **Provider-Aware Pricing**: Pricing now supports both Gemini per-image rates and OpenAI token-based usage. OpenAI projected costs are marked approximate until provider usage details are returned.
+- **Model Catalog**: Bundled model defaults now include Gemini image models plus GPT Image 2, with legacy Gemini selections preserved but marked as non-selectable when needed.
+- **Queue State Model**: Local queue records now persist provider, remote batch ID, remote request ID, remote provider, OpenAI advanced parameters, and cancellation timestamps for more reliable recovery.
+- **Cancellation UX**: Cancelled, cancelling, stalled, and expired jobs now have clearer queue states and status messages while remote cancellation is being reconciled.
+- **README**: Installation, setup, provider, model, and usage documentation now reflect the v2 multi-provider workflow.
+
+### Fixed
+- **OpenAI Batch Replay**: OpenAI batch result files are now scoped to the expected remote request IDs so replaying a batch result does not duplicate already-terminal local jobs.
+- **OpenAI Resume from History**: Failed or stale OpenAI remote batches can now be resumed from History and Project Gallery using persisted remote batch/request IDs.
+- **Timed-Out Cancellation Recovery**: Launch-time recovery now finalizes stuck cancellation rows instead of leaving old local jobs in ambiguous processing states.
+- **Gemini Batch Auth**: Gemini batch polling and cancellation continue to use the Gemini API key path after provider configuration became multi-provider.
+- **OpenAI Usage Pricing**: OpenAI usage cost calculation now uses returned token usage details, including image/text token splits when present.
+- **Output Directory Access**: Security-scoped output access is retried/refreshed where possible, and returned bytes are preserved through recovery output writes when the primary folder fails.
+
+### Technical
+- Added focused regression coverage for provider pricing, OpenAI response parsing, OpenAI Batch Tier submission/polling, remote resume, cancellation finalization, recovered output writes, and results metadata behavior.
+- Added `CONTEXT.md` language for the local queue, provider Batch Tier, OpenAI remote batches, remote request IDs, partial batch success, and images per request.
+- Updated version metadata to `2.0`.
+
 ## [1.4.2] - 2026-04-12
 
 ### Added

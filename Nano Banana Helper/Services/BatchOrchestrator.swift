@@ -445,7 +445,7 @@ final class BatchOrchestrator {
         saveActiveBatches()
         updateProgress()
 
-        if activeBatches.contains(where: { $0.tasks.contains(where: { $0.status == "processing" && ($0.externalJobName != nil || $0.phase == .submitting) }) }) {
+        if activeBatches.contains(where: { $0.tasks.contains(where: { $0.status == "processing" && ($0.hasRemoteJob || $0.phase == .submitting) }) }) {
             Task {
                 await self.startAll()
             }
@@ -458,10 +458,15 @@ final class BatchOrchestrator {
     }
 
     func cancel(batch: BatchJob) {
+        if batch.provider == .openAI && batch.useBatchTier {
+            cancelOpenAIBatch(batch: batch)
+            return
+        }
+
         batch.status = "processing"
 
         for job in batch.tasks where !job.isTerminal {
-            if job.status == "pending", job.externalJobName == nil, job.phase != .submitting {
+            if job.status == "pending", !job.hasRemoteJob, job.phase != .submitting {
                 finalizeLocalCancellation(job: job, batch: batch)
                 continue
             }
@@ -476,6 +481,39 @@ final class BatchOrchestrator {
                 Task {
                     try? await self.service.cancelBatchJob(jobName: jobName)
                 }
+            }
+        }
+
+        normalizeBatchStatus(batch)
+        statusMessage = cancellationStatusMessage
+        saveActiveBatches()
+        updateProgress()
+    }
+
+    private func cancelOpenAIBatch(batch: BatchJob) {
+        batch.status = "processing"
+        var remoteBatchIDs = Set<String>()
+
+        for job in batch.tasks where !job.isTerminal {
+            if job.status == "pending", !job.hasRemoteJob, job.phase != .submitting {
+                finalizeLocalCancellation(job: job, batch: batch)
+                continue
+            }
+
+            job.status = "processing"
+            job.phase = .cancelRequested
+            job.cancelRequestedAt = job.cancelRequestedAt ?? Date()
+            job.error = "Cancel requested. Waiting for final status."
+            job.stalledAt = nil
+
+            if let remoteBatchId = job.remoteBatchId {
+                remoteBatchIDs.insert(remoteBatchId)
+            }
+        }
+
+        for remoteBatchID in remoteBatchIDs {
+            Task {
+                try? await self.service.cancelOpenAIBatch(batchID: remoteBatchID)
             }
         }
 
@@ -563,12 +601,12 @@ final class BatchOrchestrator {
             return
         }
 
-        guard let jobName = job.externalJobName else {
+        guard let remoteJobID = job.remoteJobIdForDisplay else {
             LogManager.shared.log(.error, payload: "Queue resume ignored: task \(taskId.uuidString) has no remote batch job id.")
             return
         }
 
-        rearmRemoteJobForPolling(job, in: batch, jobName: jobName, source: "queue issue")
+        rearmRemoteJobForPolling(job, in: batch, jobIdentifier: remoteJobID, source: "queue issue")
         Task {
             await self.startAll()
         }
@@ -594,6 +632,11 @@ final class BatchOrchestrator {
             openAIOutputCompression: batch.openAIOutputCompression,
             openAINCount: batch.openAINCount
         )
+
+        if batch.provider == .openAI && batch.useBatchTier {
+            await processOpenAIBatchQueue(batch: batch, settings: batchSettings)
+            return
+        }
 
         if controlState != .cancelling {
             let submissionDataList = buildSubmissionDataList(for: batch)
@@ -638,6 +681,47 @@ final class BatchOrchestrator {
         }
     }
 
+    private func processOpenAIBatchQueue(batch: BatchJob, settings: BatchSettings) async {
+        if controlState != .cancelling {
+            let submissionDataList = buildSubmissionDataList(for: batch)
+            if !submissionDataList.isEmpty {
+                statusMessage = "Submitting \(submissionDataList.count) OpenAI batch requests..."
+                await submitOpenAIBatch(submissionDataList, in: batch, settings: settings)
+            }
+        }
+
+        if controlState == .pausedLocal {
+            applyPausedStateToBatch(batch)
+            return
+        }
+
+        let remoteBatchIDs = Set(
+            batch.tasks.compactMap { task -> String? in
+                guard shouldPollOpenAIBatch(task: task) else { return nil }
+                return task.remoteBatchId
+            }
+        )
+
+        if !remoteBatchIDs.isEmpty {
+            statusMessage = controlState == .cancelling ? "Reconciling OpenAI batch cancellation..." : "Polling OpenAI batch..."
+            for remoteBatchID in remoteBatchIDs {
+                await performOpenAIBatchPoll(remoteBatchID: remoteBatchID, batch: batch, settings: settings)
+            }
+        }
+
+        normalizeBatchStatus(batch)
+        if batch.status == "completed" {
+            let count = batch.tasks.filter { $0.status == "completed" }.count
+            statusMessage = "Completed: \(count) output images"
+            await sendCompletionNotification()
+        } else if batch.status == "failed" {
+            statusMessage = "Completed with issues"
+            await sendCompletionNotification()
+        } else if batch.status == "cancelled" {
+            statusMessage = "Cancellation complete"
+        }
+    }
+
     private func runSubmissions(_ submissionDataList: [JobSubmissionData], settings: BatchSettings) async {
         await withTaskGroup(of: Void.self) { group in
             var iterator = submissionDataList.makeIterator()
@@ -666,6 +750,225 @@ final class BatchOrchestrator {
                     }
                     break
                 }
+            }
+        }
+    }
+
+    private func submitOpenAIBatch(_ submissionDataList: [JobSubmissionData], in batch: BatchJob, settings: BatchSettings) async {
+        let resolvedMaskBookmark = settings.maskImageBookmark.flatMap {
+            AppPaths.resolveBookmark($0, dependencies: bookmarkDependencies)
+        }
+        if let refreshedMaskBookmark = resolvedMaskBookmark?.refreshedBookmarkData {
+            batch.maskImageBookmark = refreshedMaskBookmark
+            for data in submissionDataList {
+                task(for: data.id)?.maskImageBookmark = refreshedMaskBookmark
+            }
+            saveActiveBatches()
+        }
+        let maskImageURL = resolvedMaskBookmark?.url ?? settings.maskImagePath.map { URL(fileURLWithPath: $0) }
+        let resolvedModelName = settings.modelName ?? AppPricing.defaultModelName(for: settings.provider)
+        defer {
+            resolvedMaskBookmark?.url.stopAccessingSecurityScopedResource()
+            submissionDataList.forEach { $0.stopAccessingSecurityScopedResources() }
+        }
+
+        do {
+            let requestItems = try submissionDataList.map { data -> OpenAIBatchSubmissionItem in
+                guard let job = task(for: data.id) else {
+                    throw NanoBananaError.batchError(message: "OpenAI batch task disappeared before submission.")
+                }
+
+                job.status = "processing"
+                job.phase = .submitting
+                job.startedAt = job.startedAt ?? Date()
+                job.error = nil
+
+                let request = makeImageEditRequest(
+                    data: data,
+                    settings: settings,
+                    maskImageURL: maskImageURL,
+                    resolvedModelName: resolvedModelName
+                )
+
+                return OpenAIBatchSubmissionItem(
+                    taskID: data.id,
+                    customID: "task-\(data.id.uuidString)",
+                    request: request
+                )
+            }
+
+            saveActiveBatches()
+            updateProgress()
+
+            let batchInfo = try await service.startOpenAIBatch(requests: requestItems)
+            for mapping in batchInfo.requests {
+                guard let job = task(for: mapping.taskID) else { continue }
+                job.remoteBatchId = batchInfo.batchID
+                job.remoteRequestId = mapping.customID
+                job.remoteBatchProvider = .openAI
+                job.submittedAt = Date()
+                job.lastPollState = "validating"
+                job.lastPollUpdatedAt = Date()
+                job.stalledAt = nil
+                job.status = "processing"
+                job.cancelRequestedAt = job.cancelRequestedAt ?? (job.phase == .cancelRequested ? Date() : nil)
+
+                if job.phase == .cancelRequested || controlState == .cancelling {
+                    job.phase = .cancelRequested
+                    job.error = "Cancel requested. Waiting for final status."
+                    job.cancelRequestedAt = job.cancelRequestedAt ?? Date()
+                } else if controlState == .pausedLocal {
+                    job.phase = .pausedLocal
+                    job.error = "Paused locally. Resume to reconcile remote status."
+                } else {
+                    job.phase = .submittedRemote
+                    job.error = nil
+                }
+            }
+
+            if controlState == .cancelling {
+                try? await service.cancelOpenAIBatch(batchID: batchInfo.batchID)
+            }
+
+            saveActiveBatches()
+            updateProgress()
+        } catch {
+            for data in submissionDataList {
+                await handleError(jobId: data.id, data: data, settings: settings, error: error)
+            }
+        }
+    }
+
+    private func makeImageEditRequest(
+        data: JobSubmissionData,
+        settings: BatchSettings,
+        maskImageURL: URL?,
+        resolvedModelName: String
+    ) -> ImageEditRequest {
+        if data.inputURLs.isEmpty {
+            return ImageEditRequest.textOnly(
+                provider: settings.provider,
+                modelName: resolvedModelName,
+                prompt: settings.prompt,
+                systemInstruction: settings.systemPrompt,
+                aspectRatio: settings.aspectRatio,
+                imageSize: settings.imageSize,
+                useBatchTier: settings.useBatchTier,
+                openAIOutputFormat: settings.openAIOutputFormat,
+                openAIBackground: settings.openAIBackground,
+                openAIInputFidelity: settings.openAIInputFidelity,
+                openAIOutputCompression: settings.openAIOutputCompression,
+                openAINCount: settings.openAINCount
+            )
+        }
+
+        return ImageEditRequest(
+            provider: settings.provider,
+            modelName: resolvedModelName,
+            inputImageURLs: data.inputURLs,
+            maskImageURL: maskImageURL,
+            prompt: settings.prompt,
+            systemInstruction: settings.systemPrompt,
+            aspectRatio: settings.aspectRatio,
+            imageSize: settings.imageSize,
+            useBatchTier: settings.useBatchTier,
+            openAIOutputFormat: settings.openAIOutputFormat,
+            openAIBackground: settings.openAIBackground,
+            openAIInputFidelity: settings.openAIInputFidelity,
+            openAIOutputCompression: settings.openAIOutputCompression,
+            openAINCount: settings.openAINCount
+        )
+    }
+
+    private func performOpenAIBatchPoll(remoteBatchID: String, batch: BatchJob, settings: BatchSettings) async {
+        let tasksForRemoteBatch = batch.tasks.filter {
+            $0.remoteBatchId == remoteBatchID && !$0.isTerminal
+        }
+        let expectedCustomIDs = tasksForRemoteBatch.compactMap(\.remoteRequestId)
+        guard !expectedCustomIDs.isEmpty else { return }
+
+        do {
+            let shouldContinue: @Sendable () async -> Bool = { [orchestrator = self] in
+                await MainActor.run {
+                    orchestrator.shouldContinueOpenAIBatchPolling(remoteBatchID: remoteBatchID)
+                }
+            }
+
+            let result = try await service.pollOpenAIBatch(
+                batchID: remoteBatchID,
+                expectedCustomIDs: expectedCustomIDs,
+                onPollUpdate: { @Sendable update in
+                    Task { @MainActor [weak self] in
+                        self?.updateOpenAIBatchPollStatus(remoteBatchID: remoteBatchID, update: update)
+                    }
+                },
+                softTimeout: softPollTimeout,
+                shouldContinue: shouldContinue
+            )
+
+            await applyOpenAIBatchResult(result, batch: batch, settings: settings)
+        } catch NanoBananaError.softTimeout(let state) {
+            for task in tasksForRemoteBatch {
+                await markJobAsStalled(jobId: task.id, state: state)
+            }
+        } catch NanoBananaError.pollingStopped(let state) {
+            for task in tasksForRemoteBatch {
+                markJobAsPaused(jobId: task.id, state: state)
+            }
+        } catch {
+            for task in tasksForRemoteBatch {
+                await handleError(
+                    jobId: task.id,
+                    data: JobSubmissionData(id: task.id, inputURLs: [], inputPaths: [], securityScopedInputURLs: []),
+                    settings: settings,
+                    error: error
+                )
+            }
+        }
+    }
+
+    private func applyOpenAIBatchResult(_ result: OpenAIBatchResult, batch: BatchJob, settings: BatchSettings) async {
+        for success in result.successes {
+            guard let job = batch.tasks.first(where: { $0.remoteRequestId == success.customID }) else { continue }
+            await handleSuccess(
+                jobId: job.id,
+                data: JobSubmissionData(id: job.id, inputURLs: [], inputPaths: [], securityScopedInputURLs: []),
+                settings: settings,
+                responses: success.responses,
+                jobName: nil
+            )
+        }
+
+        for failure in result.failures {
+            guard let job = batch.tasks.first(where: { $0.remoteRequestId == failure.customID }),
+                  !job.isTerminal else { continue }
+
+            switch result.terminalStatus {
+            case "cancelled":
+                await handleCancelled(jobId: job.id, settings: settings, message: failure.message, jobName: nil)
+            case "expired":
+                await handleExpired(jobId: job.id, settings: settings, message: failure.message, jobName: nil)
+            default:
+                await handleError(
+                    jobId: job.id,
+                    data: JobSubmissionData(id: job.id, inputURLs: [], inputPaths: [], securityScopedInputURLs: []),
+                    settings: settings,
+                    error: NanoBananaError.batchError(message: failure.message)
+                )
+            }
+        }
+    }
+
+    private func updateOpenAIBatchPollStatus(remoteBatchID: String, update: OpenAIBatchStatusUpdate) {
+        for job in allJobs where job.remoteBatchId == remoteBatchID && !job.isTerminal {
+            job.status = "processing"
+            job.phase = job.phase == .cancelRequested ? .cancelRequested : .polling
+            job.pollCount += 1
+            job.lastPollState = update.status
+            job.lastPollUpdatedAt = update.updatedAt
+            job.stalledAt = nil
+            if job.phase != .cancelRequested {
+                job.error = nil
             }
         }
     }
@@ -872,9 +1175,9 @@ final class BatchOrchestrator {
     private func performPoll(jobId: UUID, jobName: String, settings: BatchSettings, recovering: Bool) async {
         do {
             let response: ImageEditResponse
-            let shouldContinue: @Sendable () async -> Bool = { [weak self] in
+            let shouldContinue: @Sendable () async -> Bool = { [orchestrator = self] in
                 await MainActor.run {
-                    self?.shouldContinuePolling(jobId: jobId) ?? false
+                    orchestrator.shouldContinuePolling(jobId: jobId)
                 }
             }
 
@@ -1318,7 +1621,10 @@ final class BatchOrchestrator {
             openAIBackground: settings.openAIBackground,
             openAIInputFidelity: settings.openAIInputFidelity,
             openAIOutputCompression: settings.openAIOutputCompression,
-            openAINCount: settings.openAINCount
+            openAINCount: settings.openAINCount,
+            remoteBatchId: job.remoteBatchId,
+            remoteRequestId: job.remoteRequestId,
+            remoteBatchProvider: job.remoteBatchProvider
         )
     }
 
@@ -1366,7 +1672,10 @@ final class BatchOrchestrator {
                 openAIBackground: batch?.openAIBackground ?? .auto,
                 openAIInputFidelity: batch?.openAIInputFidelity ?? .high,
                 openAIOutputCompression: batch?.openAIOutputCompression ?? 100,
-                openAINCount: batch?.openAINCount ?? 1
+                openAINCount: batch?.openAINCount ?? 1,
+                remoteBatchId: job.remoteBatchId,
+                remoteRequestId: job.remoteRequestId,
+                remoteBatchProvider: job.remoteBatchProvider
             )
             persistHistoryEntry(entry, externalJobName: job.externalJobName)
         }
@@ -1374,7 +1683,7 @@ final class BatchOrchestrator {
 
     private func shouldSubmit(task: ImageTask) -> Bool {
         !task.isTerminal &&
-        task.externalJobName == nil &&
+        !task.hasRemoteJob &&
         task.phase != .submitting &&
         task.phase != .cancelRequested &&
         (task.status == "pending" || task.phase == .pausedLocal)
@@ -1382,6 +1691,17 @@ final class BatchOrchestrator {
 
     private func shouldPoll(task: ImageTask) -> Bool {
         guard task.externalJobName != nil, !task.isTerminal else { return false }
+        guard controlState != .pausedLocal else { return false }
+        switch task.phase {
+        case .submitting, .pending, .completed, .cancelled, .expired, .failed:
+            return false
+        default:
+            return true
+        }
+    }
+
+    private func shouldPollOpenAIBatch(task: ImageTask) -> Bool {
+        guard task.remoteBatchId != nil, !task.isTerminal else { return false }
         guard controlState != .pausedLocal else { return false }
         switch task.phase {
         case .submitting, .pending, .completed, .cancelled, .expired, .failed:
@@ -1401,6 +1721,20 @@ final class BatchOrchestrator {
         return controlState != .pausedLocal
     }
 
+    private func shouldContinueOpenAIBatchPolling(remoteBatchID: String) -> Bool {
+        guard controlState != .pausedLocal else { return false }
+        return allJobs.contains {
+            $0.remoteBatchId == remoteBatchID &&
+            !$0.isTerminal &&
+            ($0.phase == .polling ||
+             $0.phase == .submittedRemote ||
+             $0.phase == .reconnecting ||
+             $0.phase == .stalled ||
+             $0.phase == .pausedLocal ||
+             $0.phase == .cancelRequested)
+        }
+    }
+
     private func applyPausedStateToActiveTasks() {
         for batch in activeBatches {
             applyPausedStateToBatch(batch)
@@ -1412,7 +1746,7 @@ final class BatchOrchestrator {
             if job.phase == .cancelRequested {
                 continue
             }
-            if job.status == "pending" || job.externalJobName == nil {
+            if job.status == "pending" || !job.hasRemoteJob {
                 job.phase = .pausedLocal
                 job.error = "Paused locally. Resume to continue."
             } else {
@@ -1707,7 +2041,7 @@ final class BatchOrchestrator {
                         message: cancellationFinalStatusTimedOutMessage
                     )
                     didChangePersistedState = true
-                } else if task.phase == .submitting && task.externalJobName == nil {
+                } else if task.phase == .submitting && !task.hasRemoteJob {
                     task.status = "failed"
                     task.phase = .failed
                     task.error = ambiguousSubmittingRecoveryMessage
@@ -1715,7 +2049,7 @@ final class BatchOrchestrator {
                     task.stalledAt = nil
                     hadAmbiguousSubmittingTasks = true
                     didChangePersistedState = true
-                } else if task.phase == .submitting && task.externalJobName != nil {
+                } else if task.phase == .submitting && task.hasRemoteJob {
                     task.phase = .submittedRemote
                     didChangePersistedState = true
                 }
@@ -1814,7 +2148,7 @@ final class BatchOrchestrator {
         if let existingBatch = activeBatches.first(where: { $0.tasks.contains(where: { $0.externalJobName == jobName }) }),
            let existingTask = existingBatch.tasks.first(where: { $0.externalJobName == jobName }) {
             if existingTask.isIssue {
-                rearmRemoteJobForPolling(existingTask, in: existingBatch, jobName: jobName, source: "history")
+                rearmRemoteJobForPolling(existingTask, in: existingBatch, jobIdentifier: jobName, source: "history")
             } else {
                 LogManager.shared.log(.request, payload: "Resume polling requested for existing active job \(jobName).")
             }
@@ -1877,7 +2211,7 @@ final class BatchOrchestrator {
         }
     }
 
-    private func rearmRemoteJobForPolling(_ job: ImageTask, in batch: BatchJob, jobName: String, source: String) {
+    private func rearmRemoteJobForPolling(_ job: ImageTask, in batch: BatchJob, jobIdentifier: String, source: String) {
         job.status = "processing"
         job.phase = .pausedLocal
         job.error = "Resuming remote job. Reconciling final status."
@@ -1890,7 +2224,7 @@ final class BatchOrchestrator {
         statusMessage = "Resuming remote job..."
         saveActiveBatches()
         updateProgress()
-        LogManager.shared.log(.request, payload: "Resume polling re-armed \(source) job \(jobName) for task \(job.id.uuidString).")
+        LogManager.shared.log(.request, payload: "Resume polling re-armed \(source) job \(jobIdentifier) for task \(job.id.uuidString).")
     }
 
     private func withAccessibleOutputDirectory<T>(

@@ -183,7 +183,7 @@ struct InspectorView: View {
                                     .font(.system(size: 11, weight: .bold))
                                     .foregroundStyle(.primary)
                                     .textCase(.uppercase)
-                                Text(stagingManager.provider == .openAI ? "Deferred for OpenAI in phase 1." : "50% cost savings.")
+                                Text(stagingManager.provider == .openAI ? "Async batch processing. Up to 24 hours." : "50% cost savings.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -191,7 +191,6 @@ struct InspectorView: View {
                             Toggle("", isOn: $stagingManager.isBatchTier)
                                 .toggleStyle(.switch)
                                 .labelsHidden()
-                                .disabled(stagingManager.provider == .openAI)
                         }
 
                         if stagingManager.generationMode == .image {
@@ -370,15 +369,9 @@ struct InspectorView: View {
         .background(VisualEffectView(material: .sidebar, blendingMode: .withinWindow))
         .onAppear {
             stagingManager.refreshProviderSelection()
-            if stagingManager.provider == .openAI {
-                stagingManager.isBatchTier = false
-            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .appConfigDidChange)) { _ in
             stagingManager.refreshProviderSelection()
-            if stagingManager.provider == .openAI {
-                stagingManager.isBatchTier = false
-            }
         }
         .fileImporter(
             isPresented: $showingMaskPicker,
@@ -400,11 +393,14 @@ struct InspectorView: View {
         let count = max(1, stagingManager.expectedOutputCount)
         switch stagingManager.generationMode {
         case .image:
-            if stagingManager.provider == .gemini && stagingManager.isBatchTier {
+            if stagingManager.isBatchTier {
                 return "Start Batch"
             }
             return count == 1 ? "Generate Image" : "Generate \(count) Images"
         case .text:
+            if stagingManager.isBatchTier {
+                return "Start Batch"
+            }
             return count == 1 ? "Generate Image" : "Generate \(count) Images"
         }
     }

@@ -62,7 +62,7 @@ struct WorkbenchView: View {
                         projectManager: projectManager,
                         projects: projectManager.projects,
                         initialProjectId: projectManager.currentProject?.id,
-                        activeJobIDs: Set(orchestrator.processingJobs.compactMap { $0.externalJobName }),
+                        activeJobIDs: Set(orchestrator.processingJobs.compactMap { $0.remoteJobIdForDisplay }),
                         onDelete: { entry in
                             historyManager.deleteEntry(entry)
                         },

@@ -79,7 +79,7 @@ struct AppPricing {
         modelName: "gpt-image-2",
         displayName: "GPT Image 2",
         pricingMode: .tokenBased,
-        supportsBatchTier: false,
+        supportsBatchTier: true,
         inputStandardRate: 0,
         inputBatchRate: 0,
         outputStandardRates: [:],

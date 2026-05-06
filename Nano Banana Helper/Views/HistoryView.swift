@@ -53,7 +53,7 @@ struct HistoryView: View {
         entries.filter { entry in
             let matchesSearch = searchText.isEmpty
                 || entry.prompt.localizedCaseInsensitiveContains(searchText)
-                || entry.externalJobName?.localizedCaseInsensitiveContains(searchText) == true
+                || entry.remoteJobIdForDisplay?.localizedCaseInsensitiveContains(searchText) == true
             let matchesProject = selectedProjectId == nil || entry.projectId == selectedProjectId
             return matchesSearch && matchesProject
         }
@@ -111,7 +111,7 @@ struct HistoryView: View {
                 List(filteredEntries, selection: $selectedEntry) { entry in
                     let project = projects.first { $0.id == entry.projectId }
                     let projectName = project?.name ?? "Unknown"
-                    let isActive = entry.externalJobName.map { activeJobIDs.contains($0) } ?? false
+                    let isActive = entry.remoteJobIdForDisplay.map { activeJobIDs.contains($0) } ?? false
 
                     HistoryRowView(
                         entry: entry,

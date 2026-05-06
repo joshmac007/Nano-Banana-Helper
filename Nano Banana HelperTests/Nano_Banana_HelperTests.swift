@@ -113,6 +113,10 @@ struct Nano_Banana_HelperTests {
         return url
     }
 
+    private func decodeJSONObject(_ data: Data) throws -> [String: Any] {
+        try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
     private func makeTransparentPNGData() -> Data {
         Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==")!
     }
@@ -2421,6 +2425,36 @@ struct Nano_Banana_HelperTests {
         #expect(orchestrator.aggregateTone == .issue)
     }
 
+    @MainActor @Test func openAIQueueIssueResumeUsesRemoteBatchId() throws {
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { _ in }
+        )
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: "/tmp",
+            useBatchTier: true,
+            provider: .openAI
+        )
+        let task = ImageTask(inputPaths: ["/tmp/input.png"], provider: .openAI)
+        task.status = "failed"
+        task.phase = .failed
+        task.error = "polling failed"
+        task.remoteBatchId = "batch_openai_123"
+        task.remoteRequestId = "task-\(task.id.uuidString)"
+        task.remoteBatchProvider = .openAI
+        batch.tasks = [task]
+
+        orchestrator.enqueue(batch)
+        orchestrator.resumeIssueTask(task)
+
+        #expect(task.status == "processing")
+        #expect(task.phase == .pausedLocal)
+        #expect(task.error == "Resuming remote job. Reconciling final status.")
+        #expect(orchestrator.controlState == .interrupted)
+    }
+
     @Test func headerActionsShowResumeBeforeCancelOnPausedQueue() {
         let actions = QueueHeaderActionVisibility(
             controlState: .pausedLocal,
@@ -3165,25 +3199,147 @@ struct Nano_Banana_HelperTests {
         }
     }
 
-    @MainActor @Test func openAIBatchGuardRejectsBatchSubmission() async throws {
-        let service = NanoBananaService()
+    @Test func openAIBatchGenerationLineUsesImageGenerationEndpointAndCount() throws {
         let request = ImageEditRequest.textOnly(
             provider: .openAI,
             modelName: "gpt-image-2",
             prompt: "prompt",
             aspectRatio: "1:1",
             imageSize: "1K",
-            useBatchTier: true
+            useBatchTier: true,
+            openAIOutputFormat: .webp,
+            openAIBackground: .opaque,
+            openAIOutputCompression: 72,
+            openAINCount: 3
         )
 
-        do {
-            _ = try await service.startBatchJob(request: request)
-            Issue.record("Expected OpenAI batch submissions to be rejected")
-        } catch NanoBananaError.batchError(let message) {
-            #expect(message.contains("OpenAI Batch Tier"))
-        } catch {
-            Issue.record("Expected batchError but got \(error)")
-        }
+        let line = try NanoBananaService.makeOpenAIBatchRequestLine(
+            customID: "task-a",
+            request: request
+        )
+        let json = try decodeJSONObject(line.encodedJSONLineData())
+        let body = try #require(json["body"] as? [String: Any])
+
+        #expect(json["custom_id"] as? String == "task-a")
+        #expect(json["method"] as? String == "POST")
+        #expect(json["url"] as? String == "/v1/images/generations")
+        #expect(body["model"] as? String == "gpt-image-2")
+        #expect(body["prompt"] as? String == "prompt")
+        #expect(body["output_format"] as? String == "webp")
+        #expect(body["background"] as? String == "opaque")
+        #expect(body["output_compression"] as? Int == 72)
+        #expect(body["n"] as? Int == 3)
+    }
+
+    @Test func openAIBatchEditLineUsesUploadedFileReferences() throws {
+        let request = ImageEditRequest(
+            provider: .openAI,
+            modelName: "gpt-image-2",
+            inputImageURLs: [
+                URL(fileURLWithPath: "/tmp/source-a.png"),
+                URL(fileURLWithPath: "/tmp/source-b.png")
+            ],
+            maskImageURL: URL(fileURLWithPath: "/tmp/mask.png"),
+            prompt: "edit prompt",
+            systemInstruction: nil,
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            useBatchTier: true,
+            openAIOutputFormat: .png,
+            openAIBackground: .auto,
+            openAIInputFidelity: .high,
+            openAIOutputCompression: 100,
+            openAINCount: 2
+        )
+
+        let line = try NanoBananaService.makeOpenAIBatchRequestLine(
+            customID: "task-edit",
+            request: request,
+            uploadedImageFileIDs: ["file-source-a", "file-source-b"],
+            uploadedMaskFileID: "file-mask"
+        )
+        let json = try decodeJSONObject(line.encodedJSONLineData())
+        let body = try #require(json["body"] as? [String: Any])
+        let images = try #require(body["images"] as? [[String: Any]])
+        let mask = try #require(body["mask"] as? [String: Any])
+
+        #expect(json["url"] as? String == "/v1/images/edits")
+        #expect(images.count == 2)
+        #expect(images[0]["file_id"] as? String == "file-source-a")
+        #expect(images[1]["file_id"] as? String == "file-source-b")
+        #expect(mask["file_id"] as? String == "file-mask")
+        #expect(body["n"] as? Int == 2)
+    }
+
+    @MainActor @Test func openAIBatchResultParsingPreservesPartialSuccess() async throws {
+        let service = NanoBananaService()
+        let outputData = """
+        {"custom_id":"task-a","response":{"status_code":200,"body":{"data":[{"b64_json":"b2s="}],"output_format":"png","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}},"error":null}
+        """.data(using: .utf8)!
+        let errorData = """
+        {"custom_id":"task-b","response":null,"error":{"message":"The edit failed"}}
+        """.data(using: .utf8)!
+
+        let result = try await service.parseOpenAIBatchResultFiles(
+            batchID: "batch_123",
+            terminalStatus: "completed",
+            expectedCustomIDs: ["task-a", "task-b"],
+            outputFileData: outputData,
+            errorFileData: errorData
+        )
+
+        let success = try #require(result.successes.first)
+        let failure = try #require(result.failures.first)
+
+        #expect(result.batchID == "batch_123")
+        #expect(success.customID == "task-a")
+        #expect(success.responses.first?.imageData == Data("ok".utf8))
+        #expect(failure.customID == "task-b")
+        #expect(failure.message.contains("The edit failed"))
+    }
+
+    @Test func remoteBatchFieldsRoundTripThroughQueueAndHistory() throws {
+        let task = ImageTask(inputPath: "/tmp/source.png", provider: .openAI)
+        task.remoteBatchId = "batch_123"
+        task.remoteRequestId = "task-a"
+        task.remoteBatchProvider = .openAI
+
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        let decodedTask = try decoder.decode(ImageTask.self, from: encoder.encode(task))
+
+        #expect(decodedTask.remoteBatchId == "batch_123")
+        #expect(decodedTask.remoteRequestId == "task-a")
+        #expect(decodedTask.remoteBatchProvider == .openAI)
+        #expect(decodedTask.hasRemoteJob)
+
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "/tmp/output.png",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            provider: .openAI,
+            remoteBatchId: "batch_123",
+            remoteRequestId: "task-a",
+            remoteBatchProvider: .openAI
+        )
+        let decodedEntry = try decoder.decode(HistoryEntry.self, from: encoder.encode(entry))
+
+        #expect(decodedEntry.remoteBatchId == "batch_123")
+        #expect(decodedEntry.remoteRequestId == "task-a")
+        #expect(decodedEntry.remoteBatchProvider == .openAI)
+    }
+
+    @Test func openAIModelAdvertisesBatchTierSupport() {
+        let pricing = AppPricing.pricing(for: "gpt-image-2", provider: .openAI)
+        let model = CuratedModelCatalog.fallbackEntries(for: .openAI).first { $0.id == "gpt-image-2" }
+
+        #expect(pricing.supportsBatchTier)
+        #expect(model?.supportsBatchTier == true)
     }
 }
 

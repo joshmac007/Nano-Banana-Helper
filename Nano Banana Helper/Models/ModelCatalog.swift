@@ -62,7 +62,7 @@ enum CuratedModelCatalog {
             provider: .openAI,
             id: "gpt-image-2",
             displayName: "GPT Image 2",
-            supportsBatchTier: false,
+            supportsBatchTier: true,
             supportsMasking: true,
             isDeprecated: false
         )

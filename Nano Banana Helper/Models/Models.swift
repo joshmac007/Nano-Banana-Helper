@@ -172,6 +172,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     let status: String // "completed", "cancelled", "failed"
     let error: String?
     let externalJobName: String?
+    let remoteBatchId: String?
+    let remoteRequestId: String?
+    let remoteBatchProvider: ModelProvider?
     let tokenUsage: TokenUsage?
     let modelName: String?
     let provider: ModelProvider
@@ -221,11 +224,15 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     var generationDescription: String {
         isTextToImage ? "Text to Image" : "Image to Image"
     }
+
+    var remoteJobIdForDisplay: String? {
+        remoteBatchId ?? externalJobName
+    }
     
     enum CodingKeys: String, CodingKey {
         case id, projectId, timestamp, sourceImagePaths, outputImagePath
         case prompt, aspectRatio, imageSize, usedBatchTier, cost
-        case status, error, externalJobName
+        case status, error, externalJobName, remoteBatchId, remoteRequestId, remoteBatchProvider
         case sourceImageBookmarks, outputImageBookmark, outputDirectoryBookmark, maskImageBookmark
         case tokenUsage, modelName, provider, systemPrompt, maskImagePath
         case openAIOutputFormat, openAIBackground, openAIInputFidelity, openAIOutputCompression, openAINCount
@@ -258,7 +265,10 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         openAIBackground: OpenAIBackground = .auto,
         openAIInputFidelity: OpenAIInputFidelity = .high,
         openAIOutputCompression: Int = 100,
-        openAINCount: Int = 1
+        openAINCount: Int = 1,
+        remoteBatchId: String? = nil,
+        remoteRequestId: String? = nil,
+        remoteBatchProvider: ModelProvider? = nil
     ) {
         self.id = id
         self.projectId = projectId
@@ -273,6 +283,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.status = status
         self.error = error
         self.externalJobName = externalJobName
+        self.remoteBatchId = remoteBatchId
+        self.remoteRequestId = remoteRequestId
+        self.remoteBatchProvider = remoteBatchProvider
         self.sourceImageBookmarks = sourceImageBookmarks
         self.outputImageBookmark = outputImageBookmark
         self.outputDirectoryBookmark = outputDirectoryBookmark
@@ -304,6 +317,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         status = try container.decode(String.self, forKey: .status)
         error = try container.decodeIfPresent(String.self, forKey: .error)
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
+        remoteBatchId = try container.decodeIfPresent(String.self, forKey: .remoteBatchId)
+        remoteRequestId = try container.decodeIfPresent(String.self, forKey: .remoteRequestId)
+        remoteBatchProvider = try container.decodeIfPresent(ModelProvider.self, forKey: .remoteBatchProvider)
         sourceImageBookmarks = try container.decodeIfPresent([Data].self, forKey: .sourceImageBookmarks)
         outputImageBookmark = try container.decodeIfPresent(Data.self, forKey: .outputImageBookmark)
         outputDirectoryBookmark = try container.decodeIfPresent(Data.self, forKey: .outputDirectoryBookmark)
@@ -335,6 +351,9 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         try container.encode(status, forKey: .status)
         try container.encodeIfPresent(error, forKey: .error)
         try container.encodeIfPresent(externalJobName, forKey: .externalJobName)
+        try container.encodeIfPresent(remoteBatchId, forKey: .remoteBatchId)
+        try container.encodeIfPresent(remoteRequestId, forKey: .remoteRequestId)
+        try container.encodeIfPresent(remoteBatchProvider, forKey: .remoteBatchProvider)
         try container.encodeIfPresent(sourceImageBookmarks, forKey: .sourceImageBookmarks)
         try container.encodeIfPresent(outputImageBookmark, forKey: .outputImageBookmark)
         try container.encodeIfPresent(outputDirectoryBookmark, forKey: .outputDirectoryBookmark)
@@ -379,7 +398,10 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
             openAIBackground: openAIBackground,
             openAIInputFidelity: openAIInputFidelity,
             openAIOutputCompression: openAIOutputCompression,
-            openAINCount: openAINCount
+            openAINCount: openAINCount,
+            remoteBatchId: remoteBatchId,
+            remoteRequestId: remoteRequestId,
+            remoteBatchProvider: remoteBatchProvider
         )
     }
 }
@@ -762,6 +784,9 @@ class ImageTask: Identifiable, Codable {
     var submittedAt: Date?
     var completedAt: Date?
     var externalJobName: String? // Store Gemini API job ID
+    var remoteBatchId: String?
+    var remoteRequestId: String?
+    var remoteBatchProvider: ModelProvider?
     var projectId: UUID? // Added for filtering results by project
     var provider: ModelProvider
     var maskImagePath: String?
@@ -772,7 +797,8 @@ class ImageTask: Identifiable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount
         case lastPollState, lastPollUpdatedAt, stalledAt
-        case error, startedAt, submittedAt, completedAt, externalJobName, projectId
+        case error, startedAt, submittedAt, completedAt, externalJobName
+        case remoteBatchId, remoteRequestId, remoteBatchProvider, projectId
         case provider, maskImagePath, maskImageBookmark, cancelRequestedAt
         case variationIndex, variationTotal
     }
@@ -794,6 +820,9 @@ class ImageTask: Identifiable, Codable {
         submittedAt = try container.decodeIfPresent(Date.self, forKey: .submittedAt)
         completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
+        remoteBatchId = try container.decodeIfPresent(String.self, forKey: .remoteBatchId)
+        remoteRequestId = try container.decodeIfPresent(String.self, forKey: .remoteRequestId)
+        remoteBatchProvider = try container.decodeIfPresent(ModelProvider.self, forKey: .remoteBatchProvider)
         projectId = try container.decodeIfPresent(UUID.self, forKey: .projectId)
         provider = try container.decodeIfPresent(ModelProvider.self, forKey: .provider) ?? .gemini
         maskImagePath = try container.decodeIfPresent(String.self, forKey: .maskImagePath)
@@ -820,6 +849,9 @@ class ImageTask: Identifiable, Codable {
         try container.encode(submittedAt, forKey: .submittedAt)
         try container.encode(completedAt, forKey: .completedAt)
         try container.encode(externalJobName, forKey: .externalJobName)
+        try container.encodeIfPresent(remoteBatchId, forKey: .remoteBatchId)
+        try container.encodeIfPresent(remoteRequestId, forKey: .remoteRequestId)
+        try container.encodeIfPresent(remoteBatchProvider, forKey: .remoteBatchProvider)
         try container.encode(projectId, forKey: .projectId)
         try container.encode(provider, forKey: .provider)
         try container.encodeIfPresent(maskImagePath, forKey: .maskImagePath)
@@ -848,6 +880,9 @@ class ImageTask: Identifiable, Codable {
         self.lastPollState = nil
         self.lastPollUpdatedAt = nil
         self.stalledAt = nil
+        self.remoteBatchId = nil
+        self.remoteRequestId = nil
+        self.remoteBatchProvider = nil
         self.projectId = projectId
         self.provider = provider
         self.maskImagePath = maskImagePath
@@ -877,6 +912,9 @@ class ImageTask: Identifiable, Codable {
         self.lastPollState = nil
         self.lastPollUpdatedAt = nil
         self.stalledAt = nil
+        self.remoteBatchId = nil
+        self.remoteRequestId = nil
+        self.remoteBatchProvider = nil
         self.projectId = projectId
         self.provider = provider
         self.maskImagePath = maskImagePath
@@ -934,7 +972,11 @@ class ImageTask: Identifiable, Codable {
     }
 
     var hasRemoteJob: Bool {
-        externalJobName != nil
+        externalJobName != nil || remoteBatchId != nil
+    }
+
+    var remoteJobIdForDisplay: String? {
+        remoteBatchId ?? externalJobName
     }
 
     var variationLabel: String? {

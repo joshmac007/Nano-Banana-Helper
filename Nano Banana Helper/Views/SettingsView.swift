@@ -210,7 +210,7 @@ struct SettingsView: View {
 
     private var providerCapabilitiesCard: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(selectedProvider == .openAI ? "OpenAI standard generation, edits, and masking are enabled. Batch Tier remains disabled in this release." : "Gemini standard and batch generation remain available.")
+            Text(selectedProvider == .openAI ? "OpenAI standard generation, edits, masking, and Batch Tier are enabled." : "Gemini standard and batch generation remain available.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

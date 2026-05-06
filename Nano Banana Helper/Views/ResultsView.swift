@@ -236,108 +236,140 @@ fileprivate struct ResultDetailView: View {
 
     @State private var outputPhase: ResultsImagePhase = .loading
     @State private var sourcePhase: ResultsImagePhase = .idle
+    @State private var isComparisonEnabled = false
 
     var body: some View {
-        VStack {
-            HStack {
-                Spacer()
-                Button(action: { dismiss() }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .padding()
-            }
+        VStack(spacing: 12) {
+            imageStage
+                .layoutPriority(1)
 
-            Group {
-                if displayOutputPhase.isLoading {
-                    ResultsDetailLoadingState(message: "Loading image...")
-                } else if displayOutputPhase.isAccessDenied {
-                    BookmarkAccessDeniedView(
-                        message: "Output folder access has expired.",
-                        onReauthorize: reauthorizeOutput
-                    )
-                } else if let outputImage = displayOutputPhase.loadedImage {
-                    if hasSourceImage, displaySourcePhase.isLoading {
-                        VStack(spacing: 16) {
-                            Image(nsImage: outputImage)
-                                .resizable()
-                                .aspectRatio(contentMode: .fit)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                .padding(.horizontal)
+            ResultsPromptMetadataView(entry: entry)
 
-                            ResultsDetailLoadingState(message: "Loading original image...")
-                                .frame(maxHeight: 120)
-                        }
-                    } else if displaySourcePhase.isAccessDenied {
-                        VStack(spacing: 16) {
-                            Image(nsImage: outputImage)
-                                .resizable()
-                                .aspectRatio(contentMode: .fit)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                .padding(.horizontal)
-
-                            BookmarkAccessDeniedView(
-                                message: "Source image access has expired.",
-                                onReauthorize: reauthorizeSource
-                            )
-                        }
-                    } else if let inputImage = displaySourcePhase.loadedImage {
-                        ComparisonView(before: inputImage, after: outputImage)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                            .padding()
-                    } else if hasSourceImage, displaySourcePhase.isFailed {
-                        VStack(spacing: 16) {
-                            Image(nsImage: outputImage)
-                                .resizable()
-                                .aspectRatio(contentMode: .fit)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                .padding(.horizontal)
-
-                            Label("Original image could not be loaded.", systemImage: "exclamationmark.triangle")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-                    } else {
-                        Image(nsImage: outputImage)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .padding()
-                    }
-                } else {
-                    ContentUnavailableView("Image Unavailable", systemImage: "exclamationmark.triangle")
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 12) {
-                ResultsPromptMetadataView(entry: entry)
-
-                HStack {
-                    Button("Remix in Workbench", action: remixEntry)
-                        .buttonStyle(.borderedProminent)
-                        .disabled(onReuse == nil)
-
-                    Button("Open File", action: openFile)
-                        .buttonStyle(.bordered)
-                        .disabled(entry.outputImagePath.isEmpty)
-
-                    Button("Show in Finder", action: revealFile)
-                        .buttonStyle(.bordered)
-                        .disabled(entry.outputImagePath.isEmpty)
-                }
-            }
-            .padding(.horizontal)
-            .padding(.bottom)
+            actionBar
         }
-        .frame(minWidth: 800, minHeight: 600)
+        .padding(.top, 36)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 16)
+        .overlay(alignment: .topTrailing) {
+            Button(action: { dismiss() }) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .padding(12)
+            .help("Close")
+        }
+        .frame(
+            minWidth: 780,
+            idealWidth: 980,
+            maxWidth: .infinity,
+            minHeight: 620,
+            idealHeight: 820,
+            maxHeight: .infinity
+        )
+        .background(ResultDetailWindowConfigurator(minSize: NSSize(width: 780, height: 620)))
+        .presentationSizing(.fitted.sticky(horizontal: true, vertical: true))
         .task(id: outputReference.cacheKey) {
             await loadOutputImage()
         }
         .task(id: sourceReference?.cacheKey ?? "result-source-\(entry.id.uuidString)-none") {
             await loadSourceImage()
+        }
+    }
+
+    @ViewBuilder
+    private var imageStage: some View {
+        Group {
+            if displayOutputPhase.isLoading {
+                ResultsDetailLoadingState(message: "Loading image...")
+            } else if displayOutputPhase.isAccessDenied {
+                BookmarkAccessDeniedView(
+                    message: "Output folder access has expired.",
+                    onReauthorize: reauthorizeOutput
+                )
+            } else if let outputImage = displayOutputPhase.loadedImage {
+                if isComparisonEnabled, hasSourceImage {
+                    comparisonStage(for: outputImage)
+                } else {
+                    fittedImage(outputImage)
+                }
+            } else {
+                ContentUnavailableView("Image Unavailable", systemImage: "exclamationmark.triangle")
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(minHeight: 360)
+        .background(Color.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    @ViewBuilder
+    private func comparisonStage(for outputImage: NSImage) -> some View {
+        if displaySourcePhase.isLoading {
+            VStack(spacing: 16) {
+                fittedImage(outputImage)
+                ResultsDetailLoadingState(message: "Loading original image...")
+                    .frame(maxHeight: 96)
+            }
+            .padding(.bottom, 12)
+        } else if displaySourcePhase.isAccessDenied {
+            VStack(spacing: 16) {
+                fittedImage(outputImage)
+                BookmarkAccessDeniedView(
+                    message: "Source image access has expired.",
+                    onReauthorize: reauthorizeSource
+                )
+                .frame(maxHeight: 150)
+            }
+            .padding(.bottom, 12)
+        } else if let inputImage = displaySourcePhase.loadedImage {
+            ComparisonView(before: inputImage, after: outputImage)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if displaySourcePhase.isFailed {
+            VStack(spacing: 16) {
+                fittedImage(outputImage)
+                Label("Original image could not be loaded.", systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxHeight: 64)
+            }
+            .padding(.bottom, 12)
+        } else {
+            fittedImage(outputImage)
+        }
+    }
+
+    private func fittedImage(_ image: NSImage) -> some View {
+        Image(nsImage: image)
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(12)
+    }
+
+    private var actionBar: some View {
+        HStack(spacing: 10) {
+            Button("Remix in Workbench", action: remixEntry)
+                .buttonStyle(.borderedProminent)
+                .disabled(onReuse == nil)
+
+            Button("Open File", action: openFile)
+                .buttonStyle(.bordered)
+                .disabled(entry.outputImagePath.isEmpty)
+
+            Button("Show in Finder", action: revealFile)
+                .buttonStyle(.bordered)
+                .disabled(entry.outputImagePath.isEmpty)
+
+            Spacer()
+
+            if hasSourceImage {
+                Toggle("Comparison", isOn: $isComparisonEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .help("Toggle comparison view")
+            }
         }
     }
 
@@ -523,56 +555,83 @@ private struct ResultsDetailLoadingState: View {
 
 private struct ResultsPromptMetadataView: View {
     let entry: HistoryEntry
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isExpanded = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Generation Details")
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.secondary)
-                    .textCase(.uppercase)
-                Spacer()
-                metadataChip(entry.generationDescription, tint: entry.isTextToImage ? .blue : .secondary)
-                if let modelName = entry.modelName {
-                    Text(modelName)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Prompt")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .textCase(.uppercase)
-                Text(entry.prompt)
-                    .font(.body)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            if let systemPrompt = entry.systemPrompt, !systemPrompt.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("System Prompt")
-                        .font(.caption2)
+            Button(action: toggleExpanded) {
+                HStack {
+                    Text("Generation Details")
+                        .font(.caption)
+                        .fontWeight(.semibold)
                         .foregroundStyle(.secondary)
                         .textCase(.uppercase)
-                    Text(systemPrompt)
+                    Spacer()
+                    metadataChip(entry.generationDescription, tint: entry.isTextToImage ? .blue : .secondary)
+                    if let modelName = entry.modelName {
+                        Text(modelName)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    Image(systemName: isExpanded ? "minus.circle.fill" : "plus.circle.fill")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .imageScale(.medium)
                 }
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "Collapse generation details" : "Expand generation details")
 
-            HStack(spacing: 12) {
-                detailBadge("Ratio", entry.aspectRatio)
-                detailBadge("Size", entry.imageSize)
-                detailBadge("Tier", entry.usedBatchTier ? "Batch" : "Standard")
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Prompt")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .textCase(.uppercase)
+                        Text(entry.prompt)
+                            .font(.body)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    if let systemPrompt = entry.systemPrompt, !systemPrompt.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("System Prompt")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textCase(.uppercase)
+                            Text(systemPrompt)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+
+                    HStack(spacing: 12) {
+                        detailBadge("Ratio", entry.aspectRatio)
+                        detailBadge("Size", entry.imageSize)
+                        detailBadge("Tier", entry.usedBatchTier ? "Batch" : "Standard")
+                    }
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
         .padding(12)
         .background(.background.secondary)
         .clipShape(RoundedRectangle(cornerRadius: 10))
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.22), value: isExpanded)
+    }
+
+    private func toggleExpanded() {
+        if reduceMotion {
+            isExpanded.toggle()
+        } else {
+            withAnimation(.easeInOut(duration: 0.22)) {
+                isExpanded.toggle()
+            }
+        }
     }
 
     private func detailBadge(_ title: String, _ value: String) -> some View {
@@ -596,6 +655,48 @@ private struct ResultsPromptMetadataView: View {
             .padding(.vertical, 4)
             .background(tint.opacity(0.12))
             .clipShape(Capsule())
+    }
+}
+
+private struct ResultDetailWindowConfigurator: NSViewRepresentable {
+    let minSize: NSSize
+
+    func makeNSView(context: Context) -> ConfiguringView {
+        ConfiguringView(minSize: minSize)
+    }
+
+    func updateNSView(_ nsView: ConfiguringView, context: Context) {
+        nsView.minSize = minSize
+        nsView.configureWindow()
+    }
+
+    final class ConfiguringView: NSView {
+        var minSize: NSSize
+
+        init(minSize: NSSize) {
+            self.minSize = minSize
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            configureWindow()
+        }
+
+        func configureWindow() {
+            guard let window,
+                  window.sheetParent != nil else {
+                return
+            }
+
+            window.styleMask.insert(.resizable)
+            window.minSize = minSize
+        }
     }
 }
 
@@ -873,27 +974,35 @@ struct ComparisonView: View {
 
     var body: some View {
         GeometryReader { geometry in
+            let imageRect = fittedRect(for: after.size, in: geometry.size)
+            let dividerX = imageRect.minX + imageRect.width * sliderValue
+
             ZStack {
+                Color.clear
+
                 Image(nsImage: after)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .frame(width: imageRect.width, height: imageRect.height)
+                    .position(x: imageRect.midX, y: imageRect.midY)
 
                 Image(nsImage: before)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .frame(width: imageRect.width, height: imageRect.height)
                     .mask(
                         HStack(spacing: 0) {
                             Rectangle()
-                                .frame(width: geometry.size.width * sliderValue)
-                            Spacer()
+                                .frame(width: imageRect.width * sliderValue)
+                            Spacer(minLength: 0)
                         }
                     )
+                    .frame(width: imageRect.width, height: imageRect.height)
+                    .position(x: imageRect.midX, y: imageRect.midY)
 
                 Rectangle()
                     .fill(.white)
-                    .frame(width: 2)
+                    .frame(width: 2, height: imageRect.height)
                     .overlay(
                         Circle()
                             .fill(.white)
@@ -905,38 +1014,65 @@ struct ComparisonView: View {
                                     .foregroundStyle(.black)
                             )
                     )
-                    .position(x: geometry.size.width * sliderValue, y: geometry.size.height / 2)
-                    .gesture(
-                        DragGesture()
-                            .onChanged { value in
-                                let location = value.location.x
-                                sliderValue = min(max(location / geometry.size.width, 0), 1)
-                            }
-                    )
+                    .position(x: dividerX, y: imageRect.midY)
 
-                VStack {
+                HStack {
+                    Text("Original")
+                        .font(.caption)
+                        .padding(4)
+                        .background(.ultraThinMaterial)
+                        .cornerRadius(4)
+                        .opacity(sliderValue > 0.1 ? 1 : 0)
+
                     Spacer()
-                    HStack {
-                        Text("Original")
-                            .font(.caption)
-                            .padding(4)
-                            .background(.ultraThinMaterial)
-                            .cornerRadius(4)
-                            .opacity(sliderValue > 0.1 ? 1 : 0)
 
-                        Spacer()
-
-                        Text("Result")
-                            .font(.caption)
-                            .padding(4)
-                            .background(.ultraThinMaterial)
-                            .cornerRadius(4)
-                            .opacity(sliderValue < 0.9 ? 1 : 0)
-                    }
-                    .padding()
+                    Text("Result")
+                        .font(.caption)
+                        .padding(4)
+                        .background(.ultraThinMaterial)
+                        .cornerRadius(4)
+                        .opacity(sliderValue < 0.9 ? 1 : 0)
                 }
+                .padding()
+                .frame(width: imageRect.width, height: imageRect.height, alignment: .bottom)
+                .position(x: imageRect.midX, y: imageRect.midY)
             }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        sliderValue = normalizedSliderValue(for: value.location.x, in: imageRect)
+                    }
+            )
         }
-        .background(Color.black.opacity(0.1))
+        .padding(12)
+    }
+
+    private func fittedRect(for imageSize: NSSize, in containerSize: CGSize) -> CGRect {
+        let containerWidth = max(containerSize.width, 1)
+        let containerHeight = max(containerSize.height, 1)
+        let imageWidth = max(imageSize.width, 1)
+        let imageHeight = max(imageSize.height, 1)
+        let imageRatio = imageWidth / imageHeight
+        let containerRatio = containerWidth / containerHeight
+
+        let fittedSize: CGSize
+        if imageRatio > containerRatio {
+            fittedSize = CGSize(width: containerWidth, height: containerWidth / imageRatio)
+        } else {
+            fittedSize = CGSize(width: containerHeight * imageRatio, height: containerHeight)
+        }
+
+        return CGRect(
+            x: (containerWidth - fittedSize.width) / 2,
+            y: (containerHeight - fittedSize.height) / 2,
+            width: fittedSize.width,
+            height: fittedSize.height
+        )
+    }
+
+    private func normalizedSliderValue(for locationX: CGFloat, in imageRect: CGRect) -> CGFloat {
+        guard imageRect.width > 0 else { return sliderValue }
+        return min(max((locationX - imageRect.minX) / imageRect.width, 0), 1)
     }
 }

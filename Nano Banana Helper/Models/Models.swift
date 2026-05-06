@@ -228,6 +228,25 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     var remoteJobIdForDisplay: String? {
         remoteBatchId ?? externalJobName
     }
+
+    var canResumeOpenAIBatchPolling: Bool {
+        (provider == .openAI || remoteBatchProvider == .openAI) &&
+            remoteBatchId != nil &&
+            remoteRequestId != nil
+    }
+
+    var canResumeRemotePolling: Bool {
+        if externalJobName != nil {
+            return true
+        }
+        return canResumeOpenAIBatchPolling
+    }
+
+    var canRescueRemoteJobID: Bool {
+        externalJobName == nil &&
+            provider != .openAI &&
+            remoteBatchProvider != .openAI
+    }
     
     enum CodingKeys: String, CodingKey {
         case id, projectId, timestamp, sourceImagePaths, outputImagePath

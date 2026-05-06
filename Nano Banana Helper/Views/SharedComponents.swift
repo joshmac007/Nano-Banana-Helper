@@ -88,14 +88,35 @@ struct CostEstimatorView: View {
     var pricingNote: String? {
         pricingResolution.note
     }
+
+    private var projectedCostHelpText: String? {
+        var notes: [String] = []
+        if pricingResolution.pricingMode == .tokenBased {
+            notes.append("Token-based pricing uses provider-reported usage details after completion.")
+        }
+        if let pricingNote {
+            notes.append(pricingNote)
+        }
+        return notes.isEmpty ? nil : notes.joined(separator: "\n\n")
+    }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Projected Cost")
-                        .font(.system(size: 11, weight: .bold))
-                        .textCase(.uppercase)
+                    HStack(alignment: .center, spacing: 4) {
+                        Text("Projected Cost")
+                            .font(.system(size: 11, weight: .bold))
+                            .textCase(.uppercase)
+                        if let projectedCostHelpText {
+                            Image(systemName: "questionmark.circle")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .help(projectedCostHelpText)
+                                .accessibilityLabel("Projected cost details")
+                                .accessibilityHint(Text(projectedCostHelpText))
+                        }
+                    }
                     Text("Estimated only")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -131,11 +152,7 @@ struct CostEstimatorView: View {
                     .font(.subheadline)
             }
 
-            if pricingResolution.pricingMode == .tokenBased {
-                Text("Token-based pricing uses provider-reported usage details after completion.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
+            if pricingResolution.pricingMode != .tokenBased {
                 HStack(spacing: 12) {
                     if generationMode == .image {
                         estimatorMetric(
@@ -164,12 +181,6 @@ struct CostEstimatorView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
-            }
-
-            if let pricingNote {
-                Text(pricingNote)
-                    .font(.caption2)
-                    .foregroundStyle(pricingResolution.pricingMode == .tokenBased ? Color.secondary : Color.orange)
             }
         }
         .padding(12)

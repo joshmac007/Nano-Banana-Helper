@@ -775,8 +775,13 @@ actor NanoBananaService {
         var successes: [OpenAIBatchLineSuccess] = []
         var failures: [OpenAIBatchLineFailure] = []
         var seenCustomIDs = Set<String>()
+        let expectedCustomIDSet = Set(expectedCustomIDs)
 
         for line in Self.jsonlLines(from: outputFileData) {
+            let customID = try Self.openAIBatchCustomID(from: line)
+            guard expectedCustomIDSet.contains(customID) else {
+                continue
+            }
             let parsed = try await parseOpenAIBatchResultLine(line)
             seenCustomIDs.insert(parsed.customID)
             switch parsed.outcome {
@@ -788,6 +793,10 @@ actor NanoBananaService {
         }
 
         for line in Self.jsonlLines(from: errorFileData) {
+            let customID = try Self.openAIBatchCustomID(from: line)
+            guard expectedCustomIDSet.contains(customID) else {
+                continue
+            }
             let parsed = try await parseOpenAIBatchResultLine(line)
             seenCustomIDs.insert(parsed.customID)
             switch parsed.outcome {
@@ -813,6 +822,14 @@ actor NanoBananaService {
             successes: successes,
             failures: failures
         )
+    }
+
+    private static func openAIBatchCustomID(from data: Data) throws -> String {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let customID = json["custom_id"] as? String else {
+            throw NanoBananaError.invalidResponseFormat
+        }
+        return customID
     }
 
     private enum OpenAIBatchLineOutcome {

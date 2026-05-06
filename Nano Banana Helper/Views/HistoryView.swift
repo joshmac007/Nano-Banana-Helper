@@ -145,11 +145,11 @@ struct HistoryView: View {
                             onReuse?(entry)
                         }
                         if entry.status == "failed" {
-                            if entry.externalJobName != nil {
+                            if entry.canResumeRemotePolling {
                                 Button("Resume Polling (No Cost)") {
                                     onResumePolling?(entry)
                                 }
-                            } else {
+                            } else if entry.canRescueRemoteJobID {
                                 Button("Rescue with Job ID...") {
                                     entryToRescue = entry
                                     rescueJobID = ""
@@ -264,7 +264,7 @@ struct HistoryRowView: View {
                 .help("Reuse Settings")
 
                 if entry.status == "failed" || (entry.status == "processing" && !isActive) {
-                    if entry.externalJobName != nil {
+                    if entry.canResumeRemotePolling {
                         Button(action: { onResumePolling?(entry) }) {
                             Image(systemName: "arrow.clockwise")
                                 .font(.system(size: 14, weight: .bold))
@@ -272,7 +272,7 @@ struct HistoryRowView: View {
                         }
                         .buttonStyle(.plain)
                         .help("Resume Polling")
-                    } else {
+                    } else if entry.canRescueRemoteJobID {
                         Button(action: { onRescue?() }) {
                             Image(systemName: "lifepreserver")
                                 .font(.system(size: 14, weight: .bold))

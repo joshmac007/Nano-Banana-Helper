@@ -927,9 +927,10 @@ final class BatchOrchestrator {
         }
     }
 
-    private func applyOpenAIBatchResult(_ result: OpenAIBatchResult, batch: BatchJob, settings: BatchSettings) async {
+    func applyOpenAIBatchResult(_ result: OpenAIBatchResult, batch: BatchJob, settings: BatchSettings) async {
         for success in result.successes {
-            guard let job = batch.tasks.first(where: { $0.remoteRequestId == success.customID }) else { continue }
+            guard let job = batch.tasks.first(where: { $0.remoteRequestId == success.customID }),
+                  !job.isTerminal else { continue }
             await handleSuccess(
                 jobId: job.id,
                 data: JobSubmissionData(id: job.id, inputURLs: [], inputPaths: [], securityScopedInputURLs: []),
@@ -2143,6 +2144,18 @@ final class BatchOrchestrator {
     }
 
     func resumePollingFromHistory(for entry: HistoryEntry) {
+        if entry.canResumeOpenAIBatchPolling {
+            resumeOpenAIPollingFromHistory(for: entry)
+            return
+        }
+        if entry.provider == .openAI || entry.remoteBatchProvider == .openAI {
+            LogManager.shared.log(.error, payload: "Resume polling ignored: OpenAI history entry is missing a remote batch id or request id.")
+            return
+        }
+        resumeGeminiPollingFromHistory(for: entry)
+    }
+
+    private func resumeGeminiPollingFromHistory(for entry: HistoryEntry) {
         guard let jobName = entry.externalJobName else { return }
 
         if let existingBatch = activeBatches.first(where: { $0.tasks.contains(where: { $0.externalJobName == jobName }) }),
@@ -2174,31 +2187,7 @@ final class BatchOrchestrator {
         task.lastPollUpdatedAt = entry.timestamp
         task.error = "Resuming from history. Reconciling remote status."
 
-        let outputDir: String
-        if !entry.outputImagePath.isEmpty {
-            outputDir = (entry.outputImagePath as NSString).deletingLastPathComponent
-        } else {
-            let projectsDir = AppPaths.projectsDirectoryURL
-            outputDir = projectsDir
-                .appendingPathComponent(entry.projectId.uuidString)
-                .appendingPathComponent("Outputs")
-                .path(percentEncoded: false)
-        }
-
-        let batch = BatchJob(
-            prompt: entry.prompt,
-            systemPrompt: entry.systemPrompt,
-            aspectRatio: entry.aspectRatio,
-            imageSize: entry.imageSize,
-            outputDirectory: outputDir,
-            outputDirectoryBookmark: entry.outputDirectoryBookmark,
-            useBatchTier: entry.usedBatchTier,
-            projectId: entry.projectId,
-            modelName: entry.modelName,
-            provider: entry.provider,
-            maskImagePath: entry.maskImagePath,
-            maskImageBookmark: entry.maskImageBookmark
-        )
+        let batch = makeHistoryResumeBatch(for: entry, outputDirectory: outputDirectoryForHistoryResume(entry))
         batch.tasks = [task]
         batch.status = "pending"
 
@@ -2209,6 +2198,95 @@ final class BatchOrchestrator {
         Task {
             await self.startAll()
         }
+    }
+
+    private func resumeOpenAIPollingFromHistory(for entry: HistoryEntry) {
+        guard let remoteBatchId = entry.remoteBatchId,
+              let remoteRequestId = entry.remoteRequestId else { return }
+
+        if let existingBatch = activeBatches.first(where: {
+            $0.tasks.contains {
+                $0.remoteBatchId == remoteBatchId &&
+                $0.remoteRequestId == remoteRequestId
+            }
+        }),
+           let existingTask = existingBatch.tasks.first(where: {
+               $0.remoteBatchId == remoteBatchId &&
+               $0.remoteRequestId == remoteRequestId
+           }) {
+            if existingTask.isIssue {
+                rearmRemoteJobForPolling(existingTask, in: existingBatch, jobIdentifier: remoteBatchId, source: "history")
+            } else {
+                LogManager.shared.log(.request, payload: "Resume polling requested for existing active OpenAI batch \(remoteBatchId).")
+            }
+            Task {
+                await self.startAll()
+            }
+            return
+        }
+
+        let task = ImageTask(
+            inputPaths: entry.sourceImagePaths,
+            projectId: entry.projectId,
+            provider: .openAI,
+            inputBookmarks: entry.sourceImageBookmarks,
+            maskImagePath: entry.maskImagePath,
+            maskImageBookmark: entry.maskImageBookmark
+        )
+        task.remoteBatchId = remoteBatchId
+        task.remoteRequestId = remoteRequestId
+        task.remoteBatchProvider = entry.remoteBatchProvider ?? .openAI
+        task.status = "processing"
+        task.phase = .pausedLocal
+        task.submittedAt = entry.timestamp
+        task.lastPollState = "validating"
+        task.lastPollUpdatedAt = entry.timestamp
+        task.error = "Resuming from history. Reconciling remote status."
+
+        let batch = makeHistoryResumeBatch(for: entry, outputDirectory: outputDirectoryForHistoryResume(entry))
+        batch.isTextMode = entry.isTextToImage
+        batch.tasks = [task]
+        batch.status = "pending"
+
+        enqueue(batch)
+        statusMessage = "Resuming OpenAI batch from history..."
+        LogManager.shared.log(.request, payload: "Resume polling enqueued recovered OpenAI batch \(remoteBatchId).")
+
+        Task {
+            await self.startAll()
+        }
+    }
+
+    private func outputDirectoryForHistoryResume(_ entry: HistoryEntry) -> String {
+        if !entry.outputImagePath.isEmpty {
+            return (entry.outputImagePath as NSString).deletingLastPathComponent
+        }
+        return AppPaths.projectsDirectoryURL
+            .appendingPathComponent(entry.projectId.uuidString)
+            .appendingPathComponent("Outputs")
+            .path(percentEncoded: false)
+    }
+
+    private func makeHistoryResumeBatch(for entry: HistoryEntry, outputDirectory: String) -> BatchJob {
+        BatchJob(
+            prompt: entry.prompt,
+            systemPrompt: entry.systemPrompt,
+            aspectRatio: entry.aspectRatio,
+            imageSize: entry.imageSize,
+            outputDirectory: outputDirectory,
+            outputDirectoryBookmark: entry.outputDirectoryBookmark,
+            useBatchTier: entry.usedBatchTier,
+            projectId: entry.projectId,
+            modelName: entry.modelName,
+            provider: entry.provider,
+            maskImagePath: entry.maskImagePath,
+            maskImageBookmark: entry.maskImageBookmark,
+            openAIOutputFormat: entry.openAIOutputFormat,
+            openAIBackground: entry.openAIBackground,
+            openAIInputFidelity: entry.openAIInputFidelity,
+            openAIOutputCompression: entry.openAIOutputCompression,
+            openAINCount: entry.openAINCount
+        )
     }
 
     private func rearmRemoteJobForPolling(_ job: ImageTask, in batch: BatchJob, jobIdentifier: String, source: String) {

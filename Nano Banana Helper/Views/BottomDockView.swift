@@ -25,16 +25,15 @@ struct BottomDockView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
 
-                Group {
-                    if projectManager.sessionCost > 0 {
-                        Text("Session: $\(projectManager.sessionCost, specifier: "%.2f")")
-                    } else if projectManager.costSummary.totalSpent > 0 {
-                        Text("Total: $\(projectManager.costSummary.totalSpent, specifier: "%.2f")")
-                    }
+                if let spendSummary = BottomDockSpendSummary.make(
+                    sessionCost: projectManager.sessionCost,
+                    selectedProject: projectManager.currentProject
+                ) {
+                    Text(spendSummary.text)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
                 }
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
 
                 Spacer()
                 
@@ -72,5 +71,25 @@ struct BottomDockView: View {
         case .neutral:
             return .secondary
         }
+    }
+}
+
+struct BottomDockSpendSummary: Equatable {
+    let text: String
+
+    static func make(sessionCost: Double, selectedProject: Project?) -> BottomDockSpendSummary? {
+        if sessionCost > 0 {
+            return BottomDockSpendSummary(text: "Session: \(formatCurrency(sessionCost))")
+        }
+
+        guard let selectedProject, selectedProject.totalCost != 0 else {
+            return nil
+        }
+
+        return BottomDockSpendSummary(text: "Project: \(formatCurrency(selectedProject.totalCost))")
+    }
+
+    private static func formatCurrency(_ value: Double) -> String {
+        String(format: "$%.2f", value)
     }
 }

@@ -581,7 +581,11 @@ actor NanoBananaService {
             throw NanoBananaError.inputPreparationFailed(message: "OpenAI Batch edits require an uploaded mask file ID when a mask is selected.")
         }
 
-        let size = try openAIOutputSize(aspectRatio: request.aspectRatio, imageSize: request.imageSize)
+        let size = try openAIOutputSize(
+            aspectRatio: request.aspectRatio,
+            imageSize: request.imageSize,
+            sourceImageURL: request.inputImageURLs.first
+        )
         let quality = openAIQuality(for: request.imageSize)
         var payload: [String: Any] = [
             "model": request.modelName,
@@ -696,7 +700,11 @@ actor NanoBananaService {
             try Self.validateOpenAIMask(primaryImageURL: primaryImageURL, maskImageURL: maskImageURL)
         }
 
-        let size = try Self.openAIOutputSize(aspectRatio: request.aspectRatio, imageSize: request.imageSize)
+        let size = try Self.openAIOutputSize(
+            aspectRatio: request.aspectRatio,
+            imageSize: request.imageSize,
+            sourceImageURL: request.inputImageURLs.first
+        )
         let quality = Self.openAIQuality(for: request.imageSize)
         let boundary = "Boundary-\(UUID().uuidString)"
         let files = try request.inputImageURLs.map { url in
@@ -1711,11 +1719,20 @@ actor NanoBananaService {
         }
     }
 
-    static func openAIOutputSize(aspectRatio: String, imageSize: String) throws -> String {
+    static func openAIOutputSize(aspectRatio: String, imageSize: String, sourceImageURL: URL? = nil) throws -> String {
         let aspect = AspectRatio.from(string: aspectRatio)
-        guard aspect.id != "Auto" else { return "auto" }
+        guard aspect.id != "Auto" else {
+            guard let sourceImageURL else { return "auto" }
+            let descriptor = try openAIImageDescriptor(for: sourceImageURL)
+            let ratio = Double(descriptor.pixelWidth) / Double(max(descriptor.pixelHeight, 1))
+            return try openAIOutputSize(forRatio: ratio, imageSize: imageSize)
+        }
 
         let ratio = Double(aspect.width / aspect.height)
+        return try openAIOutputSize(forRatio: ratio, imageSize: imageSize)
+    }
+
+    private static func openAIOutputSize(forRatio ratio: Double, imageSize: String) throws -> String {
         guard ratio <= 3.0, ratio >= (1.0 / 3.0) else {
             throw NanoBananaError.inputPreparationFailed(
                 message: "OpenAI currently supports aspect ratios up to 3:1. Select Auto or a less extreme aspect ratio."

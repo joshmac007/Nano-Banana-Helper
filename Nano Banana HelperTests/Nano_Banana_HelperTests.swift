@@ -3392,6 +3392,41 @@ struct Nano_Banana_HelperTests {
         #expect(body["n"] as? Int == 2)
     }
 
+    @Test func openAIBatchEditLineUsesSourceAspectWhenAspectIsAuto() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(
+            in: directory,
+            named: "source.jpg",
+            contents: try makeImageData(width: 3000, height: 2000, format: .jpeg, hasAlpha: false)
+        )
+        let request = ImageEditRequest(
+            provider: .openAI,
+            modelName: "gpt-image-2",
+            inputImageURLs: [sourceURL],
+            maskImageURL: nil,
+            prompt: "edit prompt",
+            systemInstruction: nil,
+            aspectRatio: "Auto",
+            imageSize: "4K",
+            useBatchTier: true,
+            openAIOutputFormat: .png,
+            openAIBackground: .auto,
+            openAIInputFidelity: .high,
+            openAIOutputCompression: 100,
+            openAINCount: 1
+        )
+
+        let line = try NanoBananaService.makeOpenAIBatchRequestLine(
+            customID: "task-auto-aspect",
+            request: request,
+            uploadedImageFileIDs: ["file-source"]
+        )
+        let json = try decodeJSONObject(line.encodedJSONLineData())
+        let body = try #require(json["body"] as? [String: Any])
+
+        #expect(body["size"] as? String == "3520x2336")
+    }
+
     @MainActor @Test func openAIBatchResultParsingPreservesPartialSuccess() async throws {
         let service = NanoBananaService()
         let outputData = """

@@ -1877,6 +1877,121 @@ struct Nano_Banana_HelperTests {
         #expect(manager.sessionImageCount == 1)
     }
 
+    @MainActor @Test func appendLedgerEntryIgnoresDuplicateJobCompletionForSameHistoryEntry() throws {
+        let tempAppSupportURL = try makeTemporaryDirectory()
+        let projectsListURL = tempAppSupportURL.appendingPathComponent("projects.json")
+        let costSummaryURL = tempAppSupportURL.appendingPathComponent("cost_summary.json")
+        let usageLedgerURL = tempAppSupportURL.appendingPathComponent("usage_ledger.json")
+        let projectsDirectoryURL = tempAppSupportURL.appendingPathComponent("projects", isDirectory: true)
+        let manager = ProjectManager(
+            appSupportURL: tempAppSupportURL,
+            projectsListURL: projectsListURL,
+            costSummaryURL: costSummaryURL,
+            usageLedgerURL: usageLedgerURL,
+            projectsDirectoryURL: projectsDirectoryURL
+        )
+        let projectId = manager.projects.first!.id
+        let historyEntryId = UUID()
+
+        manager.appendLedgerEntry(
+            UsageLedgerEntry(
+                kind: .jobCompletion,
+                projectId: projectId,
+                projectNameSnapshot: manager.projects.first?.name,
+                costDelta: 0.50,
+                imageDelta: 1,
+                tokenDelta: 15,
+                inputTokenDelta: 10,
+                outputTokenDelta: 5,
+                resolution: "4K",
+                modelName: "gemini-test",
+                relatedHistoryEntryId: historyEntryId,
+                note: nil
+            )
+        )
+        manager.appendLedgerEntry(
+            UsageLedgerEntry(
+                kind: .jobCompletion,
+                projectId: projectId,
+                projectNameSnapshot: manager.projects.first?.name,
+                costDelta: 0.75,
+                imageDelta: 1,
+                tokenDelta: 30,
+                inputTokenDelta: 20,
+                outputTokenDelta: 10,
+                resolution: "4K",
+                modelName: "gemini-test",
+                relatedHistoryEntryId: historyEntryId,
+                note: nil
+            )
+        )
+
+        #expect(manager.ledger.count == 1)
+        #expect(try loadPersistedUsageLedger(from: usageLedgerURL).count == 1)
+        #expect(manager.costSummary.totalSpent == 0.50)
+        #expect(manager.costSummary.imageCount == 1)
+        #expect(manager.projects.first?.totalCost == 0.50)
+        #expect(manager.projects.first?.imageCount == 1)
+
+        manager.appendLedgerEntry(
+            UsageLedgerEntry(
+                kind: .adjustment,
+                projectId: projectId,
+                projectNameSnapshot: manager.projects.first?.name,
+                costDelta: 0.25,
+                imageDelta: 0,
+                tokenDelta: 0,
+                inputTokenDelta: 0,
+                outputTokenDelta: 0,
+                resolution: nil,
+                modelName: nil,
+                relatedHistoryEntryId: historyEntryId,
+                note: "Manual correction"
+            )
+        )
+        #expect(manager.ledger.count == 2)
+        #expect(manager.costSummary.totalSpent == 0.75)
+
+        manager.appendLedgerEntry(
+            UsageLedgerEntry(
+                kind: .jobCompletion,
+                projectId: projectId,
+                projectNameSnapshot: manager.projects.first?.name,
+                costDelta: 0.10,
+                imageDelta: 1,
+                tokenDelta: 1,
+                inputTokenDelta: 1,
+                outputTokenDelta: 0,
+                resolution: "1K",
+                modelName: "gemini-test",
+                relatedHistoryEntryId: nil,
+                note: nil
+            )
+        )
+        manager.appendLedgerEntry(
+            UsageLedgerEntry(
+                kind: .jobCompletion,
+                projectId: projectId,
+                projectNameSnapshot: manager.projects.first?.name,
+                costDelta: 0.20,
+                imageDelta: 1,
+                tokenDelta: 2,
+                inputTokenDelta: 1,
+                outputTokenDelta: 1,
+                resolution: "1K",
+                modelName: "gemini-test",
+                relatedHistoryEntryId: nil,
+                note: nil
+            )
+        )
+
+        #expect(manager.ledger.count == 4)
+        #expect(try loadPersistedUsageLedger(from: usageLedgerURL).count == 4)
+        #expect(manager.costSummary.totalSpent == 1.05)
+        #expect(manager.projects.first?.totalCost == 1.05)
+        #expect(manager.projects.first?.imageCount == 3)
+    }
+
     @MainActor @Test func bottomDockSpendSummaryUsesSelectedProjectSpendWhenSessionIsEmpty() {
         let selectedProject = Project(name: "Selected", outputDirectory: "/tmp/selected")
         selectedProject.totalCost = 0.42
@@ -2350,6 +2465,39 @@ struct Nano_Banana_HelperTests {
         #expect(task.externalJobName == nil)
         #expect(task.status == "processing")
         #expect(task.phase == .pausedLocal)
+    }
+
+    @MainActor @Test func resumePollingFromOpenAIHistoryWithIncompleteIdentityDoesNotEnqueueRecoveredBatch() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let projectId = UUID()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { _ in }
+        )
+        let entry = HistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            externalJobName: "batches/legacy-openai-job",
+            provider: .openAI
+        )
+
+        LogManager.shared.clear()
+        orchestrator.resumePollingFromHistory(for: entry)
+
+        #expect(FileManager.default.fileExists(atPath: activeBatchURL.path) == false)
+        #expect(orchestrator.processingJobs.isEmpty)
+        #expect(orchestrator.failedJobs.isEmpty)
+        #expect(LogManager.shared.entries.contains {
+            $0.payload.contains("Resume polling ignored: OpenAI history entry is missing a remote batch id or request id.")
+        })
     }
 
     @MainActor @Test func resumePollingFromHistoryRearmsExistingOpenAIRemoteJob() throws {
@@ -3286,6 +3434,88 @@ struct Nano_Banana_HelperTests {
         #expect(try Data(contentsOf: recoveredOutput) == Data("rescued-image".utf8))
     }
 
+    @MainActor @Test func recoveredOutputCompletionAnnotatesHistoryAndLedger() async throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "input.png", contents: makeTransparentPNGData())
+        let outputURL = directory.appendingPathComponent("Desktop Project", isDirectory: true)
+        let recoveryURL = directory.appendingPathComponent("Recovered Outputs", isDirectory: true)
+        let deniedBookmark = Data("denied-output-bookmark".utf8)
+        let dependencies = AppPaths.BookmarkResolutionDependencies(
+            resolveURL: { data in
+                #expect(data == deniedBookmark)
+                return (outputURL, false)
+            },
+            refreshBookmarkData: { _ in Data("refreshed".utf8) },
+            startAccessing: { _ in false },
+            stopAccessing: { _ in }
+        )
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: directory.appendingPathComponent("active_batch.json"),
+            recoveredOutputsDirectoryURL: recoveryURL,
+            bookmarkDependencies: dependencies,
+            autoStartEnqueuedBatches: false
+        )
+        var completedEntries: [HistoryEntry] = []
+        var ledgerEntries: [UsageLedgerEntry] = []
+        orchestrator.onImageCompleted = { completedEntries.append($0) }
+        orchestrator.onLedgerEntryCreated = { ledgerEntries.append($0) }
+
+        let projectId = UUID()
+        let settings = makeBatchSettings(
+            outputDirectory: outputURL.path,
+            outputDirectoryBookmark: deniedBookmark,
+            projectId: projectId,
+            useBatchTier: true
+        )
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: outputURL.path,
+            outputDirectoryBookmark: deniedBookmark,
+            useBatchTier: true,
+            projectId: projectId,
+            modelName: "gpt-image-2",
+            provider: .openAI
+        )
+        let task = ImageTask(inputPaths: [sourceURL.path], projectId: projectId, provider: .openAI)
+        task.status = "processing"
+        task.phase = .polling
+        task.remoteBatchId = "batch_123"
+        task.remoteRequestId = "task-a"
+        task.remoteBatchProvider = .openAI
+        batch.tasks = [task]
+        orchestrator.enqueue(batch)
+
+        let result = OpenAIBatchResult(
+            batchID: "batch_123",
+            terminalStatus: "completed",
+            successes: [
+                OpenAIBatchLineSuccess(
+                    customID: "task-a",
+                    responses: [
+                        ImageEditResponse(
+                            imageData: Data("rescued-image".utf8),
+                            mimeType: "image/png",
+                            tokenUsage: nil
+                        )
+                    ]
+                )
+            ],
+            failures: []
+        )
+
+        await orchestrator.applyOpenAIBatchResult(result, batch: batch, settings: settings)
+
+        let historyEntry = try #require(completedEntries.first)
+        let ledgerEntry = try #require(ledgerEntries.first)
+        #expect(completedEntries.count == 1)
+        #expect(ledgerEntries.count == 1)
+        #expect(historyEntry.outputImagePath.hasPrefix(recoveryURL.path))
+        #expect(historyEntry.status == "completed")
+        #expect(historyEntry.error?.contains("recovery folder") == true || historyEntry.error?.contains("Output folder could not be accessed") == true)
+        #expect(ledgerEntry.note?.contains("recovery") == true || ledgerEntry.note?.contains("Output folder could not be accessed") == true)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: historyEntry.outputImagePath)) == Data("rescued-image".utf8))
+    }
+
     @Test func openAIOutputSizeRejectsExtremeAspectRatios() {
         do {
             _ = try NanoBananaService.openAIOutputSize(aspectRatio: "8:1", imageSize: "1K")
@@ -3626,6 +3856,106 @@ struct Nano_Banana_HelperTests {
         #expect(openAIEntryWithoutProvider.canResumeRemotePolling)
         #expect(incompleteOpenAIEntry.canResumeRemotePolling == false)
         #expect(incompleteOpenAIEntry.canRescueRemoteJobID == false)
+    }
+
+    @Test func openAIHistoryEntryWithOnlyExternalJobNameDoesNotAdvertiseResumeOrRescue() {
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            externalJobName: "batches/legacy-openai-job",
+            provider: .openAI
+        )
+
+        #expect(entry.canResumeRemotePolling == false)
+        #expect(entry.canRescueRemoteJobID == false)
+    }
+
+    @Test func openAIHistoryEntryRequiresRemoteBatchIdAndRemoteRequestIdForResume() {
+        let missingRequestId = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            provider: .openAI,
+            remoteBatchId: "batch_openai_123",
+            remoteBatchProvider: .openAI
+        )
+        let missingBatchId = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            provider: .openAI,
+            remoteRequestId: "task-openai-a",
+            remoteBatchProvider: .openAI
+        )
+        let completeViaProvider = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            provider: .openAI,
+            remoteBatchId: "batch_openai_123",
+            remoteRequestId: "task-openai-a"
+        )
+        let completeViaRemoteBatchProvider = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            remoteBatchId: "batch_openai_123",
+            remoteRequestId: "task-openai-a",
+            remoteBatchProvider: .openAI
+        )
+
+        #expect(missingRequestId.canResumeRemotePolling == false)
+        #expect(missingBatchId.canResumeRemotePolling == false)
+        #expect(completeViaProvider.canResumeRemotePolling)
+        #expect(completeViaRemoteBatchProvider.canResumeRemotePolling)
+    }
+
+    @Test func geminiHistoryEntryStillResumesWithExternalJobName() {
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            externalJobName: "batches/gemini-job"
+        )
+
+        #expect(entry.canResumeRemotePolling)
     }
 
     @Test func remoteBatchFieldsRoundTripThroughQueueAndHistory() throws {

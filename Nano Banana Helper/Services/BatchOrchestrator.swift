@@ -1304,13 +1304,14 @@ final class BatchOrchestrator {
             )
 
             let completedDespiteCancel = job.cancelRequestedAt != nil
+            let recoveryWarning = persisted.usedRecoveryDirectory
+                ? "Output folder could not be accessed. Saved to the recovery folder instead."
+                : nil
             job.status = "completed"
             job.phase = .completed
             job.outputPath = persisted.outputs.first?.outputURL.path
             job.completedAt = Date()
-            job.error = persisted.usedRecoveryDirectory
-                ? "Output folder could not be accessed. Saved to the recovery folder instead."
-                : nil
+            job.error = recoveryWarning
             job.stalledAt = nil
             job.cancelRequestedAt = nil
             if let owningBatch {
@@ -1330,7 +1331,7 @@ final class BatchOrchestrator {
                         outputImagePath: output.outputURL.path,
                         cost: output.cost,
                         status: "completed",
-                        error: nil,
+                        error: recoveryWarning,
                         externalJobName: jobName,
                         sourceImageBookmarks: sourceBookmarks.isEmpty ? nil : sourceBookmarks,
                         outputImageBookmark: output.outputBookmark,
@@ -1352,7 +1353,7 @@ final class BatchOrchestrator {
                             resolution: settings.imageSize,
                             modelName: resolvedModelName,
                             relatedHistoryEntryId: historyEntry.id,
-                            note: nil
+                            note: recoveryWarning
                         )
                     )
                 }

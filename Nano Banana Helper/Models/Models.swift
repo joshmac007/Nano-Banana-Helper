@@ -229,23 +229,29 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         remoteBatchId ?? externalJobName
     }
 
+    var isOpenAIRemoteBatchEntry: Bool {
+        provider == .openAI || remoteBatchProvider == .openAI
+    }
+
     var canResumeOpenAIBatchPolling: Bool {
-        (provider == .openAI || remoteBatchProvider == .openAI) &&
+        isOpenAIRemoteBatchEntry &&
             remoteBatchId != nil &&
             remoteRequestId != nil
     }
 
     var canResumeRemotePolling: Bool {
+        if isOpenAIRemoteBatchEntry {
+            return canResumeOpenAIBatchPolling
+        }
         if externalJobName != nil {
             return true
         }
-        return canResumeOpenAIBatchPolling
+        return false
     }
 
     var canRescueRemoteJobID: Bool {
         externalJobName == nil &&
-            provider != .openAI &&
-            remoteBatchProvider != .openAI
+            !isOpenAIRemoteBatchEntry
     }
     
     enum CodingKeys: String, CodingKey {

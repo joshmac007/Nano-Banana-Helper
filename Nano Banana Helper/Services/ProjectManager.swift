@@ -106,12 +106,24 @@ class ProjectManager {
     }
 
     func deleteProject(_ project: Project) {
+        guard projects.contains(where: { $0.id == project.id }) else {
+            if currentProject == nil {
+                currentProject = projects.first
+            }
+            return
+        }
+
+        guard projects.count > 1 else {
+            currentProject = projects.first
+            return
+        }
+
         projects.removeAll { $0.id == project.id }
 
         let projectDir = projectDirectory(for: project)
         try? fileManager.removeItem(at: projectDir)
 
-        if currentProject?.id == project.id {
+        if currentProject == nil || currentProject?.id == project.id {
             currentProject = projects.first
         }
 

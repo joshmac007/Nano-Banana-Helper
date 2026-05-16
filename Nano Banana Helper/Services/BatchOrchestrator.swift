@@ -228,13 +228,16 @@ final class BatchOrchestrator {
 
     func enqueue(_ batch: BatchJob) {
         discardTerminalQueueItemsBeforeNewBatch()
+        dropUnsafeSharedMaskIfNeeded(from: batch)
         activeBatches.append(batch)
 
         for task in batch.tasks {
             task.projectId = batch.projectId
             task.provider = batch.provider
-            task.maskImagePath = batch.maskImagePath
-            task.maskImageBookmark = batch.maskImageBookmark
+            if canApplySharedMask(from: batch, to: task) {
+                task.maskImagePath = task.maskImagePath ?? batch.maskImagePath
+                task.maskImageBookmark = task.maskImageBookmark ?? batch.maskImageBookmark
+            }
         }
 
         normalizeBatchStatus(batch)
@@ -246,6 +249,29 @@ final class BatchOrchestrator {
                 await start(batch: batch)
             }
         }
+    }
+
+    private func dropUnsafeSharedMaskIfNeeded(from batch: BatchJob) {
+        guard batch.maskImagePath != nil || batch.maskImageBookmark != nil else { return }
+        guard !batch.isTextMode else {
+            batch.maskImagePath = nil
+            batch.maskImageBookmark = nil
+            return
+        }
+        guard !batch.tasks.isEmpty, batch.tasks.allSatisfy({ canApplySharedMask(from: batch, to: $0) }) else {
+            batch.maskImagePath = nil
+            batch.maskImageBookmark = nil
+            return
+        }
+    }
+
+    private func canApplySharedMask(from batch: BatchJob, to task: ImageTask) -> Bool {
+        guard batch.maskImagePath != nil || batch.maskImageBookmark != nil else { return false }
+        guard !batch.isTextMode, !task.inputPaths.isEmpty else { return false }
+        if task.inputPaths.count > 1 { return true }
+
+        let inputSets = Set(batch.tasks.map(\.inputPaths))
+        return inputSets.count <= 1
     }
 
     private func discardTerminalQueueItemsBeforeNewBatch() {
@@ -613,6 +639,7 @@ final class BatchOrchestrator {
     }
 
     private func processQueue(batch: BatchJob) async {
+        dropUnsafeSharedMaskIfNeeded(from: batch)
         let batchSettings = BatchSettings(
             provider: batch.provider,
             prompt: batch.prompt,
@@ -1130,6 +1157,7 @@ final class BatchOrchestrator {
                         provider: settings.provider,
                         systemPrompt: settings.systemPrompt,
                         maskImagePath: submittedJob.maskImagePath,
+                        outputDirectoryPath: settings.outputDirectory,
                         maskImageBookmark: submittedJob.maskImageBookmark,
                         openAIOutputFormat: settings.openAIOutputFormat,
                         openAIBackground: settings.openAIBackground,
@@ -1618,6 +1646,7 @@ final class BatchOrchestrator {
             provider: settings.provider,
             systemPrompt: settings.systemPrompt,
             maskImagePath: job.maskImagePath,
+            outputDirectoryPath: settings.outputDirectory,
             maskImageBookmark: job.maskImageBookmark,
             openAIOutputFormat: settings.openAIOutputFormat,
             openAIBackground: settings.openAIBackground,
@@ -1669,6 +1698,7 @@ final class BatchOrchestrator {
                 provider: batch?.provider ?? job.provider,
                 systemPrompt: batch?.systemPrompt,
                 maskImagePath: job.maskImagePath,
+                outputDirectoryPath: batch?.outputDirectory,
                 maskImageBookmark: job.maskImageBookmark,
                 openAIOutputFormat: batch?.openAIOutputFormat ?? .png,
                 openAIBackground: batch?.openAIBackground ?? .auto,
@@ -2261,6 +2291,9 @@ final class BatchOrchestrator {
     private func outputDirectoryForHistoryResume(_ entry: HistoryEntry) -> String {
         if !entry.outputImagePath.isEmpty {
             return (entry.outputImagePath as NSString).deletingLastPathComponent
+        }
+        if let outputDirectoryPath = entry.outputDirectoryPath, !outputDirectoryPath.isEmpty {
+            return outputDirectoryPath
         }
         return AppPaths.projectsDirectoryURL
             .appendingPathComponent(entry.projectId.uuidString)

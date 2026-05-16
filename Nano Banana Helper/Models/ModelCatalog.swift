@@ -1,6 +1,6 @@
 import Foundation
 
-struct ModelCatalogEntry: Identifiable, Equatable, Sendable {
+nonisolated struct ModelCatalogEntry: Identifiable, Equatable, Sendable {
     let id: String
     let provider: ModelProvider
     let displayName: String
@@ -23,7 +23,7 @@ struct ModelCatalogEntry: Identifiable, Equatable, Sendable {
     }
 }
 
-enum CuratedModelCatalog {
+nonisolated enum CuratedModelCatalog {
     struct Definition: Sendable {
         let provider: ModelProvider
         let id: String

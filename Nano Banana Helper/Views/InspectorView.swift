@@ -140,7 +140,7 @@ struct InspectorView: View {
                                         .font(.system(size: 11, weight: .bold))
                                         .foregroundStyle(.primary)
                                         .textCase(.uppercase)
-                                    Text(stagingManager.hasMask ? "Mask applies to the first input image." : "Optional. Same size, format, and alpha channel required.")
+                                    Text(stagingManager.hasMask ? (stagingManager.isMultiInput || stagingManager.count == 1 ? "Mask will be submitted with this batch." : "Mask is kept, but not submitted for separate multi-file tasks.") : "Optional. Same size, format, and alpha channel required.")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -474,6 +474,7 @@ struct InspectorView: View {
     }
 
     private func startImageBatch(project: Project) {
+        let shouldStoreBatchMask = stagingManager.isMultiInput || stagingManager.count == 1
         let batch = BatchJob(
             prompt: stagingManager.prompt,
             systemPrompt: stagingManager.systemPrompt,
@@ -485,8 +486,8 @@ struct InspectorView: View {
             projectId: project.id,
             modelName: stagingManager.modelName,
             provider: stagingManager.provider,
-            maskImagePath: stagingManager.maskFile?.path,
-            maskImageBookmark: stagingManager.maskBookmark,
+            maskImagePath: shouldStoreBatchMask ? stagingManager.maskFile?.path : nil,
+            maskImageBookmark: shouldStoreBatchMask ? stagingManager.maskBookmark : nil,
             openAIOutputFormat: stagingManager.openAIOutputFormat,
             openAIBackground: stagingManager.openAIBackground,
             openAIInputFidelity: stagingManager.openAIInputFidelity,

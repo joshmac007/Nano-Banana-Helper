@@ -259,6 +259,7 @@ struct SettingsView: View {
                         }
                         .buttonStyle(.borderless)
                         .foregroundStyle(.red)
+                        .disabled(projectManager.projects.count <= 1)
                     }
                     .padding(.vertical, 4)
                 }

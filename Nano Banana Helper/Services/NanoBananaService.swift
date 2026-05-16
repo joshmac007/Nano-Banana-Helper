@@ -4,7 +4,7 @@ import ImageIO
 import UniformTypeIdentifiers
 
 /// Request structure for image generation or editing
-struct ImageEditRequest: Sendable {
+nonisolated struct ImageEditRequest: Sendable {
     let provider: ModelProvider
     let modelName: String
     let inputImageURLs: [URL] // Empty array for text-to-image generation
@@ -56,24 +56,24 @@ struct ImageEditRequest: Sendable {
 }
 
 /// Response structure from the active image provider
-struct ImageEditResponse: Sendable {
+nonisolated struct ImageEditResponse: Sendable {
     let imageData: Data
     let mimeType: String
     let tokenUsage: TokenUsage?
 }
 
 /// Internal struct to hold batch job creation info
-struct BatchJobInfo: Sendable {
+nonisolated struct BatchJobInfo: Sendable {
     let jobName: String
     let requestKey: String
 }
 
-enum OpenAIBatchEndpoint: String, Sendable {
+nonisolated enum OpenAIBatchEndpoint: String, Sendable {
     case imageGenerations = "/v1/images/generations"
     case imageEdits = "/v1/images/edits"
 }
 
-struct OpenAIBatchRequestLine: Sendable {
+nonisolated struct OpenAIBatchRequestLine: Sendable {
     let customID: String
     let method: String
     let endpoint: OpenAIBatchEndpoint
@@ -94,42 +94,42 @@ struct OpenAIBatchRequestLine: Sendable {
     }
 }
 
-struct OpenAIBatchLineSuccess: Sendable {
+nonisolated struct OpenAIBatchLineSuccess: Sendable {
     let customID: String
     let responses: [ImageEditResponse]
 }
 
-struct OpenAIBatchLineFailure: Sendable {
+nonisolated struct OpenAIBatchLineFailure: Sendable {
     let customID: String
     let message: String
 }
 
-struct OpenAIBatchResult: Sendable {
+nonisolated struct OpenAIBatchResult: Sendable {
     let batchID: String
     let terminalStatus: String
     let successes: [OpenAIBatchLineSuccess]
     let failures: [OpenAIBatchLineFailure]
 }
 
-struct OpenAIBatchSubmissionItem: Sendable {
+nonisolated struct OpenAIBatchSubmissionItem: Sendable {
     let taskID: UUID
     let customID: String
     let request: ImageEditRequest
 }
 
-struct OpenAIBatchRequestMapping: Sendable {
+nonisolated struct OpenAIBatchRequestMapping: Sendable {
     let taskID: UUID
     let customID: String
 }
 
-struct OpenAIBatchJobInfo: Sendable {
+nonisolated struct OpenAIBatchJobInfo: Sendable {
     let batchID: String
     let inputFileID: String
     let endpoint: OpenAIBatchEndpoint
     let requests: [OpenAIBatchRequestMapping]
 }
 
-struct OpenAIBatchStatusUpdate: Sendable {
+nonisolated struct OpenAIBatchStatusUpdate: Sendable {
     let status: String
     let completed: Int?
     let failed: Int?
@@ -137,7 +137,7 @@ struct OpenAIBatchStatusUpdate: Sendable {
     let updatedAt: Date
 }
 
-private struct OpenAIBatchStatus: Sendable {
+nonisolated private struct OpenAIBatchStatus: Sendable {
     let id: String
     let status: String
     let outputFileID: String?
@@ -148,7 +148,7 @@ private struct OpenAIBatchStatus: Sendable {
     let errorMessage: String?
 }
 
-struct PollRetryState: Sendable {
+nonisolated struct PollRetryState: Sendable {
     private(set) var consecutiveErrors = 0
 
     mutating func registerRetryableError() -> TimeInterval {
@@ -161,13 +161,13 @@ struct PollRetryState: Sendable {
     }
 }
 
-struct PollStatusUpdate: Sendable {
+nonisolated struct PollStatusUpdate: Sendable {
     let attempt: Int
     let state: String
     let updatedAt: Date
 }
 
-struct PreparedInlineImage: Sendable {
+nonisolated struct PreparedInlineImage: Sendable {
     let filename: String
     let sourceMimeType: String
     let payloadMimeType: String
@@ -181,7 +181,7 @@ struct PreparedInlineImage: Sendable {
     }
 }
 
-struct RequestBuildDiagnostics: Sendable {
+nonisolated struct RequestBuildDiagnostics: Sendable {
     let promptCharacterCount: Int
     let inputCount: Int
     let totalInlineBytes: Int
@@ -189,12 +189,12 @@ struct RequestBuildDiagnostics: Sendable {
     let preparedInputs: [PreparedInlineImage]
 }
 
-private struct RequestBuildArtifacts {
+nonisolated private struct RequestBuildArtifacts {
     let payload: [String: Any]
     let diagnostics: RequestBuildDiagnostics
 }
 
-private struct MultipartFile {
+nonisolated private struct MultipartFile {
     let fieldName: String
     let filename: String
     let mimeType: String

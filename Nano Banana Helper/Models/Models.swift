@@ -1,6 +1,6 @@
 import Foundation
 
-enum ModelProvider: String, Codable, CaseIterable, Identifiable, Sendable {
+nonisolated enum ModelProvider: String, Codable, CaseIterable, Identifiable, Sendable {
     case gemini
     case openAI = "openai"
 
@@ -31,7 +31,7 @@ enum ModelProvider: String, Codable, CaseIterable, Identifiable, Sendable {
 
 // MARK: - OpenAI Advanced Parameter Types
 
-enum OpenAIOutputFormat: String, CaseIterable, Identifiable, Codable, Sendable {
+nonisolated enum OpenAIOutputFormat: String, CaseIterable, Identifiable, Codable, Sendable {
     case png, jpeg, webp
     var id: String { rawValue }
     var displayName: String { rawValue.uppercased() }
@@ -46,13 +46,13 @@ enum OpenAIOutputFormat: String, CaseIterable, Identifiable, Codable, Sendable {
     var supportsBackground: Bool { self == .png || self == .webp }
 }
 
-enum OpenAIBackground: String, CaseIterable, Identifiable, Codable, Sendable {
+nonisolated enum OpenAIBackground: String, CaseIterable, Identifiable, Codable, Sendable {
     case auto, transparent, opaque
     var id: String { rawValue }
     var displayName: String { rawValue.capitalized }
 }
 
-enum OpenAIInputFidelity: String, CaseIterable, Identifiable, Codable, Sendable {
+nonisolated enum OpenAIInputFidelity: String, CaseIterable, Identifiable, Codable, Sendable {
     case high, low
     var id: String { rawValue }
     var displayName: String { rawValue.capitalized }
@@ -180,6 +180,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     let provider: ModelProvider
     let systemPrompt: String?
     let maskImagePath: String?
+    let outputDirectoryPath: String?
     let openAIOutputFormat: OpenAIOutputFormat
     let openAIBackground: OpenAIBackground
     let openAIInputFidelity: OpenAIInputFidelity
@@ -260,6 +261,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         case status, error, externalJobName, remoteBatchId, remoteRequestId, remoteBatchProvider
         case sourceImageBookmarks, outputImageBookmark, outputDirectoryBookmark, maskImageBookmark
         case tokenUsage, modelName, provider, systemPrompt, maskImagePath
+        case outputDirectoryPath
         case openAIOutputFormat, openAIBackground, openAIInputFidelity, openAIOutputCompression, openAINCount
     }
     
@@ -285,6 +287,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         provider: ModelProvider = .gemini,
         systemPrompt: String? = nil,
         maskImagePath: String? = nil,
+        outputDirectoryPath: String? = nil,
         maskImageBookmark: Data? = nil,
         openAIOutputFormat: OpenAIOutputFormat = .png,
         openAIBackground: OpenAIBackground = .auto,
@@ -319,6 +322,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.provider = provider
         self.systemPrompt = systemPrompt
         self.maskImagePath = maskImagePath
+        self.outputDirectoryPath = outputDirectoryPath
         self.maskImageBookmark = maskImageBookmark
         self.openAIOutputFormat = openAIOutputFormat
         self.openAIBackground = openAIBackground
@@ -353,6 +357,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         provider = try container.decodeIfPresent(ModelProvider.self, forKey: .provider) ?? .gemini
         systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt)
         maskImagePath = try container.decodeIfPresent(String.self, forKey: .maskImagePath)
+        outputDirectoryPath = try container.decodeIfPresent(String.self, forKey: .outputDirectoryPath)
         maskImageBookmark = try container.decodeIfPresent(Data.self, forKey: .maskImageBookmark)
         openAIOutputFormat = try container.decodeIfPresent(OpenAIOutputFormat.self, forKey: .openAIOutputFormat) ?? .png
         openAIBackground = try container.decodeIfPresent(OpenAIBackground.self, forKey: .openAIBackground) ?? .auto
@@ -387,6 +392,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         try container.encode(provider, forKey: .provider)
         try container.encodeIfPresent(systemPrompt, forKey: .systemPrompt)
         try container.encodeIfPresent(maskImagePath, forKey: .maskImagePath)
+        try container.encodeIfPresent(outputDirectoryPath, forKey: .outputDirectoryPath)
         try container.encodeIfPresent(maskImageBookmark, forKey: .maskImageBookmark)
         try container.encode(openAIOutputFormat, forKey: .openAIOutputFormat)
         try container.encode(openAIBackground, forKey: .openAIBackground)
@@ -418,6 +424,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
             provider: provider,
             systemPrompt: systemPrompt,
             maskImagePath: maskImagePath,
+            outputDirectoryPath: outputDirectoryPath,
             maskImageBookmark: maskImageBookmark,
             openAIOutputFormat: openAIOutputFormat,
             openAIBackground: openAIBackground,

@@ -12,6 +12,7 @@ import Testing
 import UniformTypeIdentifiers
 @testable import Nano_Banana_Helper
 
+@MainActor
 struct Nano_Banana_HelperTests {
     private let floatingPointTolerance = 0.000_000_1
 
@@ -1827,6 +1828,26 @@ struct Nano_Banana_HelperTests {
         #expect(persistedEntries.isEmpty)
     }
 
+    @MainActor @Test func deleteProjectKeepsFinalProjectSelected() throws {
+        let tempAppSupportURL = try makeTemporaryDirectory()
+        let projectsListURL = tempAppSupportURL.appendingPathComponent("projects.json")
+        let costSummaryURL = tempAppSupportURL.appendingPathComponent("cost_summary.json")
+        let projectsDirectoryURL = tempAppSupportURL.appendingPathComponent("projects", isDirectory: true)
+        let manager = ProjectManager(
+            appSupportURL: tempAppSupportURL,
+            projectsListURL: projectsListURL,
+            costSummaryURL: costSummaryURL,
+            projectsDirectoryURL: projectsDirectoryURL
+        )
+        let onlyProject = try #require(manager.projects.first)
+        manager.currentProject = nil
+
+        manager.deleteProject(onlyProject)
+
+        #expect(manager.projects.map(\.id) == [onlyProject.id])
+        #expect(manager.currentProject?.id == onlyProject.id)
+    }
+
     @MainActor @Test func appendLedgerEntryPersistsUsageAndDerivesProjectTotals() throws {
         let tempAppSupportURL = try makeTemporaryDirectory()
         let projectsListURL = tempAppSupportURL.appendingPathComponent("projects.json")
@@ -2333,6 +2354,42 @@ struct Nano_Banana_HelperTests {
         #expect(persistedState.batches.first?.systemPrompt == nil)
         #expect(persistedState.batches.first?.outputDirectoryBookmark == outputDirectoryBookmark)
         #expect(persistedState.batches.first?.tasks.first?.inputBookmarks == [inputBookmark])
+    }
+
+    @MainActor @Test func resumePollingFromHistoryWithEmptyOutputAndNilBookmarkPreservesDefaultOutputDirectory() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let projectId = UUID()
+        let defaultOutputDirectory = AppPaths.defaultOutputDirectory.path
+        let fallbackOutputDirectory = AppPaths.projectsDirectoryURL
+            .appendingPathComponent(projectId.uuidString)
+            .appendingPathComponent("Outputs")
+            .path(percentEncoded: false)
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        let entry = HistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: ["/tmp/input.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "16:9",
+            imageSize: "2K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "processing",
+            externalJobName: "batches/default-output-job",
+            outputDirectoryBookmark: nil,
+            outputDirectoryPath: defaultOutputDirectory
+        )
+
+        orchestrator.resumePollingFromHistory(for: entry)
+
+        let persistedState = try loadPersistedQueueState(from: activeBatchURL)
+        let batch = try #require(persistedState.batches.first)
+        #expect(batch.outputDirectory == defaultOutputDirectory)
+        #expect(batch.outputDirectory != fallbackOutputDirectory)
+        #expect(batch.outputDirectoryBookmark == nil)
     }
 
     @MainActor @Test func resumePollingFromLegacyHistoryLeavesModelNameNil() throws {
@@ -3140,6 +3197,7 @@ struct Nano_Banana_HelperTests {
             provider: .openAI,
             systemPrompt: "system",
             maskImagePath: "/tmp/mask.png",
+            outputDirectoryPath: "/tmp/history-output",
             maskImageBookmark: Data("mask".utf8),
             openAIOutputFormat: .webp,
             openAIBackground: .transparent,
@@ -3153,6 +3211,7 @@ struct Nano_Banana_HelperTests {
 
         #expect(decoded.provider == .openAI)
         #expect(decoded.maskImagePath == "/tmp/mask.png")
+        #expect(decoded.outputDirectoryPath == "/tmp/history-output")
         #expect(decoded.maskImageBookmark == Data("mask".utf8))
         #expect(decoded.openAIOutputFormat == .webp)
         #expect(decoded.openAIBackground == .transparent)
@@ -3275,6 +3334,154 @@ struct Nano_Banana_HelperTests {
         #expect(task.provider == .openAI)
         #expect(task.maskImagePath == maskURL.path)
         #expect(task.maskImageBookmark == Data("mask".utf8))
+    }
+
+    @MainActor @Test func imageTasksDropSharedMaskForMultipleIndependentSources() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "first.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "second.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+
+        let manager = BatchStagingManager()
+        manager.addFiles([firstURL, secondURL])
+        manager.setMaskFile(maskURL, bookmark: Data("mask".utf8))
+
+        let tasks = manager.makeImageTasks()
+
+        #expect(tasks.count == 2)
+        #expect(tasks.allSatisfy { $0.maskImagePath == nil })
+        #expect(tasks.allSatisfy { $0.maskImageBookmark == nil })
+    }
+
+    @MainActor @Test func multiInputImageTasksCarrySharedMaskMetadata() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "first.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "second.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+
+        let manager = BatchStagingManager()
+        manager.isMultiInput = true
+        manager.addFiles([firstURL, secondURL])
+        manager.setMaskFile(maskURL, bookmark: Data("mask".utf8))
+
+        let task = try #require(manager.makeImageTasks().first)
+
+        #expect(task.inputPaths == [firstURL.path, secondURL.path])
+        #expect(task.maskImagePath == maskURL.path)
+        #expect(task.maskImageBookmark == Data("mask".utf8))
+    }
+
+    @MainActor @Test func enqueueDropsSharedBatchMaskForMultipleIndependentSources() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "first.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "second.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+        let activeBatchURL = directory.appendingPathComponent("active_batch.json")
+        let maskBookmark = Data("mask".utf8)
+
+        let manager = BatchStagingManager()
+        manager.applyProviderSelection(.openAI, modelName: "gpt-image-2")
+        manager.addFiles([firstURL, secondURL])
+        manager.setMaskFile(maskURL, bookmark: maskBookmark)
+
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: directory.path,
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            maskImagePath: maskURL.path,
+            maskImageBookmark: maskBookmark
+        )
+        batch.tasks = manager.makeImageTasks()
+
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        orchestrator.enqueue(batch)
+
+        let persistedBatch = try #require(loadPersistedQueueState(from: activeBatchURL).batches.first)
+        #expect(persistedBatch.maskImagePath == nil)
+        #expect(persistedBatch.maskImageBookmark == nil)
+        #expect(persistedBatch.tasks.count == 2)
+        #expect(persistedBatch.tasks.allSatisfy { $0.maskImagePath == nil })
+        #expect(persistedBatch.tasks.allSatisfy { $0.maskImageBookmark == nil })
+    }
+
+    @MainActor @Test func enqueuePreservesSharedBatchMaskForSingleSourceVariations() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "source.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+        let activeBatchURL = directory.appendingPathComponent("active_batch.json")
+        let maskBookmark = Data("mask".utf8)
+
+        let manager = BatchStagingManager()
+        manager.applyProviderSelection(.openAI, modelName: "gpt-image-2")
+        manager.imageVariationCount = 2
+        manager.addFiles([sourceURL])
+        manager.setMaskFile(maskURL, bookmark: maskBookmark)
+
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: directory.path,
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            maskImagePath: maskURL.path,
+            maskImageBookmark: maskBookmark
+        )
+        batch.tasks = manager.makeImageTasks()
+
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        orchestrator.enqueue(batch)
+
+        let persistedBatch = try #require(loadPersistedQueueState(from: activeBatchURL).batches.first)
+        #expect(persistedBatch.maskImagePath == maskURL.path)
+        #expect(persistedBatch.maskImageBookmark == maskBookmark)
+        #expect(persistedBatch.tasks.count == 2)
+        #expect(persistedBatch.tasks.allSatisfy { $0.maskImagePath == maskURL.path })
+        #expect(persistedBatch.tasks.allSatisfy { $0.maskImageBookmark == maskBookmark })
+    }
+
+    @MainActor @Test func enqueuePreservesSharedBatchMaskForMergedMultiInputTask() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "first.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "second.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+        let activeBatchURL = directory.appendingPathComponent("active_batch.json")
+        let maskBookmark = Data("mask".utf8)
+
+        let manager = BatchStagingManager()
+        manager.applyProviderSelection(.openAI, modelName: "gpt-image-2")
+        manager.isMultiInput = true
+        manager.addFiles([firstURL, secondURL])
+        manager.setMaskFile(maskURL, bookmark: maskBookmark)
+
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: directory.path,
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            maskImagePath: maskURL.path,
+            maskImageBookmark: maskBookmark
+        )
+        batch.tasks = manager.makeImageTasks()
+
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        orchestrator.enqueue(batch)
+
+        let persistedBatch = try #require(loadPersistedQueueState(from: activeBatchURL).batches.first)
+        let task = try #require(persistedBatch.tasks.first)
+        #expect(persistedBatch.maskImagePath == maskURL.path)
+        #expect(persistedBatch.maskImageBookmark == maskBookmark)
+        #expect(task.inputPaths == [firstURL.path, secondURL.path])
+        #expect(task.maskImagePath == maskURL.path)
+        #expect(task.maskImageBookmark == maskBookmark)
     }
 
     @MainActor @Test func openAIPreflightPreservesPNGPayload() async throws {

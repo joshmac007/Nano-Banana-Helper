@@ -724,7 +724,7 @@ private enum ThumbnailBucket: Int, Sendable {
         }
     }
 
-    var maxPixelSize: Int {
+    nonisolated var maxPixelSize: Int {
         rawValue
     }
 

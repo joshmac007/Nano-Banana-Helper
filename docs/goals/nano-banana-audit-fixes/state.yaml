@@ -1,0 +1,623 @@
+version: 2
+
+goal:
+  title: "Nano Banana Audit Fixes"
+  slug: "nano-banana-audit-fixes"
+  kind: existing_plan
+  tranche: "Implement and verify the five audited reliability fixes using bounded Worker slices, Judge review, and GitNexus impact/change checks where available."
+  status: complete
+  intake:
+    original_request: "Use subagents to build out the audited fixes, reviewers afterwards, and GitNexus when needed to keep changes tight."
+    interpreted_outcome: "All five audited Nano Banana Helper issues are fixed with scoped implementation, regression tests, verification, and final review."
+    input_shape: existing_plan
+    audience: "Nano Banana Helper owner and app users"
+    authority: approved
+    proof_type: test
+    completion_proof: "Focused tests and relevant builds pass, Swift 6 readiness is verified or explicitly blocked with evidence, GitNexus impact/change checks are recorded when available, and final Judge audit confirms all five original findings are closed."
+    likely_misfire: "Stopping at planning, fixing only the easy UI guard, or applying broad refactors that do not close all five audited behaviors."
+    blind_spots_considered:
+      - "GoalBuddy Codex agent roles may need installation before true goal_scout/goal_worker/goal_judge dispatch."
+      - "GitNexus may be unavailable or stale; the PM must record that truthfully and use narrow manual fallback only when allowed."
+      - "Swift 6 may expose layered compiler errors after the first failures are fixed."
+      - "Bookmark/output fixes must preserve sandbox security instead of bypassing it."
+      - "Thumbnail async work must keep security-scoped access and avoid main-thread file I/O."
+    existing_plan_facts:
+      - "P1 Swift concurrency debt is hidden by Swift 5 mode; README claims Swift 6 while project configs set SWIFT_VERSION = 5.0."
+      - "P2 OpenAI non-multi-input mask handling applies one mask to every staged file and can poison multi-file Batch Tier submissions."
+      - "P2 Settings can delete the last project; ProjectManager can leave currentProject nil."
+      - "P2 History resume can lose the original output folder when no bookmark exists."
+      - "P2 Staging thumbnails synchronously read full image data during SwiftUI rendering."
+
+rules:
+  pm_owns_state: true
+  one_active_task: true
+  max_write_workers: 1
+  no_implementation_without_worker_or_pm_task: true
+  no_completion_without_judge_or_pm_audit: true
+  planning_is_not_completion: true
+  queued_required_worker_blocks_completion: true
+  continuous_until_full_outcome: true
+  missing_input_or_credentials_do_not_stop_goal: true
+  preserve_and_validate_existing_plan: true
+  intake_misfire_must_be_audited: true
+  slice_policy:
+    max_consecutive_tiny_tasks: 2
+    prefer_vertical_slices: true
+    judge_picks_largest_safe_slice: true
+    worker_completes_whole_slice: true
+
+agents:
+  scout: bundled_not_installed
+  worker: bundled_not_installed
+  judge: bundled_not_installed
+  note: "Bundled GoalBuddy agent templates exist; Codex-visible goal_scout/goal_worker/goal_judge roles were not verified during prep. The first PM task must verify/install or fall back truthfully before dispatch."
+
+visual_board:
+  selected: local
+  local:
+    status: live
+    url: "http://goalbuddy.localhost:41737/nano-banana-audit-fixes/"
+    command: "npx goalbuddy board docs/goals/nano-banana-audit-fixes"
+  github_projects:
+    status: not_requested
+    url: null
+    command: "npx goalbuddy extend github-projects"
+    missing: []
+
+active_task: null
+
+tasks:
+  - id: T001
+    type: pm
+    assignee: PM
+    status: done
+    reasoning_hint: medium
+    objective: "Verify GoalBuddy agent dispatch readiness and GitNexus availability, then update the board with truthful execution constraints before implementation."
+    inputs:
+      - "GoalBuddy bundled agent templates"
+      - "Current Codex spawn_agent role availability"
+      - "Repo GitNexus instructions from AGENTS.md/project docs"
+      - "docs/goals/nano-banana-audit-fixes/state.yaml"
+    constraints:
+      - "Control-file-only writes."
+      - "Do not inspect implementation code beyond what is necessary to verify tool availability."
+      - "Do not implement fixes in this task."
+      - "If goal_scout/goal_worker/goal_judge roles are unavailable, record the installation/fallback path before any attempted subagent dispatch."
+    expected_output:
+      - "Agent availability status"
+      - "GitNexus availability/staleness status"
+      - "Updated board constraints or setup task if needed"
+      - "Receipt stating whether parallel subagent implementation can proceed"
+    receipt:
+      result: done
+      summary: "GoalBuddy update check passed. Bundled GoalBuddy agent templates and Claude-side configs exist, but this Codex session exposes only default/explorer/worker spawn roles, not goal_scout/goal_worker/goal_judge. GitNexus CLI is usable with an up-to-date Nano-Banana-Helper index at commit 4209a6d. Proceed with PM-supervised fallback and native Codex subagents where bounded; record GitNexus CLI/MCP limitations truthfully before edits."
+      evidence:
+        - "npx --yes goalbuddy prompt \"$PWD/docs/goals/nano-banana-audit-fixes\""
+        - "npx --yes --package gitnexus@latest gitnexus status"
+        - ".gitnexus/meta.json"
+      facts:
+        - "GoalBuddy dedicated Codex spawn roles unavailable in current tool schema."
+        - "GitNexus index current: indexed commit 4209a6d equals current commit 4209a6d."
+        - "GitNexus MCP tools were not exposed through tool_search; CLI status/list are available."
+      contradictions:
+        - "User asked for subagents, but GoalBuddy-specific subagent role names are not callable in this Codex session."
+      ambiguity_requiring_judge:
+        - "Whether to treat native Codex explorer/worker agents as acceptable fallback for GoalBuddy Scout/Worker/Judge tasks."
+  - id: T002
+    type: scout
+    assignee: Scout
+    status: done
+    reasoning_hint: medium
+    objective: "Refresh evidence for the five audited findings and map exact affected symbols, tests, and verification commands."
+    inputs:
+      - "Audit findings in goal.md"
+      - "Repo source files and tests"
+      - "GitNexus query/context/impact tools when available"
+    constraints:
+      - "Read-only."
+      - "Prefer GitNexus for unfamiliar execution flows when available."
+      - "Report exact files, symbols, call chains, and tests; do not propose broad refactors."
+    expected_output:
+      - "Evidence map for all five findings"
+      - "Affected symbols requiring impact analysis"
+      - "Recommended Worker slices with allowed_files candidates"
+      - "Focused test/build commands"
+    receipt:
+      result: done
+      summary: "Evidence refreshed for all five findings. Swift 6 override build still fails on MainActor-inferred AppPaths.bookmark default callback usage. GitNexus CLI is available/current but query/impact are degraded for these Swift symbols, returning target-not-found or no definitions; use source-call evidence as fallback and keep GitNexus detect-changes for final scope."
+      evidence:
+        - "docs/goals/nano-banana-audit-fixes/notes/T002-evidence-map.md"
+        - "rtk proxy xcodebuild build ... SWIFT_VERSION=6.0 ... CODE_SIGNING_ALLOWED=NO"
+        - "gitnexus impact --repo Nano-Banana-Helper --depth 2 --include-tests <target>"
+      facts:
+        - "All five findings remain reproducible from current source."
+        - "Current GitNexus index is present but not sufficient for symbol-level impact on the target Swift symbols."
+        - "Tests exist near every finding, but missing regressions for multi-file mask handling, last-project deletion, nil-bookmark history resume output path, and staging thumbnail async behavior."
+      contradictions:
+        - "Repo requires GitNexus impact before symbol edits, but GitNexus returns UNKNOWN for key Swift symbols; Judge must approve source-evidence fallback per slice."
+      ambiguity_requiring_judge:
+        - "Whether to group the three data-safety fixes into one Worker slice or keep them separate because they share the large unit test file."
+  - id: T003
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Choose safe implementation slices and parallelization boundaries for the five fixes."
+    inputs:
+      - "T001 receipt"
+      - "T002 receipt"
+      - "Current dirty diff"
+    constraints:
+      - "Do not implement."
+      - "Require GitNexus impact evidence or an explicit unavailable fallback before any symbol edit."
+      - "Prefer the largest safe useful slices; only split Workers when write scopes are disjoint and verification remains clear."
+    expected_output:
+      - "Implementation sequencing decision"
+      - "Parallel Worker plan if safe"
+      - "Each Worker objective"
+      - "allowed_files"
+      - "verify"
+      - "stop_if"
+    receipt:
+      result: done
+      decision: approved
+      full_outcome_complete: false
+      evidence:
+        - "docs/goals/nano-banana-audit-fixes/notes/T002-evidence-map.md"
+        - "git status --short showed only pre-existing CLAUDE.md change plus GoalBuddy files before implementation."
+      blocked_tasks: []
+      required_board_updates:
+        - "Use sequential Worker slices; do not parallelize writes because Nano_Banana_HelperTests.swift is shared and Models.swift may be touched by multiple slices."
+        - "Approve native Codex worker fallback for implementation only because GoalBuddy goal_worker is unavailable and user explicitly requested subagents."
+        - "For every Worker, treat GitNexus symbol impact UNKNOWN as not-low-risk; use source evidence, focused tests, and final gitnexus detect-changes as fallback."
+        - "Run T004 Swift 6 readiness first because it is the highest-risk compiler gate and may expose layered follow-up errors."
+  - id: T004
+    type: worker
+    assignee: Worker
+    status: blocked
+    reasoning_hint: medium
+    objective: "Implement the Swift 6 concurrency-readiness slice selected by Judge."
+    allowed_files:
+      - "Nano Banana Helper/Models/Models.swift"
+      - "Nano Banana Helper/Models/ModelCatalog.swift"
+      - "Nano Banana Helper/Models/AppPaths.swift"
+      - "Nano Banana Helper/Services/NanoBananaService.swift"
+      - "Nano Banana Helper/Services/HistoryManager.swift"
+      - "Nano Banana Helper/Views/BookmarkAccessDeniedView.swift"
+      - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+    verify:
+      - "rtk proxy xcodebuild build -quiet -project 'Nano Banana Helper.xcodeproj' -scheme 'Nano Banana Helper' -destination 'platform=macOS,arch=arm64' -derivedDataPath 'build/GoalSwift6DerivedData' SWIFT_VERSION=6.0 MACOSX_DEPLOYMENT_TARGET=26.2 CODE_SIGNING_ALLOWED=NO"
+      - "rtk proxy xcodebuild test -quiet -project 'Nano Banana Helper.xcodeproj' -scheme 'Nano Banana Helper' -destination 'platform=macOS,arch=arm64' -derivedDataPath 'build/GoalVerifyDerivedData' -only-testing:'Nano Banana HelperTests' MACOSX_DEPLOYMENT_TARGET=26.2 CODE_SIGNING_ALLOWED=NO"
+    stop_if:
+      - "Need files outside allowed_files."
+      - "GitNexus impact is HIGH or CRITICAL."
+      - "Swift 6 build exposes unrelated architectural changes that need a new Judge decision."
+      - "Verification fails twice for the same reason."
+    receipt:
+      result: blocked
+      changed_files:
+        - "Nano Banana Helper/Models/Models.swift"
+        - "Nano Banana Helper/Models/ModelCatalog.swift"
+        - "Nano Banana Helper/Models/AppPaths.swift"
+        - "Nano Banana Helper/Services/NanoBananaService.swift"
+      commands:
+        - cmd: "npx gitnexus --help"
+          status: fail
+        - cmd: "rtk proxy xcodebuild build ... SWIFT_VERSION=6.0 ... CODE_SIGNING_ALLOWED=NO"
+          status: fail
+        - cmd: "rtk proxy xcodebuild test ... -only-testing:'Nano Banana HelperTests'"
+          status: not_run
+      summary: "Native Codex Worker added scoped nonisolated annotations to value/helper types and preserved bookmark behavior. Swift 6 build advanced past the original AppPaths.bookmark callback errors but stopped on ResultsView.swift:917, which was outside T004 allowed_files."
+      remaining_blockers:
+        - "Need a follow-up Worker for Nano Banana Helper/Views/ResultsView.swift before Swift 6 build can continue."
+  - id: T010
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: medium
+    objective: "Continue the Swift 6 readiness slice by fixing the ResultsView.swift actor-isolation blocker exposed by T004 verification."
+    allowed_files:
+      - "Nano Banana Helper/Views/ResultsView.swift"
+      - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+    verify:
+      - "rtk proxy xcodebuild build -quiet -project 'Nano Banana Helper.xcodeproj' -scheme 'Nano Banana Helper' -destination 'platform=macOS,arch=arm64' -derivedDataPath 'build/GoalSwift6DerivedData' SWIFT_VERSION=6.0 MACOSX_DEPLOYMENT_TARGET=26.2 CODE_SIGNING_ALLOWED=NO"
+      - "rtk proxy xcodebuild test -quiet -project 'Nano Banana Helper.xcodeproj' -scheme 'Nano Banana Helper' -destination 'platform=macOS,arch=arm64' -derivedDataPath 'build/GoalVerifyDerivedData' -only-testing:'Nano Banana HelperTests' MACOSX_DEPLOYMENT_TARGET=26.2 CODE_SIGNING_ALLOWED=NO"
+    stop_if:
+      - "Need files outside allowed_files."
+      - "Swift 6 build exposes unrelated architectural changes that need a new Judge decision."
+      - "Verification fails twice for the same reason."
+    receipt:
+      result: done
+      changed_files:
+        - "Nano Banana Helper/Views/ResultsView.swift"
+      commands:
+        - cmd: "rtk proxy xcodebuild build ... SWIFT_VERSION=6.0 ... CODE_SIGNING_ALLOWED=NO"
+          status: pass
+        - cmd: "rtk proxy xcodebuild test ... -only-testing:'Nano Banana HelperTests'"
+          status: pass
+        - cmd: "git diff --check"
+          status: pass
+      summary: "Native Codex Worker fixed the Swift 6 ResultsView blocker by marking the pure ThumbnailBucket.maxPixelSize getter nonisolated. Swift 6 override build and focused Nano Banana HelperTests passed in the worker run."
+      remaining_blockers:
+        - "Tests still emit existing Swift 6 isolation warnings in the test file."
+  - id: T005
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: medium
+    objective: "Implement the OpenAI mask batching safety slice selected by Judge."
+    allowed_files:
+      - "Nano Banana Helper/Models/BatchStagingManager.swift"
+      - "Nano Banana Helper/Views/InspectorView.swift"
+      - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+    verify:
+      - "Focused unit tests for BatchStagingManager mask/multi-file behavior."
+      - "Full Nano Banana HelperTests command from T004 verify list."
+    stop_if:
+      - "Need files outside allowed_files."
+      - "Mask contract requires product behavior not resolved by the audited finding."
+      - "GitNexus impact is HIGH or CRITICAL."
+      - "Verification fails twice for the same reason."
+    receipt:
+      result: done
+      changed_files:
+        - "Nano Banana Helper/Models/BatchStagingManager.swift"
+        - "Nano Banana Helper/Views/InspectorView.swift"
+        - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+      commands:
+        - cmd: "rtk proxy xcodebuild test ... -only-testing:'Nano Banana HelperTests'"
+          status: pass
+        - cmd: "git diff --check"
+          status: pass
+      summary: "Native Codex Worker changed makeImageTasks so a shared mask is submitted only for one independent source or a merged multi-input task, not for multiple independent per-source tasks. Added regressions for dropping shared masks in separate multi-file mode and preserving masks in multi-input mode; updated Inspector helper copy. Worker reported red/green regression proof and degraded GitNexus impact/detect-changes output."
+      remaining_blockers:
+        - "GitNexus symbol impact and detect-changes were degraded/unreliable for this Swift diff."
+  - id: T006
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: medium
+    objective: "Implement the project deletion invariant slice selected by Judge."
+    allowed_files:
+      - "Nano Banana Helper/Services/ProjectManager.swift"
+      - "Nano Banana Helper/Views/SettingsView.swift"
+      - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+    verify:
+      - "Focused ProjectManager deletion invariant test."
+      - "Full Nano Banana HelperTests command from T004 verify list."
+    stop_if:
+      - "Need files outside allowed_files."
+      - "Deletion behavior conflicts with an existing project-management contract."
+      - "GitNexus impact is HIGH or CRITICAL."
+      - "Verification fails twice for the same reason."
+    receipt:
+      result: done
+      changed_files:
+        - "Nano Banana Helper/Services/ProjectManager.swift"
+        - "Nano Banana Helper/Views/SettingsView.swift"
+        - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+      commands:
+        - cmd: "Focused xcodebuild deleteProjectKeepsFinalProjectSelected"
+          status: pass
+        - cmd: "rtk proxy xcodebuild test ... -only-testing:'Nano Banana HelperTests'"
+          status: pass
+        - cmd: "git diff --check"
+          status: pass
+      summary: "Native Codex Worker added a service-level deleteProject invariant that refuses to remove the final project and restores currentProject when possible. Settings now disables the final-project delete button. Added a focused regression for final-project deletion."
+      remaining_blockers: []
+  - id: T007
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: medium
+    objective: "Implement the history resume output-directory preservation slice selected by Judge."
+    allowed_files:
+      - "Nano Banana Helper/Models/Models.swift"
+      - "Nano Banana Helper/Services/BatchOrchestrator.swift"
+      - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+    verify:
+      - "Focused resumePollingFromHistory nil-bookmark/default-output regression."
+      - "Full Nano Banana HelperTests command from T004 verify list."
+    stop_if:
+      - "Need files outside allowed_files."
+      - "A schema/persistence migration is required beyond the approved narrow fix."
+      - "Sandbox/bookmark behavior would be weakened."
+      - "GitNexus impact is HIGH or CRITICAL."
+      - "Verification fails twice for the same reason."
+    receipt:
+      result: done
+      changed_files:
+        - "Nano Banana Helper/Models/Models.swift"
+        - "Nano Banana Helper/Services/BatchOrchestrator.swift"
+        - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+      commands:
+        - cmd: "Focused xcodebuild resumePollingFromHistory nil-bookmark/default-output regression"
+          status: pass
+        - cmd: "rtk proxy xcodebuild test ... -only-testing:'Nano Banana HelperTests'"
+          status: pass
+        - cmd: "git diff --check"
+          status: pass
+      summary: "Native Codex Worker added backward-compatible HistoryEntry.outputDirectoryPath, persists it from remote history writes, and makes resume prefer it when outputImagePath is empty. Added nil-bookmark/default-output regression proving resume avoids the AppSupport fallback."
+      remaining_blockers: []
+  - id: T008
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: medium
+    objective: "Implement the asynchronous staging thumbnail slice selected by Judge."
+    allowed_files:
+      - "Nano Banana Helper/Views/StagingView.swift"
+      - "Nano Banana Helper/Views/ResultsView.swift"
+      - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+    verify:
+      - "Code evidence that StagedImageCell body no longer calls AppPaths.loadImageData synchronously."
+      - "Full Nano Banana HelperTests command from T004 verify list."
+    stop_if:
+      - "Need files outside allowed_files."
+      - "Thumbnail changes break security-scoped bookmark access."
+      - "GitNexus impact is HIGH or CRITICAL."
+      - "Verification fails twice for the same reason."
+    receipt:
+      result: done
+      changed_files:
+        - "Nano Banana Helper/Views/StagingView.swift"
+      commands:
+        - cmd: "rg code evidence: StagedImageCell no longer calls AppPaths.loadImageData or NSImage(data:)"
+          status: pass
+        - cmd: "rtk proxy xcodebuild test ... -only-testing:'Nano Banana HelperTests'"
+          status: pass
+        - cmd: "git diff --check"
+          status: pass
+      summary: "Native Codex Worker moved StagedImageCell thumbnail loading to an async .task path using AppPaths.withAccessibleURL and ImageIO thumbnail decoding. The view body no longer synchronously reads full image data."
+      remaining_blockers: []
+  - id: T009
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Review implemented slices for scope control, behavior closure, and test adequacy."
+    inputs:
+      - "Worker receipts"
+      - "Current diff"
+      - "Focused test output"
+      - "Swift 6 build output"
+      - "GitNexus detect-changes output when available"
+    constraints:
+      - "Do not implement."
+      - "Reject broad unrelated refactors or unverified behavior claims."
+      - "Require follow-up Worker tasks for any failed or missing audited fix."
+    expected_output:
+      - "approved | needs_changes"
+      - "Per-finding status"
+      - "Scope and regression risks"
+      - "Required follow-up tasks if any"
+    receipt:
+      result: done
+      decision: needs_changes
+      full_outcome_complete: false
+      evidence:
+        - "Reviewer Hubble found the OpenAI mask fix is undone by batch-level mask propagation in BatchOrchestrator."
+        - "Reviewer Franklin found Swift 6 app build passes but Swift 6 unit-test build still fails on test-target isolation."
+        - "Reviewer Franklin noted the resume output-directory regression lacks encode/decode persistence-boundary coverage."
+        - "Local verification: Swift 6 app build passed; default Nano Banana HelperTests passed; git diff --check passed."
+        - "GitNexus detect-changes reported 'No changes detected' despite a non-empty git diff, so final scope review must use git diff/source evidence as fallback."
+      blocked_tasks: []
+      required_board_updates:
+        - "Add a Worker to prevent batch-level OpenAI mask settings from reapplying to independent multi-file tasks and test the enqueue/orchestrator path."
+        - "Add a Worker to make the unit-test target Swift 6 clean or record a precise blocker if production scope must expand."
+        - "Add a Worker or include in Swift/test cleanup to assert HistoryEntry.outputDirectoryPath survives encode/decode."
+  - id: T011
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: medium
+    objective: "Repair the OpenAI mask fix so batch-level settings cannot reapply a shared mask to multiple independent per-source tasks."
+    allowed_files:
+      - "Nano Banana Helper/Services/BatchOrchestrator.swift"
+      - "Nano Banana Helper/Models/BatchStagingManager.swift"
+      - "Nano Banana Helper/Views/InspectorView.swift"
+      - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+    verify:
+      - "Focused regression covering enqueue/orchestrator path for multi-file non-multi-input mask handling."
+      - "rtk proxy xcodebuild test -quiet -project 'Nano Banana Helper.xcodeproj' -scheme 'Nano Banana Helper' -destination 'platform=macOS,arch=arm64' -derivedDataPath 'build/GoalVerifyDerivedData' -only-testing:'Nano Banana HelperTests' MACOSX_DEPLOYMENT_TARGET=26.2 CODE_SIGNING_ALLOWED=NO"
+      - "git diff --check"
+    stop_if:
+      - "Need files outside allowed_files."
+      - "Fix requires a product decision about per-file masks beyond dropping the ambiguous shared mask."
+      - "Verification fails twice for the same reason."
+    receipt:
+      result: done
+      changed_files:
+        - "Nano Banana Helper/Services/BatchOrchestrator.swift"
+        - "Nano Banana Helper/Views/InspectorView.swift"
+        - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+      commands:
+        - cmd: "Focused xcodebuild regression for enqueue mask handling"
+          status: pass
+        - cmd: "rtk proxy xcodebuild test ... -only-testing:'Nano Banana HelperTests'"
+          status: pass
+        - cmd: "git diff --check"
+          status: pass
+        - cmd: "gitnexus impact for BatchOrchestrator/enqueue/processQueue/InspectorView/startImageBatch/BatchStagingManager/makeImageTasks"
+          status: degraded
+        - cmd: "gitnexus detect-changes"
+          status: degraded
+      summary: "Native Codex Worker closed the reviewer-found mask leak by dropping unsafe shared batch masks before enqueue propagation and before processQueue builds BatchSettings. InspectorView now stores batch-level mask metadata only for one source or merged multi-input batches. Added enqueue/persisted-queue regressions proving multi-file independent tasks drop the shared mask while single-source variations and merged multi-input tasks keep it."
+      remaining_blockers:
+        - "GitNexus impact returned UNKNOWN/target-not-found and detect-changes reported no changes despite a non-empty diff."
+  - id: T012
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: medium
+    objective: "Make the Nano Banana HelperTests target Swift 6 clean for the reviewed test-isolation failures."
+    allowed_files:
+      - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+      - "Nano Banana Helper/Models/Models.swift"
+      - "Nano Banana Helper/Models/BillingModels.swift"
+      - "Nano Banana Helper/Services/BatchOrchestrator.swift"
+    verify:
+      - "rtk proxy xcodebuild test -quiet -project 'Nano Banana Helper.xcodeproj' -scheme 'Nano Banana Helper' -destination 'platform=macOS,arch=arm64' -derivedDataPath 'build/GoalSwift6TestsDerivedData' -only-testing:'Nano Banana HelperTests' SWIFT_VERSION=6.0 MACOSX_DEPLOYMENT_TARGET=26.2 CODE_SIGNING_ALLOWED=NO"
+      - "rtk proxy xcodebuild test -quiet -project 'Nano Banana Helper.xcodeproj' -scheme 'Nano Banana Helper' -destination 'platform=macOS,arch=arm64' -derivedDataPath 'build/GoalVerifyDerivedData' -only-testing:'Nano Banana HelperTests' MACOSX_DEPLOYMENT_TARGET=26.2 CODE_SIGNING_ALLOWED=NO"
+      - "git diff --check"
+    stop_if:
+      - "Need files outside allowed_files."
+      - "Swift 6 test cleanup requires broad production model isolation changes beyond Codable/test helper boundaries."
+      - "Verification fails twice for the same reason."
+    receipt:
+      result: done
+      changed_files:
+        - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+      commands:
+        - cmd: "rtk proxy xcodebuild test ... -only-testing:'Nano Banana HelperTests' SWIFT_VERSION=6.0"
+          status: pass
+        - cmd: "rtk proxy xcodebuild test ... -only-testing:'Nano Banana HelperTests'"
+          status: pass
+        - cmd: "git diff --check"
+          status: pass
+        - cmd: "gitnexus impact for makeHistoryEntry/HistoryEntry/BatchJob/AppPricing/Project"
+          status: degraded
+        - cmd: "gitnexus detect-changes"
+          status: degraded
+      summary: "Native Codex Worker made the unit test target Swift 6 clean by marking the Nano_Banana_HelperTests suite @MainActor, keeping production code untouched. Worker also extended the existing HistoryEntry round-trip test to assert outputDirectoryPath survives encode/decode."
+      remaining_blockers:
+        - "Project settings still declare SWIFT_VERSION = 5.0; a follow-up config promotion is required to fully close the original Swift 6 finding."
+  - id: T013
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: low
+    objective: "Add persistence-boundary coverage for HistoryEntry.outputDirectoryPath encode/decode behavior."
+    allowed_files:
+      - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+    verify:
+      - "Focused HistoryEntry outputDirectoryPath encode/decode regression."
+      - "Full Nano Banana HelperTests command."
+      - "git diff --check"
+    stop_if:
+      - "Need files outside allowed_files."
+      - "Verification fails twice for the same reason."
+    receipt:
+      result: done
+      changed_files:
+        - "Nano Banana HelperTests/Nano_Banana_HelperTests.swift"
+      commands:
+        - cmd: "HistoryEntry provider/advanced metadata round-trip test includes outputDirectoryPath"
+          status: pass
+        - cmd: "rtk proxy xcodebuild test ... -only-testing:'Nano Banana HelperTests' SWIFT_VERSION=6.0"
+          status: pass
+      summary: "Persistence-boundary coverage was folded into T012: outputDirectoryPath is now encoded and decoded in the existing HistoryEntry round-trip regression."
+      remaining_blockers: []
+  - id: T014
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: medium
+    objective: "Promote the Xcode project build settings from Swift 5 to Swift 6 now that app and unit-test Swift 6 overrides pass."
+    allowed_files:
+      - "Nano Banana Helper.xcodeproj/project.pbxproj"
+    verify:
+      - "rg -n \"SWIFT_VERSION = 5.0\" 'Nano Banana Helper.xcodeproj/project.pbxproj' returns no matches"
+      - "rtk proxy xcodebuild build -quiet -project 'Nano Banana Helper.xcodeproj' -scheme 'Nano Banana Helper' -destination 'platform=macOS,arch=arm64' -derivedDataPath 'build/GoalSwift6ProjectDerivedData' MACOSX_DEPLOYMENT_TARGET=26.2 CODE_SIGNING_ALLOWED=NO"
+      - "rtk proxy xcodebuild test -quiet -project 'Nano Banana Helper.xcodeproj' -scheme 'Nano Banana Helper' -destination 'platform=macOS,arch=arm64' -derivedDataPath 'build/GoalSwift6ProjectTestsDerivedData' -only-testing:'Nano Banana HelperTests' MACOSX_DEPLOYMENT_TARGET=26.2 CODE_SIGNING_ALLOWED=NO"
+      - "git diff --check"
+    stop_if:
+      - "Changing project settings exposes new Swift 6 failures not already solved by override verification."
+      - "Need files outside project.pbxproj."
+      - "Verification fails twice for the same reason."
+    receipt:
+      result: done
+      changed_files:
+        - "Nano Banana Helper.xcodeproj/project.pbxproj"
+      commands:
+        - cmd: "rg -n \"SWIFT_VERSION = 5.0\" 'Nano Banana Helper.xcodeproj/project.pbxproj'"
+          status: pass_no_matches
+        - cmd: "rg -n \"SWIFT_VERSION = 6.0\" 'Nano Banana Helper.xcodeproj/project.pbxproj'"
+          status: pass_six_matches
+        - cmd: "rtk proxy xcodebuild build ... CODE_SIGNING_ALLOWED=NO"
+          status: pass
+        - cmd: "rtk proxy xcodebuild test ... -only-testing:'Nano Banana HelperTests' CODE_SIGNING_ALLOWED=NO"
+          status: pass
+        - cmd: "git diff --check"
+          status: pass
+      summary: "Native Codex Worker promoted all six Xcode build configurations from Swift 5.0 to Swift 6.0 without changing unrelated project settings. Build and unit-test verification passed without SWIFT_VERSION command-line overrides."
+      remaining_blockers: []
+  - id: T999
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Final audit: prove whether the full five-finding outcome is complete."
+    inputs:
+      - "All done task receipts"
+      - "Last verification"
+      - "Current dirty diff"
+      - "GitNexus detect-changes output when available"
+    constraints:
+      - "Do not implement."
+      - "Reject completion if any original finding is unverified."
+      - "Reject completion if required Worker work is still queued or active."
+      - "Reject completion if GitNexus was skipped without a truthful blocker/fallback receipt."
+    expected_output:
+      - "complete | not_complete"
+      - "full_outcome_complete: true | false"
+      - "Per-finding evidence"
+      - "Missing evidence"
+      - "Next task if not complete"
+    receipt:
+      result: done
+      decision: complete
+      full_outcome_complete: true
+      evidence:
+        - "PM verification: project build passed with SWIFT_VERSION=6.0 project settings and CODE_SIGNING_ALLOWED=NO."
+        - "PM verification: Nano Banana HelperTests passed with SWIFT_VERSION=6.0 project settings and CODE_SIGNING_ALLOWED=NO."
+        - "PM verification: build-for-testing passed for app, unit-test, and UI-test bundles under Swift 6 project settings."
+        - "PM verification: git diff --check passed."
+        - "PM verification: GitNexus status reports index up-to-date at commit 4209a6d."
+        - "PM verification: GitNexus detect-changes is degraded, warning FTS unavailable and reporting 'No changes detected' despite a non-empty diff."
+        - "Final Swift reviewer found no issues."
+        - "Final P2 reviewer found no behavior blockers; only P3 scope bookkeeping notes for GoalBuddy artifacts and Swift promotion being outside the P2-only review lens."
+      per_finding:
+        swift_6:
+          status: closed
+          evidence:
+            - "All six project SWIFT_VERSION settings are 6.0."
+            - "Swift 6 app build, unit test target, and build-for-testing passed."
+        openai_mask:
+          status: closed
+          evidence:
+            - "Shared masks are dropped for multiple independent per-source tasks at staging, enqueue propagation, and processQueue settings capture."
+            - "Regressions cover drop behavior plus single-source and merged multi-input preservation."
+        project_deletion:
+          status: closed
+          evidence:
+            - "ProjectManager refuses to delete the final project and repairs nil currentProject."
+            - "Settings delete button is disabled when only one project remains."
+        history_resume_output_directory:
+          status: closed
+          evidence:
+            - "HistoryEntry persists outputDirectoryPath."
+            - "Resume prefers outputDirectoryPath when outputImagePath is empty and bookmark is nil."
+            - "Tests cover resume and encode/decode round trip."
+        staging_thumbnails:
+          status: closed
+          evidence:
+            - "StagedImageCell renders from async thumbnailPhase and decodes ImageIO thumbnails through AppPaths.withAccessibleURL off the render path."
+      residual_risks:
+        - "No live OpenAI submission was run."
+        - "No UI-test execution was completed; build-for-testing passed, and reviewer full test attempt hit a local automation-mode timeout."
+        - "Async staging thumbnail path is compile/source verified but not directly behavior-tested."
+        - "GoalBuddy docs/board artifacts are untracked process evidence; decide separately whether to commit or discard them."
+
+checks:
+  dirty_fingerprint: "pre-existing CLAUDE.md change plus scoped audit-fix files and untracked docs/goals GoalBuddy artifacts"
+  last_verification:
+    result: pass_with_gitnexus_detect_degraded
+    task: T999
+    commands:
+      - "rtk proxy xcodebuild build -quiet -project 'Nano Banana Helper.xcodeproj' -scheme 'Nano Banana Helper' -destination 'platform=macOS,arch=arm64' -derivedDataPath 'build/GoalFinalProjectBuildDerivedData' MACOSX_DEPLOYMENT_TARGET=26.2 CODE_SIGNING_ALLOWED=NO"
+      - "rtk proxy xcodebuild test -quiet -project 'Nano Banana Helper.xcodeproj' -scheme 'Nano Banana Helper' -destination 'platform=macOS,arch=arm64' -derivedDataPath 'build/GoalFinalProjectTestsDerivedData' -only-testing:'Nano Banana HelperTests' MACOSX_DEPLOYMENT_TARGET=26.2 CODE_SIGNING_ALLOWED=NO"
+      - "rtk proxy xcodebuild build-for-testing -quiet -project 'Nano Banana Helper.xcodeproj' -scheme 'Nano Banana Helper' -destination 'platform=macOS,arch=arm64' -derivedDataPath 'build/GoalFinalBuildForTestingDerivedData' MACOSX_DEPLOYMENT_TARGET=26.2 CODE_SIGNING_ALLOWED=NO"
+      - "git diff --check"
+      - "npx --yes --package gitnexus@latest gitnexus status"
+      - "npx --yes --package gitnexus@latest gitnexus detect-changes --repo Nano-Banana-Helper"

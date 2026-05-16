@@ -281,6 +281,7 @@ class BatchStagingManager {
             }
         }
 
+        let shouldAttachMask = stagedFiles.count == 1
         return stagedFiles.flatMap { url in
             (0..<imageVariationCount).map { index in
                 ImageTask(
@@ -288,8 +289,8 @@ class BatchStagingManager {
                     projectId: nil,
                     provider: provider,
                     inputBookmark: bookmark(for: url),
-                    maskImagePath: maskFile?.path,
-                    maskImageBookmark: maskBookmark,
+                    maskImagePath: shouldAttachMask ? maskFile?.path : nil,
+                    maskImageBookmark: shouldAttachMask ? maskBookmark : nil,
                     variationIndex: index + 1,
                     variationTotal: imageVariationCount
                 )

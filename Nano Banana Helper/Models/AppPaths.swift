@@ -3,7 +3,7 @@ import Foundation
 
 /// Centralized management of application storage paths and data migration
 struct AppPaths {
-    enum AccessResult<T> {
+    nonisolated enum AccessResult<T> {
         case success(T, refreshedBookmark: Data?)
         case fallbackUsed(T)
         case accessDenied
@@ -52,6 +52,14 @@ struct AppPaths {
     /// Path to the currently active batch job for persistence across restarts
     static var activeBatchURL: URL {
         appSupportURL.appendingPathComponent("active_batch.json")
+    }
+
+    /// App-controlled fallback for generated images that were returned by the API
+    /// but could not be written to the selected output folder.
+    static var recoveredOutputsDirectoryURL: URL {
+        let url = appSupportURL.appendingPathComponent("Recovered Outputs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
     }
     
     /// Subdirectory for individual project data
@@ -106,7 +114,14 @@ struct AppPaths {
     // MARK: - Security Scoped Bookmarks
     
     /// Create a security scoped bookmark for a URL
-    static func bookmark(for url: URL) -> Data? {
+    nonisolated static func bookmark(for url: URL) -> Data? {
+        let didStart = url.startAccessingSecurityScopedResource()
+        defer {
+            if didStart {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
         do {
             let data = try url.bookmarkData(
                 options: .withSecurityScope,
@@ -120,21 +135,21 @@ struct AppPaths {
         }
     }
 
-    struct ResolvedBookmark {
+    nonisolated struct ResolvedBookmark {
         let url: URL
         let refreshedBookmarkData: Data?
     }
 
-    struct ResolvedBookmarkPath {
+    nonisolated struct ResolvedBookmarkPath {
         let path: String
         let refreshedBookmarkData: Data?
     }
 
-    struct BookmarkResolutionDependencies {
-        let resolveURL: (Data) throws -> (url: URL, isStale: Bool)
-        let refreshBookmarkData: (URL) throws -> Data
-        let startAccessing: (URL) -> Bool
-        let stopAccessing: (URL) -> Void
+    nonisolated struct BookmarkResolutionDependencies: Sendable {
+        let resolveURL: @Sendable (Data) throws -> (url: URL, isStale: Bool)
+        let refreshBookmarkData: @Sendable (URL) throws -> Data
+        let startAccessing: @Sendable (URL) -> Bool
+        let stopAccessing: @Sendable (URL) -> Void
 
         static let live = BookmarkResolutionDependencies(
             resolveURL: { data in
@@ -167,7 +182,7 @@ struct AppPaths {
     /// - Important: The caller is responsible for calling `stopAccessingSecurityScopedResource()`
     ///   on the returned URL when done. Prefer `withResolvedBookmark` or `resolveBookmarkToPath`
     ///   for display-only use cases to avoid leaks.
-    static func resolveBookmark(
+    nonisolated static func resolveBookmark(
         _ data: Data,
         dependencies: BookmarkResolutionDependencies = .live
     ) -> ResolvedBookmark? {
@@ -204,7 +219,7 @@ struct AppPaths {
     /// Resolves a bookmark, executes a closure with the scoped URL, then immediately stops access.
     /// Use this for short-lived operations (reading file data, loading an image, etc.).
     @discardableResult
-    static func withResolvedBookmark<T>(
+    nonisolated static func withResolvedBookmark<T>(
         _ data: Data,
         dependencies: BookmarkResolutionDependencies = .live,
         _ body: (URL) throws -> T
@@ -217,7 +232,7 @@ struct AppPaths {
     /// Resolves a bookmark, captures the file-system path, then immediately stops access.
     /// Safe for display-only use (labels, Finder reveals, FileManager checks) where a live
     /// security scope is not required.
-    static func resolveBookmarkToPath(
+    nonisolated static func resolveBookmarkToPath(
         _ data: Data,
         dependencies: BookmarkResolutionDependencies = .live
     ) -> ResolvedBookmarkPath? {
@@ -229,7 +244,7 @@ struct AppPaths {
         )
     }
 
-    static func loadImageData(
+    nonisolated static func loadImageData(
         bookmark: Data?,
         fallbackPath: String,
         dependencies: BookmarkResolutionDependencies = .live,
@@ -307,7 +322,7 @@ struct AppPaths {
         )
     }
 
-    static func withAccessibleURL<T>(
+    nonisolated static func withAccessibleURL<T>(
         bookmark: Data?,
         fallbackPath: String,
         dependencies: BookmarkResolutionDependencies = .live,

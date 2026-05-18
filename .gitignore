@@ -24,3 +24,7 @@ build/
 *.swp
 *.lock
 .worktrees/
+.gitnexus
+.claude
+claude.md
+agents.md

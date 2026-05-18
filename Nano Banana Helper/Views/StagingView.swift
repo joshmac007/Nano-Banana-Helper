@@ -1,3 +1,4 @@
+import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -39,7 +40,7 @@ struct StagingView: View {
                     }
                 }
                 DispatchQueue.main.async {
-                    stagingManager.addFiles(urls)
+                    stagingManager.addFiles(urls, bookmarks: makeBookmarks(for: urls))
                 }
             }
             return true
@@ -50,21 +51,19 @@ struct StagingView: View {
             allowsMultipleSelection: true
         ) { result in
             if case .success(let urls) = result {
-                // Create security-scoped bookmarks for each URL so we can
-                // access the files later when the batch job runs.
-                var bookmarks: [URL: Data] = [:]
-                for url in urls {
-                    let didStart = url.startAccessingSecurityScopedResource()
-                    if let bookmark = AppPaths.bookmark(for: url) {
-                        bookmarks[url] = bookmark
-                    }
-                    if didStart {
-                        url.stopAccessingSecurityScopedResource()
-                    }
-                }
-                stagingManager.addFiles(urls, bookmarks: bookmarks)
+                stagingManager.addFiles(urls, bookmarks: makeBookmarks(for: urls))
             }
         }
+    }
+
+    private func makeBookmarks(for urls: [URL]) -> [URL: Data] {
+        var bookmarks: [URL: Data] = [:]
+        for url in urls {
+            if let bookmark = AppPaths.bookmark(for: url) {
+                bookmarks[url] = bookmark
+            }
+        }
+        return bookmarks
     }
     
     // MARK: - Image Mode View
@@ -78,7 +77,10 @@ struct StagingView: View {
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 200), spacing: 16)], spacing: 16) {
                     ForEach(stagingManager.stagedFiles, id: \.self) { url in
-                        StagedImageCell(url: url) {
+                        StagedImageCell(
+                            url: url,
+                            bookmark: stagingManager.bookmark(for: url)
+                        ) {
                             stagingManager.removeFile(url)
                         }
                         .onDrag {
@@ -225,22 +227,16 @@ private struct StagedImageDropDelegate: DropDelegate {
 
 struct StagedImageCell: View {
     let url: URL
+    let bookmark: Data?
     let onDelete: () -> Void
-    
-    // Load synchronously — AsyncImage uses URLSession which can't access
-    // security-scoped sandbox URLs after stopAccessingSecurityScopedResource.
-    private var thumbnail: NSImage? {
-        // Try direct load first (works for drag-and-drop and accessible paths)
-        if let img = NSImage(contentsOfFile: url.path) { return img }
-        // Try resolving via bookmark if stored in BatchStagingManager
-        return nil
-    }
+
+    @State private var thumbnailPhase: StagedThumbnailPhase = .loading
     
     var body: some View {
         ZStack(alignment: .topTrailing) {
             // Image Preview
             Group {
-                if let img = thumbnail {
+                if let img = thumbnailPhase.loadedImage {
                     Image(nsImage: img)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
@@ -277,6 +273,74 @@ struct StagedImageCell: View {
         )
         .cornerRadius(8)
         .shadow(radius: 2)
+        .task(id: thumbnailReference) {
+            await loadThumbnail(for: thumbnailReference)
+        }
+    }
+
+    private var thumbnailReference: StagedThumbnailReference {
+        StagedThumbnailReference(fallbackPath: url.path, bookmark: bookmark)
+    }
+
+    @MainActor
+    private func loadThumbnail(for reference: StagedThumbnailReference) async {
+        thumbnailPhase = .loading
+        let task = Task<StagedThumbnailPhase, Never>(priority: .utility) {
+            StagedImageCell.readThumbnail(reference: reference)
+        }
+        let phase = await task.value
+        guard !Task.isCancelled else { return }
+        thumbnailPhase = phase
+    }
+
+    nonisolated private static func readThumbnail(reference: StagedThumbnailReference) -> StagedThumbnailPhase {
+        switch AppPaths.withAccessibleURL(
+            bookmark: reference.bookmark,
+            fallbackPath: reference.fallbackPath,
+            operation: { url in
+                decodeThumbnail(at: url, maxPixelSize: 300)
+            }
+        ) {
+        case let .success(image, _), let .fallbackUsed(image):
+            return .loaded(image)
+        case .accessDenied:
+            return .failed
+        }
+    }
+
+    nonisolated private static func decodeThumbnail(at url: URL, maxPixelSize: Int) -> NSImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            return nil
+        }
+
+        let options: CFDictionary = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ] as CFDictionary
+
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else {
+            return nil
+        }
+
+        let size = NSSize(width: cgImage.width, height: cgImage.height)
+        return NSImage(cgImage: cgImage, size: size)
+    }
+}
+
+private struct StagedThumbnailReference: Equatable, Sendable {
+    let fallbackPath: String
+    let bookmark: Data?
+}
+
+private enum StagedThumbnailPhase {
+    case loading
+    case loaded(NSImage)
+    case failed
+
+    var loadedImage: NSImage? {
+        guard case let .loaded(image) = self else { return nil }
+        return image
     }
 }
 

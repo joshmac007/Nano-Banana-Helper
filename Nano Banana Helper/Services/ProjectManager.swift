@@ -106,12 +106,24 @@ class ProjectManager {
     }
 
     func deleteProject(_ project: Project) {
+        guard projects.contains(where: { $0.id == project.id }) else {
+            if currentProject == nil {
+                currentProject = projects.first
+            }
+            return
+        }
+
+        guard projects.count > 1 else {
+            currentProject = projects.first
+            return
+        }
+
         projects.removeAll { $0.id == project.id }
 
         let projectDir = projectDirectory(for: project)
         try? fileManager.removeItem(at: projectDir)
 
-        if currentProject?.id == project.id {
+        if currentProject == nil || currentProject?.id == project.id {
             currentProject = projects.first
         }
 
@@ -296,11 +308,25 @@ class ProjectManager {
     // MARK: - Usage Ledger
 
     func appendLedgerEntry(_ entry: UsageLedgerEntry) {
+        guard !isDuplicateJobCompletion(entry) else { return }
+
         ledger.append(entry)
         ledger.sort(by: { $0.timestamp < $1.timestamp })
         persistLedger()
         deriveSummaryAndProjectTotals()
         saveProjects()
+    }
+
+    private func isDuplicateJobCompletion(_ entry: UsageLedgerEntry) -> Bool {
+        guard entry.kind == .jobCompletion,
+              let relatedHistoryEntryId = entry.relatedHistoryEntryId else {
+            return false
+        }
+
+        return ledger.contains {
+            $0.kind == .jobCompletion &&
+            $0.relatedHistoryEntryId == relatedHistoryEntryId
+        }
     }
 
     func deriveSummaryAndProjectTotals() {

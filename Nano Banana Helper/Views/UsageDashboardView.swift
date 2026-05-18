@@ -171,7 +171,7 @@ struct UsageDashboardView: View {
     }
 
     private var disclaimerText: some View {
-        Text("Usage data is based on app tracking only. All cost values are estimated and may differ from actual Google billing.")
+        Text("Usage data is based on app tracking only. Cost values are estimated and may differ from provider billing.")
             .font(.caption)
             .foregroundStyle(.secondary)
             .multilineTextAlignment(.center)

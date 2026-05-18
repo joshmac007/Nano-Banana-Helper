@@ -5,10 +5,14 @@
 //  Created by Josh McSwain on 2/2/26.
 //
 
+import CoreGraphics
 import Foundation
+import ImageIO
 import Testing
+import UniformTypeIdentifiers
 @testable import Nano_Banana_Helper
 
+@MainActor
 struct Nano_Banana_HelperTests {
     private let floatingPointTolerance = 0.000_000_1
 
@@ -110,6 +114,10 @@ struct Nano_Banana_HelperTests {
         return url
     }
 
+    private func decodeJSONObject(_ data: Data) throws -> [String: Any] {
+        try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
     private func makeTransparentPNGData() -> Data {
         Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==")!
     }
@@ -135,6 +143,44 @@ struct Nano_Banana_HelperTests {
             cost: 1,
             sourceImageBookmarks: sourceImageBookmarks,
             systemPrompt: systemPrompt
+        )
+    }
+
+    private func makeBatchSettings(
+        outputDirectory: String,
+        outputDirectoryBookmark: Data? = nil,
+        projectId: UUID? = UUID(),
+        provider: ModelProvider = .openAI,
+        modelName: String? = "gpt-image-2",
+        prompt: String = "prompt",
+        systemPrompt: String? = "system",
+        aspectRatio: String = "1:1",
+        imageSize: String = "1K",
+        useBatchTier: Bool = false,
+        openAIOutputFormat: OpenAIOutputFormat = .png,
+        openAIBackground: OpenAIBackground = .auto,
+        openAIInputFidelity: OpenAIInputFidelity = .high,
+        openAIOutputCompression: Int = 100,
+        openAINCount: Int = 1
+    ) -> BatchSettings {
+        BatchSettings(
+            provider: provider,
+            prompt: prompt,
+            systemPrompt: systemPrompt,
+            aspectRatio: aspectRatio,
+            imageSize: imageSize,
+            outputDirectory: outputDirectory,
+            outputDirectoryBookmark: outputDirectoryBookmark,
+            useBatchTier: useBatchTier,
+            projectId: projectId,
+            modelName: modelName,
+            maskImagePath: nil,
+            maskImageBookmark: nil,
+            openAIOutputFormat: openAIOutputFormat,
+            openAIBackground: openAIBackground,
+            openAIInputFidelity: openAIInputFidelity,
+            openAIOutputCompression: openAIOutputCompression,
+            openAINCount: openAINCount
         )
     }
 
@@ -189,6 +235,77 @@ struct Nano_Banana_HelperTests {
         return try await perform()
     }
 
+    @MainActor
+    private func withStoredConfig<T>(
+        update: (inout AppConfig) -> Void,
+        perform: () async throws -> T
+    ) async rethrows -> T {
+        let fileManager = FileManager.default
+        let configURL = AppConfig.fileURL
+        let originalData = try? Data(contentsOf: configURL)
+
+        try? fileManager.createDirectory(
+            at: configURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        var config = AppConfig.load()
+        update(&config)
+        config.save()
+
+        defer {
+            if let originalData {
+                try? originalData.write(to: configURL)
+            } else {
+                try? fileManager.removeItem(at: configURL)
+            }
+        }
+
+        return try await perform()
+    }
+
+    private func makeImageData(
+        width: Int = 1,
+        height: Int = 1,
+        format: UTType,
+        hasAlpha: Bool
+    ) throws -> Data {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let alphaInfo: CGImageAlphaInfo = hasAlpha ? .premultipliedLast : .noneSkipLast
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | alphaInfo.rawValue
+
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+
+        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+        guard let image = context.makeImage() else {
+            throw CocoaError(.coderInvalidValue)
+        }
+
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, format.identifier as CFString, 1, nil) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+
+        return data as Data
+    }
+
     @Test func example() async throws {
         // Write your test here and use APIs like
         // APIs like `#expect(...)` to check expected conditions.
@@ -235,6 +352,11 @@ struct Nano_Banana_HelperTests {
         #expect(entry.tokenUsage == nil)
         #expect(entry.modelName == nil)
         #expect(entry.cost == 0.067)
+        #expect(entry.openAIOutputFormat == .png)
+        #expect(entry.openAIBackground == .auto)
+        #expect(entry.openAIInputFidelity == .high)
+        #expect(entry.openAIOutputCompression == 100)
+        #expect(entry.openAINCount == 1)
     }
 
     @MainActor @Test func historyEntryWithTokenData() throws {
@@ -305,6 +427,50 @@ struct Nano_Banana_HelperTests {
         #expect(AppPricing.outputFallbackRate(modelName: "legacy-image-model", isBatchTier: false) == 0.039)
     }
 
+    @Test func openAIUsageCostChargesAggregateTokensWhenDetailsAreMissing() throws {
+        let usage = TokenUsage(
+            promptTokenCount: 11,
+            candidatesTokenCount: 13,
+            totalTokenCount: 24
+        )
+
+        let cost = try #require(AppPricing.usageCost(
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            tokenUsage: usage,
+            isBatchTier: false
+        ))
+
+        let expected = (11.0 * 5.0 / 1_000_000.0) + (13.0 * 30.0 / 1_000_000.0)
+        #expect(abs(cost - expected) < floatingPointTolerance)
+    }
+
+    @Test func openAIUsageCostKeepsDetailedTextAndImageSplit() throws {
+        let usage = TokenUsage(
+            promptTokenCount: 11,
+            candidatesTokenCount: 13,
+            totalTokenCount: 24,
+            promptImageTokenCount: 7,
+            promptTextTokenCount: 4,
+            candidateImageTokenCount: 10,
+            candidateTextTokenCount: 3
+        )
+
+        let cost = try #require(AppPricing.usageCost(
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            tokenUsage: usage,
+            isBatchTier: false
+        ))
+
+        let expected =
+            (7.0 * 8.0 / 1_000_000.0) +
+            (4.0 * 5.0 / 1_000_000.0) +
+            (10.0 * 30.0 / 1_000_000.0) +
+            (3.0 * 10.0 / 1_000_000.0)
+        #expect(abs(cost - expected) < floatingPointTolerance)
+    }
+
     @Test func imageSizeCostCalculationsUseSelectedModelRates() {
         let proImageCost = ImageSize.calculateCost(
             imageSize: "2K",
@@ -356,6 +522,11 @@ struct Nano_Banana_HelperTests {
         #expect(batch.modelName == nil)
         #expect(batch.imageSize == "2K")
         #expect(batch.useBatchTier)
+        #expect(batch.openAIOutputFormat == .png)
+        #expect(batch.openAIBackground == .auto)
+        #expect(batch.openAIInputFidelity == .high)
+        #expect(batch.openAIOutputCompression == 100)
+        #expect(batch.openAINCount == 1)
     }
 
     @Test func batchJobRoundTripsModelName() throws {
@@ -658,6 +829,31 @@ struct Nano_Banana_HelperTests {
         #expect(tasks.allSatisfy { $0.variationTotal == 4 })
     }
 
+    @MainActor @Test func submissionDataKeepsAllInputPathsWhenBookmarksArePartial() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "one.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "two.png")
+        let thirdURL = try makeTemporaryFile(in: directory, named: "three.png")
+        let inputPaths = [firstURL.path, secondURL.path, thirdURL.path]
+        let batch = BatchJob(prompt: "prompt", outputDirectory: directory.path)
+        batch.tasks = [
+            ImageTask(
+                inputPaths: inputPaths,
+                inputBookmarks: [Data("invalid-bookmark".utf8)]
+            )
+        ]
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: directory.appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false
+        )
+
+        let submissionData = try #require(orchestrator.buildSubmissionDataList(for: batch).first)
+
+        #expect(submissionData.inputURLs.map(\.path) == inputPaths)
+        #expect(submissionData.inputPaths == inputPaths)
+        #expect(submissionData.securityScopedInputURLs.isEmpty)
+    }
+
     @MainActor @Test func stagingEffectiveCountsReflectImageVariations() throws {
         let directory = try makeTemporaryDirectory()
         let firstURL = try makeTemporaryFile(in: directory, named: "one.png")
@@ -743,12 +939,20 @@ struct Nano_Banana_HelperTests {
         let fileURL = try makeTemporaryFile(in: directory, named: "alpha.png", contents: originalPNG)
         let service = NanoBananaService()
         let request = ImageEditRequest(
+            provider: .gemini,
+            modelName: "gemini-3.1-flash-image-preview",
             inputImageURLs: [fileURL],
+            maskImageURL: nil,
             prompt: "test prompt",
             systemInstruction: nil,
             aspectRatio: "1:1",
             imageSize: "1K",
-            useBatchTier: true
+            useBatchTier: true,
+            openAIOutputFormat: .png,
+            openAIBackground: .auto,
+            openAIInputFidelity: .high,
+            openAIOutputCompression: 100,
+            openAINCount: 1
         )
 
         let prepared = try await service.prepareInlineImages(for: [fileURL])
@@ -1562,6 +1766,32 @@ struct Nano_Banana_HelperTests {
         #expect(!FileManager.default.fileExists(atPath: activeBatchURL.path))
     }
 
+    @MainActor @Test func enqueueClearsTerminalQueueBeforeStartingFreshBatch() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        let staleBatch = BatchJob(prompt: "old", outputDirectory: "/tmp")
+        let staleTask = ImageTask(inputPaths: ["/tmp/one.png", "/tmp/two.png", "/tmp/three.png"])
+        staleTask.status = "failed"
+        staleTask.phase = .failed
+        staleTask.error = "API error (400)"
+        staleBatch.tasks = [staleTask]
+
+        orchestrator.enqueue(staleBatch)
+        #expect(orchestrator.failedJobs.count == 1)
+
+        let freshBatch = BatchJob(prompt: "new", outputDirectory: "/tmp")
+        freshBatch.tasks = [ImageTask(inputPath: "/tmp/single.png")]
+
+        orchestrator.enqueue(freshBatch)
+
+        #expect(orchestrator.failedJobs.isEmpty)
+        #expect(orchestrator.pendingJobs.count == 1)
+        #expect(orchestrator.pendingJobs.first?.inputPaths == ["/tmp/single.png"])
+    }
+
     @Test func clearHistoryRemovesEntriesFromGlobalCacheAndDisk() throws {
         let project = makeProject()
         let projectId = project.id
@@ -1596,6 +1826,26 @@ struct Nano_Banana_HelperTests {
         decoder.dateDecodingStrategy = .iso8601
         let persistedEntries = try decoder.decode([HistoryEntry].self, from: data)
         #expect(persistedEntries.isEmpty)
+    }
+
+    @MainActor @Test func deleteProjectKeepsFinalProjectSelected() throws {
+        let tempAppSupportURL = try makeTemporaryDirectory()
+        let projectsListURL = tempAppSupportURL.appendingPathComponent("projects.json")
+        let costSummaryURL = tempAppSupportURL.appendingPathComponent("cost_summary.json")
+        let projectsDirectoryURL = tempAppSupportURL.appendingPathComponent("projects", isDirectory: true)
+        let manager = ProjectManager(
+            appSupportURL: tempAppSupportURL,
+            projectsListURL: projectsListURL,
+            costSummaryURL: costSummaryURL,
+            projectsDirectoryURL: projectsDirectoryURL
+        )
+        let onlyProject = try #require(manager.projects.first)
+        manager.currentProject = nil
+
+        manager.deleteProject(onlyProject)
+
+        #expect(manager.projects.map(\.id) == [onlyProject.id])
+        #expect(manager.currentProject?.id == onlyProject.id)
     }
 
     @MainActor @Test func appendLedgerEntryPersistsUsageAndDerivesProjectTotals() throws {
@@ -1646,6 +1896,136 @@ struct Nano_Banana_HelperTests {
         #expect(manager.sessionCost == 0.5)
         #expect(manager.sessionTokens == 15)
         #expect(manager.sessionImageCount == 1)
+    }
+
+    @MainActor @Test func appendLedgerEntryIgnoresDuplicateJobCompletionForSameHistoryEntry() throws {
+        let tempAppSupportURL = try makeTemporaryDirectory()
+        let projectsListURL = tempAppSupportURL.appendingPathComponent("projects.json")
+        let costSummaryURL = tempAppSupportURL.appendingPathComponent("cost_summary.json")
+        let usageLedgerURL = tempAppSupportURL.appendingPathComponent("usage_ledger.json")
+        let projectsDirectoryURL = tempAppSupportURL.appendingPathComponent("projects", isDirectory: true)
+        let manager = ProjectManager(
+            appSupportURL: tempAppSupportURL,
+            projectsListURL: projectsListURL,
+            costSummaryURL: costSummaryURL,
+            usageLedgerURL: usageLedgerURL,
+            projectsDirectoryURL: projectsDirectoryURL
+        )
+        let projectId = manager.projects.first!.id
+        let historyEntryId = UUID()
+
+        manager.appendLedgerEntry(
+            UsageLedgerEntry(
+                kind: .jobCompletion,
+                projectId: projectId,
+                projectNameSnapshot: manager.projects.first?.name,
+                costDelta: 0.50,
+                imageDelta: 1,
+                tokenDelta: 15,
+                inputTokenDelta: 10,
+                outputTokenDelta: 5,
+                resolution: "4K",
+                modelName: "gemini-test",
+                relatedHistoryEntryId: historyEntryId,
+                note: nil
+            )
+        )
+        manager.appendLedgerEntry(
+            UsageLedgerEntry(
+                kind: .jobCompletion,
+                projectId: projectId,
+                projectNameSnapshot: manager.projects.first?.name,
+                costDelta: 0.75,
+                imageDelta: 1,
+                tokenDelta: 30,
+                inputTokenDelta: 20,
+                outputTokenDelta: 10,
+                resolution: "4K",
+                modelName: "gemini-test",
+                relatedHistoryEntryId: historyEntryId,
+                note: nil
+            )
+        )
+
+        #expect(manager.ledger.count == 1)
+        #expect(try loadPersistedUsageLedger(from: usageLedgerURL).count == 1)
+        #expect(manager.costSummary.totalSpent == 0.50)
+        #expect(manager.costSummary.imageCount == 1)
+        #expect(manager.projects.first?.totalCost == 0.50)
+        #expect(manager.projects.first?.imageCount == 1)
+
+        manager.appendLedgerEntry(
+            UsageLedgerEntry(
+                kind: .adjustment,
+                projectId: projectId,
+                projectNameSnapshot: manager.projects.first?.name,
+                costDelta: 0.25,
+                imageDelta: 0,
+                tokenDelta: 0,
+                inputTokenDelta: 0,
+                outputTokenDelta: 0,
+                resolution: nil,
+                modelName: nil,
+                relatedHistoryEntryId: historyEntryId,
+                note: "Manual correction"
+            )
+        )
+        #expect(manager.ledger.count == 2)
+        #expect(manager.costSummary.totalSpent == 0.75)
+
+        manager.appendLedgerEntry(
+            UsageLedgerEntry(
+                kind: .jobCompletion,
+                projectId: projectId,
+                projectNameSnapshot: manager.projects.first?.name,
+                costDelta: 0.10,
+                imageDelta: 1,
+                tokenDelta: 1,
+                inputTokenDelta: 1,
+                outputTokenDelta: 0,
+                resolution: "1K",
+                modelName: "gemini-test",
+                relatedHistoryEntryId: nil,
+                note: nil
+            )
+        )
+        manager.appendLedgerEntry(
+            UsageLedgerEntry(
+                kind: .jobCompletion,
+                projectId: projectId,
+                projectNameSnapshot: manager.projects.first?.name,
+                costDelta: 0.20,
+                imageDelta: 1,
+                tokenDelta: 2,
+                inputTokenDelta: 1,
+                outputTokenDelta: 1,
+                resolution: "1K",
+                modelName: "gemini-test",
+                relatedHistoryEntryId: nil,
+                note: nil
+            )
+        )
+
+        #expect(manager.ledger.count == 4)
+        #expect(try loadPersistedUsageLedger(from: usageLedgerURL).count == 4)
+        #expect(manager.costSummary.totalSpent == 1.05)
+        #expect(manager.projects.first?.totalCost == 1.05)
+        #expect(manager.projects.first?.imageCount == 3)
+    }
+
+    @MainActor @Test func bottomDockSpendSummaryUsesSelectedProjectSpendWhenSessionIsEmpty() {
+        let selectedProject = Project(name: "Selected", outputDirectory: "/tmp/selected")
+        selectedProject.totalCost = 0.42
+
+        #expect(
+            BottomDockSpendSummary.make(sessionCost: 0.50, selectedProject: selectedProject)?.text ==
+            "Session: $0.50"
+        )
+        #expect(
+            BottomDockSpendSummary.make(sessionCost: 0, selectedProject: selectedProject)?.text ==
+            "Project: $0.42"
+        )
+        #expect(BottomDockSpendSummary.make(sessionCost: 0, selectedProject: nil) == nil)
     }
 
     @Test func usageSnapshotFiltersExpectedRanges() {
@@ -1878,7 +2258,7 @@ struct Nano_Banana_HelperTests {
         #expect(abs(proEstimator.totalCost - 0.2702) < floatingPointTolerance)
         #expect(abs(flashEstimator.totalCost - 0.156336) < floatingPointTolerance)
         #expect(proEstimator.totalCost > flashEstimator.totalCost)
-        #expect(fallbackEstimator.fallbackPricingDescription == "Using Nano Banana pricing fallback.")
+        #expect(fallbackEstimator.pricingNote == "Using Nano Banana pricing fallback.")
     }
 
     @MainActor @Test func enqueueTextGenerationLocksConfiguredModelName() async throws {
@@ -1890,6 +2270,8 @@ struct Nano_Banana_HelperTests {
             )
 
             orchestrator.enqueueTextGeneration(
+                provider: .gemini,
+                modelName: "gemini-3-pro-image-preview",
                 prompt: "prompt",
                 aspectRatio: "16:9",
                 imageSize: "2K",
@@ -1974,6 +2356,42 @@ struct Nano_Banana_HelperTests {
         #expect(persistedState.batches.first?.tasks.first?.inputBookmarks == [inputBookmark])
     }
 
+    @MainActor @Test func resumePollingFromHistoryWithEmptyOutputAndNilBookmarkPreservesDefaultOutputDirectory() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let projectId = UUID()
+        let defaultOutputDirectory = AppPaths.defaultOutputDirectory.path
+        let fallbackOutputDirectory = AppPaths.projectsDirectoryURL
+            .appendingPathComponent(projectId.uuidString)
+            .appendingPathComponent("Outputs")
+            .path(percentEncoded: false)
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        let entry = HistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: ["/tmp/input.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "16:9",
+            imageSize: "2K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "processing",
+            externalJobName: "batches/default-output-job",
+            outputDirectoryBookmark: nil,
+            outputDirectoryPath: defaultOutputDirectory
+        )
+
+        orchestrator.resumePollingFromHistory(for: entry)
+
+        let persistedState = try loadPersistedQueueState(from: activeBatchURL)
+        let batch = try #require(persistedState.batches.first)
+        #expect(batch.outputDirectory == defaultOutputDirectory)
+        #expect(batch.outputDirectory != fallbackOutputDirectory)
+        #expect(batch.outputDirectoryBookmark == nil)
+    }
+
     @MainActor @Test func resumePollingFromLegacyHistoryLeavesModelNameNil() throws {
         let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
         let orchestrator = BatchOrchestrator(
@@ -1997,6 +2415,199 @@ struct Nano_Banana_HelperTests {
 
         let persistedState = try loadPersistedQueueState(from: activeBatchURL)
         #expect(persistedState.batches.first?.modelName == nil)
+    }
+
+    @MainActor @Test func resumePollingFromHistoryRearmsExistingFailedRemoteJob() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let jobName = "batches/permission-recovery-job"
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { _ in }
+        )
+        let projectId = UUID()
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: "/tmp",
+            useBatchTier: true,
+            projectId: projectId
+        )
+        let task = ImageTask(inputPaths: ["/tmp/input.png"], projectId: projectId)
+        task.status = "failed"
+        task.phase = .failed
+        task.error = "The file couldn't be saved because you don't have permission."
+        task.externalJobName = jobName
+        batch.tasks = [task]
+        LogManager.shared.clear()
+
+        orchestrator.enqueue(batch)
+        let entry = HistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: ["/tmp/input.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "16:9",
+            imageSize: "2K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            error: task.error,
+            externalJobName: jobName
+        )
+
+        orchestrator.resumePollingFromHistory(for: entry)
+
+        #expect(orchestrator.failedJobs.isEmpty)
+        let resumedTask = try #require(orchestrator.processingJobs.first)
+        #expect(resumedTask.externalJobName == jobName)
+        #expect(resumedTask.phase == .pausedLocal)
+        #expect(resumedTask.error == "Resuming remote job. Reconciling final status.")
+        #expect(LogManager.shared.entries.contains { $0.payload.contains(jobName) })
+
+        let persistedState = try loadPersistedQueueState(from: activeBatchURL)
+        let persistedTask = try #require(persistedState.batches.first?.tasks.first)
+        #expect(persistedTask.status == "processing")
+        #expect(persistedTask.phase == .pausedLocal)
+        #expect(persistedTask.externalJobName == jobName)
+    }
+
+    @MainActor @Test func resumePollingFromOpenAIHistoryRehydratesRemoteBatchFieldsAndSettings() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let projectId = UUID()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { _ in }
+        )
+        let entry = HistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            provider: .openAI,
+            systemPrompt: "system",
+            openAIOutputFormat: .webp,
+            openAIBackground: .opaque,
+            openAIInputFidelity: .low,
+            openAIOutputCompression: 72,
+            openAINCount: 3,
+            remoteBatchId: "batch_openai_123",
+            remoteRequestId: "task-openai-a",
+            remoteBatchProvider: .openAI
+        )
+
+        orchestrator.resumePollingFromHistory(for: entry)
+
+        let persistedState = try loadPersistedQueueState(from: activeBatchURL)
+        let batch = try #require(persistedState.batches.first)
+        let task = try #require(batch.tasks.first)
+
+        #expect(batch.provider == .openAI)
+        #expect(batch.useBatchTier)
+        #expect(batch.modelName == nil)
+        #expect(batch.systemPrompt == "system")
+        #expect(batch.openAIOutputFormat == .webp)
+        #expect(batch.openAIBackground == .opaque)
+        #expect(batch.openAIInputFidelity == .low)
+        #expect(batch.openAIOutputCompression == 72)
+        #expect(batch.openAINCount == 3)
+        #expect(task.remoteBatchId == "batch_openai_123")
+        #expect(task.remoteRequestId == "task-openai-a")
+        #expect(task.remoteBatchProvider == .openAI)
+        #expect(task.externalJobName == nil)
+        #expect(task.status == "processing")
+        #expect(task.phase == .pausedLocal)
+    }
+
+    @MainActor @Test func resumePollingFromOpenAIHistoryWithIncompleteIdentityDoesNotEnqueueRecoveredBatch() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let projectId = UUID()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { _ in }
+        )
+        let entry = HistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            externalJobName: "batches/legacy-openai-job",
+            provider: .openAI
+        )
+
+        LogManager.shared.clear()
+        orchestrator.resumePollingFromHistory(for: entry)
+
+        #expect(FileManager.default.fileExists(atPath: activeBatchURL.path) == false)
+        #expect(orchestrator.processingJobs.isEmpty)
+        #expect(orchestrator.failedJobs.isEmpty)
+        #expect(LogManager.shared.entries.contains {
+            $0.payload.contains("Resume polling ignored: OpenAI history entry is missing a remote batch id or request id.")
+        })
+    }
+
+    @MainActor @Test func resumePollingFromHistoryRearmsExistingOpenAIRemoteJob() throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let projectId = UUID()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { _ in }
+        )
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: "/tmp",
+            useBatchTier: true,
+            projectId: projectId,
+            provider: .openAI
+        )
+        let task = ImageTask(inputPaths: ["/tmp/source.png"], projectId: projectId, provider: .openAI)
+        task.status = "failed"
+        task.phase = .failed
+        task.error = "write failed"
+        task.remoteBatchId = "batch_openai_123"
+        task.remoteRequestId = "task-openai-a"
+        task.remoteBatchProvider = .openAI
+        batch.tasks = [task]
+
+        orchestrator.enqueue(batch)
+        let entry = HistoryEntry(
+            projectId: projectId,
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            provider: .openAI,
+            remoteBatchId: "batch_openai_123",
+            remoteRequestId: "task-openai-a",
+            remoteBatchProvider: .openAI
+        )
+
+        orchestrator.resumePollingFromHistory(for: entry)
+
+        #expect(orchestrator.failedJobs.isEmpty)
+        let resumedTask = try #require(orchestrator.processingJobs.first)
+        #expect(resumedTask.remoteBatchId == "batch_openai_123")
+        #expect(resumedTask.remoteRequestId == "task-openai-a")
+        #expect(resumedTask.phase == .pausedLocal)
+
+        let persistedState = try loadPersistedQueueState(from: activeBatchURL)
+        #expect(persistedState.batches.count == 1)
     }
 
     @MainActor @Test func cancelHandlesSubmittingPhaseTasks() throws {
@@ -2138,6 +2749,36 @@ struct Nano_Banana_HelperTests {
         #expect(orchestrator.cancelledJobs.isEmpty)
         #expect(orchestrator.hasTrueFailures)
         #expect(orchestrator.aggregateTone == .issue)
+    }
+
+    @MainActor @Test func openAIQueueIssueResumeUsesRemoteBatchId() throws {
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: try makeTemporaryDirectory().appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { _ in }
+        )
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: "/tmp",
+            useBatchTier: true,
+            provider: .openAI
+        )
+        let task = ImageTask(inputPaths: ["/tmp/input.png"], provider: .openAI)
+        task.status = "failed"
+        task.phase = .failed
+        task.error = "polling failed"
+        task.remoteBatchId = "batch_openai_123"
+        task.remoteRequestId = "task-\(task.id.uuidString)"
+        task.remoteBatchProvider = .openAI
+        batch.tasks = [task]
+
+        orchestrator.enqueue(batch)
+        orchestrator.resumeIssueTask(task)
+
+        #expect(task.status == "processing")
+        #expect(task.phase == .pausedLocal)
+        #expect(task.error == "Resuming remote job. Reconciling final status.")
+        #expect(orchestrator.controlState == .interrupted)
     }
 
     @Test func headerActionsShowResumeBeforeCancelOnPausedQueue() {
@@ -2329,6 +2970,53 @@ struct Nano_Banana_HelperTests {
         }
     }
 
+    @MainActor @Test func launchRecoveryFinalizesStaleCancellationRequests() async throws {
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
+        let task = ImageTask(inputPaths: ["/tmp/input.png"])
+        task.status = "processing"
+        task.phase = .cancelRequested
+        task.externalJobName = "batches/stuck-cancel-job"
+        task.cancelRequestedAt = Date(timeIntervalSinceNow: -(31 * 60))
+        task.error = "Cancel requested. Waiting for the final remote status."
+        batch.tasks = [task]
+        batch.status = "processing"
+        try persistQueueState(PersistedQueueState(controlState: .cancelling, batches: [batch]), to: activeBatchURL)
+
+        let probe = BatchStartProbe()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false,
+            processQueueOverride: { batchID in
+                await probe.recordStart(batchID)
+            }
+        )
+
+        if orchestrator.controlState != .idle {
+            Issue.record("Expected stale cancellation recovery to finish locally instead of staying cancelling")
+        }
+        if orchestrator.cancelledJobs.count != 1 {
+            Issue.record("Expected stale cancellation request to move into cancelled jobs")
+        }
+        if orchestrator.cancelledJobs.first?.error != "Cancelled locally. Remote final status was not confirmed before polling timed out." {
+            Issue.record("Expected stale cancellation to explain that final remote status was not confirmed")
+        }
+
+        await orchestrator.recoverSavedQueueOnLaunchIfNeeded()
+
+        if await probe.startedCount() != 0 {
+            Issue.record("Expected launch recovery to avoid polling stale cancellation requests again")
+        }
+
+        let persisted = try loadPersistedQueueState(from: activeBatchURL)
+        if persisted.controlState != .idle {
+            Issue.record("Expected stale cancellation normalization to be persisted as idle")
+        }
+        if persisted.batches.first?.tasks.first?.status != "cancelled" {
+            Issue.record("Expected stale cancellation normalization to persist cancelled status")
+        }
+    }
+
     @MainActor @Test func launchRecoveryAutoResumesRemotePollingStates() async throws {
         let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
         let batch = BatchJob(prompt: "prompt", outputDirectory: "/tmp")
@@ -2456,6 +3144,1069 @@ struct Nano_Banana_HelperTests {
         if startedCount != 2 {
             Issue.record("Expected startAll() to start both eligible batches")
         }
+    }
+
+    @MainActor @Test func appConfigBackwardCompatibilityMigratesLegacyGeminiFields() throws {
+        let json = """
+        {
+            "apiKey": "legacy-gemini-key",
+            "modelName": "gemini-3.1-flash-image-preview"
+        }
+        """.data(using: .utf8)!
+
+        let config = try JSONDecoder().decode(AppConfig.self, from: json)
+
+        #expect(config.provider == .gemini)
+        #expect(config.geminiAPIKey == "legacy-gemini-key")
+        #expect(config.geminiModelName == "gemini-3.1-flash-image-preview")
+        #expect(config.apiKey == "legacy-gemini-key")
+        #expect(config.modelName == "gemini-3.1-flash-image-preview")
+    }
+
+    @MainActor @Test func appConfigRoundTripsSeparateProviderSelections() throws {
+        var config = AppConfig()
+        config.provider = .openAI
+        config.setAPIKey("gemini-key", for: .gemini)
+        config.setAPIKey("openai-key", for: .openAI)
+        config.setModelName("gemini-3-pro-image-preview", for: .gemini)
+        config.setModelName("gpt-image-2", for: .openAI)
+
+        let data = try JSONEncoder().encode(config)
+        let decoded = try JSONDecoder().decode(AppConfig.self, from: data)
+
+        #expect(decoded.provider == .openAI)
+        #expect(decoded.apiKey(for: .gemini) == "gemini-key")
+        #expect(decoded.apiKey(for: .openAI) == "openai-key")
+        #expect(decoded.modelName(for: .gemini) == "gemini-3-pro-image-preview")
+        #expect(decoded.modelName(for: .openAI) == "gpt-image-2")
+        #expect(decoded.apiKey == "openai-key")
+        #expect(decoded.modelName == "gpt-image-2")
+    }
+
+    @MainActor @Test func historyEntryRoundTripsProviderAndAdvancedMetadata() throws {
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/input.png"],
+            outputImagePath: "/tmp/output.png",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: false,
+            cost: 0.5,
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            systemPrompt: "system",
+            maskImagePath: "/tmp/mask.png",
+            outputDirectoryPath: "/tmp/history-output",
+            maskImageBookmark: Data("mask".utf8),
+            openAIOutputFormat: .webp,
+            openAIBackground: .transparent,
+            openAIInputFidelity: .low,
+            openAIOutputCompression: 72,
+            openAINCount: 3
+        )
+
+        let data = try JSONEncoder().encode(entry)
+        let decoded = try JSONDecoder().decode(HistoryEntry.self, from: data)
+
+        #expect(decoded.provider == .openAI)
+        #expect(decoded.maskImagePath == "/tmp/mask.png")
+        #expect(decoded.outputDirectoryPath == "/tmp/history-output")
+        #expect(decoded.maskImageBookmark == Data("mask".utf8))
+        #expect(decoded.openAIOutputFormat == .webp)
+        #expect(decoded.openAIBackground == .transparent)
+        #expect(decoded.openAIInputFidelity == .low)
+        #expect(decoded.openAIOutputCompression == 72)
+        #expect(decoded.openAINCount == 3)
+    }
+
+    @Test func batchJobRoundTripsProviderAndAdvancedMetadata() throws {
+        let batch = BatchJob(
+            prompt: "prompt",
+            systemPrompt: "system",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            outputDirectory: "/tmp",
+            useBatchTier: false,
+            projectId: UUID(),
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            maskImagePath: "/tmp/mask.png",
+            maskImageBookmark: Data("mask".utf8),
+            openAIOutputFormat: .webp,
+            openAIBackground: .transparent,
+            openAIInputFidelity: .low,
+            openAIOutputCompression: 72,
+            openAINCount: 3
+        )
+
+        let data = try JSONEncoder().encode(batch)
+        let decoded = try JSONDecoder().decode(BatchJob.self, from: data)
+
+        #expect(decoded.provider == .openAI)
+        #expect(decoded.maskImagePath == "/tmp/mask.png")
+        #expect(decoded.maskImageBookmark == Data("mask".utf8))
+        #expect(decoded.openAIOutputFormat == .webp)
+        #expect(decoded.openAIBackground == .transparent)
+        #expect(decoded.openAIInputFidelity == .low)
+        #expect(decoded.openAIOutputCompression == 72)
+        #expect(decoded.openAINCount == 3)
+    }
+
+    @Test func openAIOutputFormatFlagsMatchProviderCapabilities() {
+        #expect(OpenAIOutputFormat.png.supportsBackground)
+        #expect(OpenAIOutputFormat.webp.supportsBackground)
+        #expect(OpenAIOutputFormat.jpeg.supportsBackground == false)
+        #expect(OpenAIOutputFormat.jpeg.supportsCompression)
+        #expect(OpenAIOutputFormat.webp.supportsCompression)
+    }
+
+
+    @MainActor @Test func imageTaskRoundTripsProviderAndMaskMetadata() throws {
+        let task = ImageTask(
+            inputPath: "/tmp/input.png",
+            provider: .openAI,
+            inputBookmark: Data("input".utf8),
+            maskImagePath: "/tmp/mask.png",
+            maskImageBookmark: Data("mask".utf8),
+            variationIndex: 1,
+            variationTotal: 2
+        )
+
+        let data = try JSONEncoder().encode(task)
+        let decoded = try JSONDecoder().decode(ImageTask.self, from: data)
+
+        #expect(decoded.provider == .openAI)
+        #expect(decoded.maskImagePath == "/tmp/mask.png")
+        #expect(decoded.maskImageBookmark == Data("mask".utf8))
+    }
+
+    @MainActor @Test func stagingRestoreRestoresProviderMaskAndAdvancedSettings() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "input.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: [sourceURL.path],
+            outputImagePath: "/tmp/output.png",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: false,
+            cost: 1,
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            systemPrompt: "system",
+            maskImagePath: maskURL.path,
+            maskImageBookmark: Data("mask".utf8),
+            openAIOutputFormat: .webp,
+            openAIBackground: .transparent,
+            openAIInputFidelity: .low,
+            openAIOutputCompression: 67,
+            openAINCount: 4
+        )
+
+        let manager = BatchStagingManager()
+        manager.restore(from: entry)
+
+        #expect(manager.provider == .openAI)
+        #expect(manager.modelName == "gpt-image-2")
+        #expect(manager.maskFile == maskURL)
+        #expect(manager.maskBookmark == Data("mask".utf8))
+        #expect(manager.openAIOutputFormat == .webp)
+        #expect(manager.openAIBackground == .transparent)
+        #expect(manager.openAIInputFidelity == .low)
+        #expect(manager.openAIOutputCompression == 67)
+        #expect(manager.openAINCount == 4)
+    }
+
+    @MainActor @Test func imageTasksCarryProviderAndMaskMetadata() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "input.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+
+        let manager = BatchStagingManager()
+        manager.applyProviderSelection(.openAI, modelName: "gpt-image-2")
+        manager.addFiles([sourceURL])
+        manager.setMaskFile(maskURL, bookmark: Data("mask".utf8))
+
+        let task = try #require(manager.makeImageTasks().first)
+        #expect(task.provider == .openAI)
+        #expect(task.maskImagePath == maskURL.path)
+        #expect(task.maskImageBookmark == Data("mask".utf8))
+    }
+
+    @MainActor @Test func imageTasksDropSharedMaskForMultipleIndependentSources() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "first.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "second.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+
+        let manager = BatchStagingManager()
+        manager.addFiles([firstURL, secondURL])
+        manager.setMaskFile(maskURL, bookmark: Data("mask".utf8))
+
+        let tasks = manager.makeImageTasks()
+
+        #expect(tasks.count == 2)
+        #expect(tasks.allSatisfy { $0.maskImagePath == nil })
+        #expect(tasks.allSatisfy { $0.maskImageBookmark == nil })
+    }
+
+    @MainActor @Test func multiInputImageTasksCarrySharedMaskMetadata() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "first.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "second.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+
+        let manager = BatchStagingManager()
+        manager.isMultiInput = true
+        manager.addFiles([firstURL, secondURL])
+        manager.setMaskFile(maskURL, bookmark: Data("mask".utf8))
+
+        let task = try #require(manager.makeImageTasks().first)
+
+        #expect(task.inputPaths == [firstURL.path, secondURL.path])
+        #expect(task.maskImagePath == maskURL.path)
+        #expect(task.maskImageBookmark == Data("mask".utf8))
+    }
+
+    @MainActor @Test func enqueueDropsSharedBatchMaskForMultipleIndependentSources() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "first.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "second.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+        let activeBatchURL = directory.appendingPathComponent("active_batch.json")
+        let maskBookmark = Data("mask".utf8)
+
+        let manager = BatchStagingManager()
+        manager.applyProviderSelection(.openAI, modelName: "gpt-image-2")
+        manager.addFiles([firstURL, secondURL])
+        manager.setMaskFile(maskURL, bookmark: maskBookmark)
+
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: directory.path,
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            maskImagePath: maskURL.path,
+            maskImageBookmark: maskBookmark
+        )
+        batch.tasks = manager.makeImageTasks()
+
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        orchestrator.enqueue(batch)
+
+        let persistedBatch = try #require(loadPersistedQueueState(from: activeBatchURL).batches.first)
+        #expect(persistedBatch.maskImagePath == nil)
+        #expect(persistedBatch.maskImageBookmark == nil)
+        #expect(persistedBatch.tasks.count == 2)
+        #expect(persistedBatch.tasks.allSatisfy { $0.maskImagePath == nil })
+        #expect(persistedBatch.tasks.allSatisfy { $0.maskImageBookmark == nil })
+    }
+
+    @MainActor @Test func enqueuePreservesSharedBatchMaskForSingleSourceVariations() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "source.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+        let activeBatchURL = directory.appendingPathComponent("active_batch.json")
+        let maskBookmark = Data("mask".utf8)
+
+        let manager = BatchStagingManager()
+        manager.applyProviderSelection(.openAI, modelName: "gpt-image-2")
+        manager.imageVariationCount = 2
+        manager.addFiles([sourceURL])
+        manager.setMaskFile(maskURL, bookmark: maskBookmark)
+
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: directory.path,
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            maskImagePath: maskURL.path,
+            maskImageBookmark: maskBookmark
+        )
+        batch.tasks = manager.makeImageTasks()
+
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        orchestrator.enqueue(batch)
+
+        let persistedBatch = try #require(loadPersistedQueueState(from: activeBatchURL).batches.first)
+        #expect(persistedBatch.maskImagePath == maskURL.path)
+        #expect(persistedBatch.maskImageBookmark == maskBookmark)
+        #expect(persistedBatch.tasks.count == 2)
+        #expect(persistedBatch.tasks.allSatisfy { $0.maskImagePath == maskURL.path })
+        #expect(persistedBatch.tasks.allSatisfy { $0.maskImageBookmark == maskBookmark })
+    }
+
+    @MainActor @Test func enqueuePreservesSharedBatchMaskForMergedMultiInputTask() throws {
+        let directory = try makeTemporaryDirectory()
+        let firstURL = try makeTemporaryFile(in: directory, named: "first.png")
+        let secondURL = try makeTemporaryFile(in: directory, named: "second.png")
+        let maskURL = try makeTemporaryFile(in: directory, named: "mask.png")
+        let activeBatchURL = directory.appendingPathComponent("active_batch.json")
+        let maskBookmark = Data("mask".utf8)
+
+        let manager = BatchStagingManager()
+        manager.applyProviderSelection(.openAI, modelName: "gpt-image-2")
+        manager.isMultiInput = true
+        manager.addFiles([firstURL, secondURL])
+        manager.setMaskFile(maskURL, bookmark: maskBookmark)
+
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: directory.path,
+            modelName: "gpt-image-2",
+            provider: .openAI,
+            maskImagePath: maskURL.path,
+            maskImageBookmark: maskBookmark
+        )
+        batch.tasks = manager.makeImageTasks()
+
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        orchestrator.enqueue(batch)
+
+        let persistedBatch = try #require(loadPersistedQueueState(from: activeBatchURL).batches.first)
+        let task = try #require(persistedBatch.tasks.first)
+        #expect(persistedBatch.maskImagePath == maskURL.path)
+        #expect(persistedBatch.maskImageBookmark == maskBookmark)
+        #expect(task.inputPaths == [firstURL.path, secondURL.path])
+        #expect(task.maskImagePath == maskURL.path)
+        #expect(task.maskImageBookmark == maskBookmark)
+    }
+
+    @MainActor @Test func openAIPreflightPreservesPNGPayload() async throws {
+        let directory = try makeTemporaryDirectory()
+        let originalPNG = try makeImageData(format: .png, hasAlpha: true)
+        let fileURL = try makeTemporaryFile(in: directory, named: "alpha.png", contents: originalPNG)
+        let service = NanoBananaService()
+
+        let prepared = try await service.prepareInlineImages(for: [fileURL], provider: .openAI)
+
+        #expect(prepared.count == 1)
+        #expect(prepared[0].sourceMimeType == "image/png")
+        #expect(prepared[0].payloadMimeType == "image/png")
+        #expect(prepared[0].payloadByteCount == prepared[0].originalByteCount)
+        #expect(prepared[0].data == originalPNG)
+    }
+
+    @MainActor @Test func openAIResponseParsingCapturesDetailedTokenUsageAndAllImages() async throws {
+        let payload = """
+        {
+          "data": [
+            { "b64_json": "aGVsbG8=" },
+            { "b64_json": "d29ybGQ=" }
+          ],
+          "output_format": "png",
+          "usage": {
+            "input_tokens": 11,
+            "input_tokens_details": { "image_tokens": 7, "text_tokens": 4 },
+            "output_tokens": 13,
+            "output_tokens_details": { "image_tokens": 10, "text_tokens": 3 },
+            "total_tokens": 24
+          }
+        }
+        """.data(using: .utf8)!
+
+        let service = NanoBananaService()
+        let responses = try await service.parseOpenAIResponse(payload)
+        let first = try #require(responses.first)
+        let second = try #require(responses.dropFirst().first)
+        let usage = try #require(first.tokenUsage)
+
+        #expect(responses.count == 2)
+        #expect(first.mimeType == "image/png")
+        #expect(first.imageData == Data("hello".utf8))
+        #expect(second.imageData == Data("world".utf8))
+        #expect(usage.promptTokenCount == 11)
+        #expect(usage.promptImageTokenCount == 7)
+        #expect(usage.promptTextTokenCount == 4)
+        #expect(usage.candidateImageTokenCount == 10)
+        #expect(usage.candidateTextTokenCount == 3)
+        #expect(second.tokenUsage == nil)
+    }
+
+    @MainActor @Test func persistResponsesWritesMultiOutputFilesAndAllocatesUsageOnce() throws {
+        let directory = try makeTemporaryDirectory()
+        let inputFilename = "input-\(UUID().uuidString).png"
+        let inputURL = try makeTemporaryFile(in: directory, named: inputFilename, contents: makeTransparentPNGData())
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: directory.appendingPathComponent("active_batch.json"),
+            autoStartEnqueuedBatches: false
+        )
+        let settings = makeBatchSettings(
+            outputDirectory: AppPaths.defaultOutputDirectory.path,
+            projectId: UUID(),
+            openAIOutputFormat: .webp,
+            openAIBackground: .transparent,
+            openAIInputFidelity: .high,
+            openAIOutputCompression: 80,
+            openAINCount: 2
+        )
+        let job = ImageTask(inputPath: inputURL.path, projectId: settings.projectId, provider: .openAI)
+        let responses = [
+            ImageEditResponse(
+                imageData: Data("first".utf8),
+                mimeType: "image/webp",
+                tokenUsage: TokenUsage(
+                    promptTokenCount: 11,
+                    candidatesTokenCount: 13,
+                    totalTokenCount: 24,
+                    promptImageTokenCount: 7,
+                    promptTextTokenCount: 4,
+                    candidateImageTokenCount: 10,
+                    candidateTextTokenCount: 3
+                )
+            ),
+            ImageEditResponse(
+                imageData: Data("second".utf8),
+                mimeType: "image/webp",
+                tokenUsage: nil
+            )
+        ]
+
+        let persisted = try orchestrator.persistResponses(
+            responses,
+            for: job,
+            settings: settings,
+            resolvedModelName: "gpt-image-2",
+            owningBatchId: nil
+        )
+
+        #expect(persisted.outputs.count == 2)
+        #expect(persisted.outputs[0].outputURL.pathExtension == "webp")
+        #expect(persisted.outputs[0].outputURL.lastPathComponent.contains("img1of2"))
+        #expect(persisted.outputs[1].outputURL.lastPathComponent.contains("img2of2"))
+        #expect(try Data(contentsOf: persisted.outputs[0].outputURL) == Data("first".utf8))
+        #expect(try Data(contentsOf: persisted.outputs[1].outputURL) == Data("second".utf8))
+        #expect(abs(persisted.outputs.reduce(0) { $0 + $1.cost } - persisted.totalCost) < floatingPointTolerance)
+        #expect(persisted.outputs[0].tokenUsage?.totalTokenCount == 24)
+        #expect(persisted.outputs[1].tokenUsage == nil)
+    }
+
+    @MainActor @Test func persistResponsesFallsBackToRecoveryDirectoryWhenOutputAccessIsDenied() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "input.png", contents: makeTransparentPNGData())
+        let outputURL = directory.appendingPathComponent("Desktop Project", isDirectory: true)
+        let recoveryURL = directory.appendingPathComponent("Recovered Outputs", isDirectory: true)
+        let deniedBookmark = Data("denied-output-bookmark".utf8)
+        let dependencies = AppPaths.BookmarkResolutionDependencies(
+            resolveURL: { data in
+                #expect(data == deniedBookmark)
+                return (outputURL, false)
+            },
+            refreshBookmarkData: { _ in Data("refreshed".utf8) },
+            startAccessing: { _ in false },
+            stopAccessing: { _ in }
+        )
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: directory.appendingPathComponent("active_batch.json"),
+            recoveredOutputsDirectoryURL: recoveryURL,
+            bookmarkDependencies: dependencies,
+            autoStartEnqueuedBatches: false
+        )
+        let settings = makeBatchSettings(
+            outputDirectory: outputURL.path,
+            outputDirectoryBookmark: deniedBookmark,
+            projectId: UUID()
+        )
+        let job = ImageTask(inputPath: sourceURL.path, projectId: settings.projectId, provider: .openAI)
+        let response = ImageEditResponse(
+            imageData: Data("rescued-image".utf8),
+            mimeType: "image/png",
+            tokenUsage: nil
+        )
+
+        let persisted = try orchestrator.persistResponses(
+            [response],
+            for: job,
+            settings: settings,
+            resolvedModelName: "gpt-image-2",
+            owningBatchId: nil
+        )
+
+        let recoveredOutput = try #require(persisted.outputs.first?.outputURL)
+        #expect(persisted.usedRecoveryDirectory)
+        #expect(persisted.outputDirectoryBookmark == nil)
+        #expect(recoveredOutput.path.hasPrefix(recoveryURL.path))
+        #expect(try Data(contentsOf: recoveredOutput) == Data("rescued-image".utf8))
+    }
+
+    @MainActor @Test func recoveredOutputCompletionAnnotatesHistoryAndLedger() async throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(in: directory, named: "input.png", contents: makeTransparentPNGData())
+        let outputURL = directory.appendingPathComponent("Desktop Project", isDirectory: true)
+        let recoveryURL = directory.appendingPathComponent("Recovered Outputs", isDirectory: true)
+        let deniedBookmark = Data("denied-output-bookmark".utf8)
+        let dependencies = AppPaths.BookmarkResolutionDependencies(
+            resolveURL: { data in
+                #expect(data == deniedBookmark)
+                return (outputURL, false)
+            },
+            refreshBookmarkData: { _ in Data("refreshed".utf8) },
+            startAccessing: { _ in false },
+            stopAccessing: { _ in }
+        )
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: directory.appendingPathComponent("active_batch.json"),
+            recoveredOutputsDirectoryURL: recoveryURL,
+            bookmarkDependencies: dependencies,
+            autoStartEnqueuedBatches: false
+        )
+        var completedEntries: [HistoryEntry] = []
+        var ledgerEntries: [UsageLedgerEntry] = []
+        orchestrator.onImageCompleted = { completedEntries.append($0) }
+        orchestrator.onLedgerEntryCreated = { ledgerEntries.append($0) }
+
+        let projectId = UUID()
+        let settings = makeBatchSettings(
+            outputDirectory: outputURL.path,
+            outputDirectoryBookmark: deniedBookmark,
+            projectId: projectId,
+            useBatchTier: true
+        )
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: outputURL.path,
+            outputDirectoryBookmark: deniedBookmark,
+            useBatchTier: true,
+            projectId: projectId,
+            modelName: "gpt-image-2",
+            provider: .openAI
+        )
+        let task = ImageTask(inputPaths: [sourceURL.path], projectId: projectId, provider: .openAI)
+        task.status = "processing"
+        task.phase = .polling
+        task.remoteBatchId = "batch_123"
+        task.remoteRequestId = "task-a"
+        task.remoteBatchProvider = .openAI
+        batch.tasks = [task]
+        orchestrator.enqueue(batch)
+
+        let result = OpenAIBatchResult(
+            batchID: "batch_123",
+            terminalStatus: "completed",
+            successes: [
+                OpenAIBatchLineSuccess(
+                    customID: "task-a",
+                    responses: [
+                        ImageEditResponse(
+                            imageData: Data("rescued-image".utf8),
+                            mimeType: "image/png",
+                            tokenUsage: nil
+                        )
+                    ]
+                )
+            ],
+            failures: []
+        )
+
+        await orchestrator.applyOpenAIBatchResult(result, batch: batch, settings: settings)
+
+        let historyEntry = try #require(completedEntries.first)
+        let ledgerEntry = try #require(ledgerEntries.first)
+        #expect(completedEntries.count == 1)
+        #expect(ledgerEntries.count == 1)
+        #expect(historyEntry.outputImagePath.hasPrefix(recoveryURL.path))
+        #expect(historyEntry.status == "completed")
+        #expect(historyEntry.error?.contains("recovery folder") == true || historyEntry.error?.contains("Output folder could not be accessed") == true)
+        #expect(ledgerEntry.note?.contains("recovery") == true || ledgerEntry.note?.contains("Output folder could not be accessed") == true)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: historyEntry.outputImagePath)) == Data("rescued-image".utf8))
+    }
+
+    @Test func openAIOutputSizeRejectsExtremeAspectRatios() {
+        do {
+            _ = try NanoBananaService.openAIOutputSize(aspectRatio: "8:1", imageSize: "1K")
+            Issue.record("Expected extreme aspect ratios to be rejected for OpenAI")
+        } catch NanoBananaError.inputPreparationFailed {
+            // Expected path.
+        } catch {
+            Issue.record("Expected inputPreparationFailed but got \(error)")
+        }
+    }
+
+    @Test func openAIMaskValidationRejectsFormatMismatch() throws {
+        let directory = try makeTemporaryDirectory()
+        let primaryURL = try makeTemporaryFile(
+            in: directory,
+            named: "source.jpg",
+            contents: try makeImageData(format: .jpeg, hasAlpha: false)
+        )
+        let maskURL = try makeTemporaryFile(
+            in: directory,
+            named: "mask.png",
+            contents: try makeImageData(format: .png, hasAlpha: true)
+        )
+
+        do {
+            try NanoBananaService.validateOpenAIMask(primaryImageURL: primaryURL, maskImageURL: maskURL)
+            Issue.record("Expected format mismatch to fail mask validation")
+        } catch NanoBananaError.inputPreparationFailed(let message) {
+            #expect(message.contains("same file format"))
+        } catch {
+            Issue.record("Expected inputPreparationFailed but got \(error)")
+        }
+    }
+
+    @Test func openAIBatchGenerationLineUsesImageGenerationEndpointAndCount() throws {
+        let request = ImageEditRequest.textOnly(
+            provider: .openAI,
+            modelName: "gpt-image-2",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            useBatchTier: true,
+            openAIOutputFormat: .webp,
+            openAIBackground: .opaque,
+            openAIOutputCompression: 72,
+            openAINCount: 3
+        )
+
+        let line = try NanoBananaService.makeOpenAIBatchRequestLine(
+            customID: "task-a",
+            request: request
+        )
+        let json = try decodeJSONObject(line.encodedJSONLineData())
+        let body = try #require(json["body"] as? [String: Any])
+
+        #expect(json["custom_id"] as? String == "task-a")
+        #expect(json["method"] as? String == "POST")
+        #expect(json["url"] as? String == "/v1/images/generations")
+        #expect(body["model"] as? String == "gpt-image-2")
+        #expect(body["prompt"] as? String == "prompt")
+        #expect(body["output_format"] as? String == "webp")
+        #expect(body["background"] as? String == "opaque")
+        #expect(body["output_compression"] as? Int == 72)
+        #expect(body["n"] as? Int == 3)
+    }
+
+    @Test func openAIBatchEditLineUsesUploadedFileReferences() throws {
+        let request = ImageEditRequest(
+            provider: .openAI,
+            modelName: "gpt-image-2",
+            inputImageURLs: [
+                URL(fileURLWithPath: "/tmp/source-a.png"),
+                URL(fileURLWithPath: "/tmp/source-b.png")
+            ],
+            maskImageURL: URL(fileURLWithPath: "/tmp/mask.png"),
+            prompt: "edit prompt",
+            systemInstruction: nil,
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            useBatchTier: true,
+            openAIOutputFormat: .png,
+            openAIBackground: .auto,
+            openAIInputFidelity: .high,
+            openAIOutputCompression: 100,
+            openAINCount: 2
+        )
+
+        let line = try NanoBananaService.makeOpenAIBatchRequestLine(
+            customID: "task-edit",
+            request: request,
+            uploadedImageFileIDs: ["file-source-a", "file-source-b"],
+            uploadedMaskFileID: "file-mask"
+        )
+        let json = try decodeJSONObject(line.encodedJSONLineData())
+        let body = try #require(json["body"] as? [String: Any])
+        let images = try #require(body["images"] as? [[String: Any]])
+        let mask = try #require(body["mask"] as? [String: Any])
+
+        #expect(json["url"] as? String == "/v1/images/edits")
+        #expect(images.count == 2)
+        #expect(images[0]["file_id"] as? String == "file-source-a")
+        #expect(images[1]["file_id"] as? String == "file-source-b")
+        #expect(mask["file_id"] as? String == "file-mask")
+        #expect(body["n"] as? Int == 2)
+    }
+
+    @Test func openAIBatchEditLineUsesSourceAspectWhenAspectIsAuto() throws {
+        let directory = try makeTemporaryDirectory()
+        let sourceURL = try makeTemporaryFile(
+            in: directory,
+            named: "source.jpg",
+            contents: try makeImageData(width: 3000, height: 2000, format: .jpeg, hasAlpha: false)
+        )
+        let request = ImageEditRequest(
+            provider: .openAI,
+            modelName: "gpt-image-2",
+            inputImageURLs: [sourceURL],
+            maskImageURL: nil,
+            prompt: "edit prompt",
+            systemInstruction: nil,
+            aspectRatio: "Auto",
+            imageSize: "4K",
+            useBatchTier: true,
+            openAIOutputFormat: .png,
+            openAIBackground: .auto,
+            openAIInputFidelity: .high,
+            openAIOutputCompression: 100,
+            openAINCount: 1
+        )
+
+        let line = try NanoBananaService.makeOpenAIBatchRequestLine(
+            customID: "task-auto-aspect",
+            request: request,
+            uploadedImageFileIDs: ["file-source"]
+        )
+        let json = try decodeJSONObject(line.encodedJSONLineData())
+        let body = try #require(json["body"] as? [String: Any])
+
+        #expect(body["size"] as? String == "3520x2336")
+    }
+
+    @MainActor @Test func openAIBatchResultParsingPreservesPartialSuccess() async throws {
+        let service = NanoBananaService()
+        let outputData = """
+        {"custom_id":"task-a","response":{"status_code":200,"body":{"data":[{"b64_json":"b2s="}],"output_format":"png","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}},"error":null}
+        """.data(using: .utf8)!
+        let errorData = """
+        {"custom_id":"task-b","response":null,"error":{"message":"The edit failed"}}
+        """.data(using: .utf8)!
+
+        let result = try await service.parseOpenAIBatchResultFiles(
+            batchID: "batch_123",
+            terminalStatus: "completed",
+            expectedCustomIDs: ["task-a", "task-b"],
+            outputFileData: outputData,
+            errorFileData: errorData
+        )
+
+        let success = try #require(result.successes.first)
+        let failure = try #require(result.failures.first)
+
+        #expect(result.batchID == "batch_123")
+        #expect(success.customID == "task-a")
+        #expect(success.responses.first?.imageData == Data("ok".utf8))
+        #expect(failure.customID == "task-b")
+        #expect(failure.message.contains("The edit failed"))
+    }
+
+    @MainActor @Test func openAIBatchResultParsingIgnoresUnexpectedCustomIDs() async throws {
+        let service = NanoBananaService()
+        let outputData = """
+        {"custom_id":"task-already-completed","response":{"status_code":200,"body":{"data":[{"b64_json":"b2s="}],"output_format":"png"}},"error":null}
+        {"custom_id":"task-still-pending","response":{"status_code":200,"body":{"data":[{"b64_json":"b2s="}],"output_format":"png"}},"error":null}
+        """.data(using: .utf8)!
+
+        let result = try await service.parseOpenAIBatchResultFiles(
+            batchID: "batch_123",
+            terminalStatus: "completed",
+            expectedCustomIDs: ["task-still-pending"],
+            outputFileData: outputData,
+            errorFileData: nil
+        )
+
+        #expect(result.successes.map(\.customID) == ["task-still-pending"])
+        #expect(result.failures.isEmpty)
+    }
+
+    @MainActor @Test func openAIBatchResultParsingSkipsMalformedUnexpectedLine() async throws {
+        let service = NanoBananaService()
+        let outputData = """
+        {"custom_id":"task-already-completed","response":{"status_code":200,"body":{"data":[],"output_format":"png"}},"error":null}
+        """.data(using: .utf8)!
+
+        let result = try await service.parseOpenAIBatchResultFiles(
+            batchID: "batch_123",
+            terminalStatus: "completed",
+            expectedCustomIDs: ["task-still-pending"],
+            outputFileData: outputData,
+            errorFileData: nil
+        )
+
+        #expect(result.successes.isEmpty)
+        #expect(result.failures.map(\.customID) == ["task-still-pending"])
+    }
+
+    @MainActor @Test func openAIBatchResultApplicationSkipsTerminalSuccessSideEffects() async throws {
+        let outputDirectory = try makeTemporaryDirectory()
+        let activeBatchURL = try makeTemporaryDirectory().appendingPathComponent("active_batch.json")
+        let projectId = UUID()
+        let orchestrator = BatchOrchestrator(
+            activeBatchURL: activeBatchURL,
+            autoStartEnqueuedBatches: false
+        )
+        var completedEntries: [HistoryEntry] = []
+        var ledgerEntries: [UsageLedgerEntry] = []
+        orchestrator.onImageCompleted = { completedEntries.append($0) }
+        orchestrator.onLedgerEntryCreated = { ledgerEntries.append($0) }
+
+        let batch = BatchJob(
+            prompt: "prompt",
+            outputDirectory: outputDirectory.path,
+            useBatchTier: true,
+            projectId: projectId,
+            modelName: "gpt-image-2",
+            provider: .openAI
+        )
+        let task = ImageTask(inputPaths: ["/tmp/source.png"], projectId: projectId, provider: .openAI)
+        task.status = "completed"
+        task.phase = .completed
+        task.remoteBatchId = "batch_123"
+        task.remoteRequestId = "task-a"
+        task.remoteBatchProvider = .openAI
+        batch.tasks = [task]
+
+        let settings = BatchSettings(
+            provider: .openAI,
+            prompt: "prompt",
+            systemPrompt: nil,
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            outputDirectory: outputDirectory.path,
+            outputDirectoryBookmark: nil,
+            useBatchTier: true,
+            projectId: projectId,
+            modelName: "gpt-image-2",
+            maskImagePath: nil,
+            maskImageBookmark: nil,
+            openAIOutputFormat: .png,
+            openAIBackground: .auto,
+            openAIInputFidelity: .high,
+            openAIOutputCompression: 100,
+            openAINCount: 1
+        )
+        let result = OpenAIBatchResult(
+            batchID: "batch_123",
+            terminalStatus: "completed",
+            successes: [
+                OpenAIBatchLineSuccess(
+                    customID: "task-a",
+                    responses: [
+                        ImageEditResponse(
+                            imageData: Data("duplicate-output".utf8),
+                            mimeType: "image/png",
+                            tokenUsage: nil
+                        )
+                    ]
+                )
+            ],
+            failures: []
+        )
+
+        await orchestrator.applyOpenAIBatchResult(result, batch: batch, settings: settings)
+
+        #expect(completedEntries.isEmpty)
+        #expect(ledgerEntries.isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outputDirectory.path).isEmpty)
+    }
+
+    @Test func historyEntryRemotePollingEligibilitySupportsOpenAIAndGemini() {
+        let geminiEntry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            externalJobName: "batches/gemini-job"
+        )
+        let openAIEntry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            provider: .openAI,
+            remoteBatchId: "batch_openai_123",
+            remoteRequestId: "task-a",
+            remoteBatchProvider: .openAI
+        )
+        let openAIEntryWithoutProvider = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            provider: .openAI,
+            remoteBatchId: "batch_openai_123",
+            remoteRequestId: "task-a"
+        )
+        let incompleteOpenAIEntry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            provider: .openAI,
+            remoteBatchId: "batch_openai_123",
+            remoteBatchProvider: .openAI
+        )
+
+        #expect(geminiEntry.canResumeRemotePolling)
+        #expect(openAIEntry.canResumeRemotePolling)
+        #expect(openAIEntryWithoutProvider.canResumeRemotePolling)
+        #expect(incompleteOpenAIEntry.canResumeRemotePolling == false)
+        #expect(incompleteOpenAIEntry.canRescueRemoteJobID == false)
+    }
+
+    @Test func openAIHistoryEntryWithOnlyExternalJobNameDoesNotAdvertiseResumeOrRescue() {
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            externalJobName: "batches/legacy-openai-job",
+            provider: .openAI
+        )
+
+        #expect(entry.canResumeRemotePolling == false)
+        #expect(entry.canRescueRemoteJobID == false)
+    }
+
+    @Test func openAIHistoryEntryRequiresRemoteBatchIdAndRemoteRequestIdForResume() {
+        let missingRequestId = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            provider: .openAI,
+            remoteBatchId: "batch_openai_123",
+            remoteBatchProvider: .openAI
+        )
+        let missingBatchId = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            provider: .openAI,
+            remoteRequestId: "task-openai-a",
+            remoteBatchProvider: .openAI
+        )
+        let completeViaProvider = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            provider: .openAI,
+            remoteBatchId: "batch_openai_123",
+            remoteRequestId: "task-openai-a"
+        )
+        let completeViaRemoteBatchProvider = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            remoteBatchId: "batch_openai_123",
+            remoteRequestId: "task-openai-a",
+            remoteBatchProvider: .openAI
+        )
+
+        #expect(missingRequestId.canResumeRemotePolling == false)
+        #expect(missingBatchId.canResumeRemotePolling == false)
+        #expect(completeViaProvider.canResumeRemotePolling)
+        #expect(completeViaRemoteBatchProvider.canResumeRemotePolling)
+    }
+
+    @Test func geminiHistoryEntryStillResumesWithExternalJobName() {
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            status: "failed",
+            externalJobName: "batches/gemini-job"
+        )
+
+        #expect(entry.canResumeRemotePolling)
+    }
+
+    @Test func remoteBatchFieldsRoundTripThroughQueueAndHistory() throws {
+        let task = ImageTask(inputPath: "/tmp/source.png", provider: .openAI)
+        task.remoteBatchId = "batch_123"
+        task.remoteRequestId = "task-a"
+        task.remoteBatchProvider = .openAI
+
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        let decodedTask = try decoder.decode(ImageTask.self, from: encoder.encode(task))
+
+        #expect(decodedTask.remoteBatchId == "batch_123")
+        #expect(decodedTask.remoteRequestId == "task-a")
+        #expect(decodedTask.remoteBatchProvider == .openAI)
+        #expect(decodedTask.hasRemoteJob)
+
+        let entry = HistoryEntry(
+            projectId: UUID(),
+            sourceImagePaths: ["/tmp/source.png"],
+            outputImagePath: "/tmp/output.png",
+            prompt: "prompt",
+            aspectRatio: "1:1",
+            imageSize: "1K",
+            usedBatchTier: true,
+            cost: 0,
+            provider: .openAI,
+            remoteBatchId: "batch_123",
+            remoteRequestId: "task-a",
+            remoteBatchProvider: .openAI
+        )
+        let decodedEntry = try decoder.decode(HistoryEntry.self, from: encoder.encode(entry))
+
+        #expect(decodedEntry.remoteBatchId == "batch_123")
+        #expect(decodedEntry.remoteRequestId == "task-a")
+        #expect(decodedEntry.remoteBatchProvider == .openAI)
+    }
+
+    @Test func openAIModelAdvertisesBatchTierSupport() {
+        let pricing = AppPricing.pricing(for: "gpt-image-2", provider: .openAI)
+        let model = CuratedModelCatalog.fallbackEntries(for: .openAI).first { $0.id == "gpt-image-2" }
+
+        #expect(pricing.supportsBatchTier)
+        #expect(model?.supportsBatchTier == true)
     }
 }
 

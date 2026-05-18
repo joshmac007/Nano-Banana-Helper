@@ -7,10 +7,15 @@ struct JobSubmissionData: Sendable {
     let id: UUID
     let inputURLs: [URL]       // Security-scoped URLs (already started access)
     let inputPaths: [String]
-    let hasSecurityScope: Bool // Whether we need to stop access after use
+    let securityScopedInputURLs: [URL]
+
+    func stopAccessingSecurityScopedResources() {
+        securityScopedInputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+    }
 }
 
 struct BatchSettings: Sendable {
+    let provider: ModelProvider
     let prompt: String
     let systemPrompt: String?
     let aspectRatio: String
@@ -20,6 +25,13 @@ struct BatchSettings: Sendable {
     let useBatchTier: Bool
     let projectId: UUID?
     let modelName: String?
+    let maskImagePath: String?
+    let maskImageBookmark: Data?
+    let openAIOutputFormat: OpenAIOutputFormat
+    let openAIBackground: OpenAIBackground
+    let openAIInputFidelity: OpenAIInputFidelity
+    let openAIOutputCompression: Int
+    let openAINCount: Int
 
     func cost(inputCount: Int) -> Double {
         ImageSize.calculateCost(
@@ -29,6 +41,21 @@ struct BatchSettings: Sendable {
             modelName: modelName
         )
     }
+}
+
+struct PersistedResponseOutput: Sendable {
+    let outputURL: URL
+    let outputBookmark: Data?
+    let cost: Double
+    let tokenUsage: TokenUsage?
+}
+
+struct PersistedResponseBatch: Sendable {
+    let outputs: [PersistedResponseOutput]
+    let outputDirectoryBookmark: Data?
+    let totalCost: Double
+    let totalTokenUsage: TokenUsage?
+    let usedRecoveryDirectory: Bool
 }
 
 struct PersistedQueueState: Codable {
@@ -161,6 +188,7 @@ final class BatchOrchestrator {
     private let service: NanoBananaService
     private let concurrencyLimit = 5
     private let activeBatchURL: URL
+    private let recoveredOutputsDirectoryURL: URL
     private let bookmarkDependencies: AppPaths.BookmarkResolutionDependencies
     private let autoStartEnqueuedBatches: Bool
     private let processQueueOverride: ProcessQueueOverride?
@@ -179,16 +207,19 @@ final class BatchOrchestrator {
     var onRestoreSettings: ((HistoryEntry) -> Void)?
 
     private let ambiguousSubmittingRecoveryMessage = "App closed before submission completed. Remote job id was not saved; retry manually to avoid duplicate jobs."
+    private let cancellationFinalStatusTimedOutMessage = "Cancelled locally. Remote final status was not confirmed before polling timed out."
 
     init(
         service: NanoBananaService = NanoBananaService(),
         activeBatchURL: URL? = nil,
+        recoveredOutputsDirectoryURL: URL? = nil,
         bookmarkDependencies: AppPaths.BookmarkResolutionDependencies? = nil,
         autoStartEnqueuedBatches: Bool = true,
         processQueueOverride: ProcessQueueOverride? = nil
     ) {
         self.service = service
         self.activeBatchURL = activeBatchURL ?? AppPaths.activeBatchURL
+        self.recoveredOutputsDirectoryURL = recoveredOutputsDirectoryURL ?? AppPaths.recoveredOutputsDirectoryURL
         self.bookmarkDependencies = bookmarkDependencies ?? .live
         self.autoStartEnqueuedBatches = autoStartEnqueuedBatches
         self.processQueueOverride = processQueueOverride
@@ -196,10 +227,17 @@ final class BatchOrchestrator {
     }
 
     func enqueue(_ batch: BatchJob) {
+        discardTerminalQueueItemsBeforeNewBatch()
+        dropUnsafeSharedMaskIfNeeded(from: batch)
         activeBatches.append(batch)
 
         for task in batch.tasks {
             task.projectId = batch.projectId
+            task.provider = batch.provider
+            if canApplySharedMask(from: batch, to: task) {
+                task.maskImagePath = task.maskImagePath ?? batch.maskImagePath
+                task.maskImageBookmark = task.maskImageBookmark ?? batch.maskImageBookmark
+            }
         }
 
         normalizeBatchStatus(batch)
@@ -213,7 +251,42 @@ final class BatchOrchestrator {
         }
     }
 
+    private func dropUnsafeSharedMaskIfNeeded(from batch: BatchJob) {
+        guard batch.maskImagePath != nil || batch.maskImageBookmark != nil else { return }
+        guard !batch.isTextMode else {
+            batch.maskImagePath = nil
+            batch.maskImageBookmark = nil
+            return
+        }
+        guard !batch.tasks.isEmpty, batch.tasks.allSatisfy({ canApplySharedMask(from: batch, to: $0) }) else {
+            batch.maskImagePath = nil
+            batch.maskImageBookmark = nil
+            return
+        }
+    }
+
+    private func canApplySharedMask(from batch: BatchJob, to task: ImageTask) -> Bool {
+        guard batch.maskImagePath != nil || batch.maskImageBookmark != nil else { return false }
+        guard !batch.isTextMode, !task.inputPaths.isEmpty else { return false }
+        if task.inputPaths.count > 1 { return true }
+
+        let inputSets = Set(batch.tasks.map(\.inputPaths))
+        return inputSets.count <= 1
+    }
+
+    private func discardTerminalQueueItemsBeforeNewBatch() {
+        guard !activeBatches.isEmpty else { return }
+        guard activeBatches.allSatisfy({ $0.tasks.allSatisfy(\.isTerminal) }) else { return }
+
+        activeBatches.removeAll()
+        controlState = .idle
+        currentProgress = 0
+        statusMessage = "Ready"
+    }
+
     func enqueueTextGeneration(
+        provider: ModelProvider,
+        modelName: String,
         prompt: String,
         systemPrompt: String? = nil,
         aspectRatio: String,
@@ -222,7 +295,12 @@ final class BatchOrchestrator {
         outputDirectoryBookmark: Data? = nil,
         useBatchTier: Bool,
         imageCount: Int,
-        projectId: UUID?
+        projectId: UUID?,
+        openAIOutputFormat: OpenAIOutputFormat = .png,
+        openAIBackground: OpenAIBackground = .auto,
+        openAIInputFidelity: OpenAIInputFidelity = .high,
+        openAIOutputCompression: Int = 100,
+        openAINCount: Int = 1
     ) {
         let batch = BatchJob(
             prompt: prompt,
@@ -233,11 +311,17 @@ final class BatchOrchestrator {
             outputDirectoryBookmark: outputDirectoryBookmark,
             useBatchTier: useBatchTier,
             projectId: projectId,
-            modelName: AppConfig.load().modelName ?? AppPricing.defaultModelName
+            modelName: modelName,
+            provider: provider,
+            openAIOutputFormat: openAIOutputFormat,
+            openAIBackground: openAIBackground,
+            openAIInputFidelity: openAIInputFidelity,
+            openAIOutputCompression: openAIOutputCompression,
+            openAINCount: openAINCount
         )
         batch.isTextMode = true
         batch.tasks = (0..<imageCount).map { _ in
-            ImageTask(inputPaths: [], projectId: projectId)
+            ImageTask(inputPaths: [], projectId: projectId, provider: provider)
         }
         enqueue(batch)
     }
@@ -387,7 +471,7 @@ final class BatchOrchestrator {
         saveActiveBatches()
         updateProgress()
 
-        if activeBatches.contains(where: { $0.tasks.contains(where: { $0.status == "processing" && ($0.externalJobName != nil || $0.phase == .submitting) }) }) {
+        if activeBatches.contains(where: { $0.tasks.contains(where: { $0.status == "processing" && ($0.hasRemoteJob || $0.phase == .submitting) }) }) {
             Task {
                 await self.startAll()
             }
@@ -400,10 +484,15 @@ final class BatchOrchestrator {
     }
 
     func cancel(batch: BatchJob) {
+        if batch.provider == .openAI && batch.useBatchTier {
+            cancelOpenAIBatch(batch: batch)
+            return
+        }
+
         batch.status = "processing"
 
         for job in batch.tasks where !job.isTerminal {
-            if job.status == "pending", job.externalJobName == nil, job.phase != .submitting {
+            if job.status == "pending", !job.hasRemoteJob, job.phase != .submitting {
                 finalizeLocalCancellation(job: job, batch: batch)
                 continue
             }
@@ -418,6 +507,39 @@ final class BatchOrchestrator {
                 Task {
                     try? await self.service.cancelBatchJob(jobName: jobName)
                 }
+            }
+        }
+
+        normalizeBatchStatus(batch)
+        statusMessage = cancellationStatusMessage
+        saveActiveBatches()
+        updateProgress()
+    }
+
+    private func cancelOpenAIBatch(batch: BatchJob) {
+        batch.status = "processing"
+        var remoteBatchIDs = Set<String>()
+
+        for job in batch.tasks where !job.isTerminal {
+            if job.status == "pending", !job.hasRemoteJob, job.phase != .submitting {
+                finalizeLocalCancellation(job: job, batch: batch)
+                continue
+            }
+
+            job.status = "processing"
+            job.phase = .cancelRequested
+            job.cancelRequestedAt = job.cancelRequestedAt ?? Date()
+            job.error = "Cancel requested. Waiting for final status."
+            job.stalledAt = nil
+
+            if let remoteBatchId = job.remoteBatchId {
+                remoteBatchIDs.insert(remoteBatchId)
+            }
+        }
+
+        for remoteBatchID in remoteBatchIDs {
+            Task {
+                try? await self.service.cancelOpenAIBatch(batchID: remoteBatchID)
             }
         }
 
@@ -495,8 +617,31 @@ final class BatchOrchestrator {
         await startAll()
     }
 
+    func resumeIssueTask(_ task: ImageTask) {
+        resumeIssueTask(id: task.id)
+    }
+
+    func resumeIssueTask(id taskId: UUID) {
+        guard let batch = batch(containing: taskId), let job = task(for: taskId) else {
+            LogManager.shared.log(.error, payload: "Queue resume ignored: task \(taskId.uuidString) is no longer in the active queue.")
+            return
+        }
+
+        guard let remoteJobID = job.remoteJobIdForDisplay else {
+            LogManager.shared.log(.error, payload: "Queue resume ignored: task \(taskId.uuidString) has no remote batch job id.")
+            return
+        }
+
+        rearmRemoteJobForPolling(job, in: batch, jobIdentifier: remoteJobID, source: "queue issue")
+        Task {
+            await self.startAll()
+        }
+    }
+
     private func processQueue(batch: BatchJob) async {
+        dropUnsafeSharedMaskIfNeeded(from: batch)
         let batchSettings = BatchSettings(
+            provider: batch.provider,
             prompt: batch.prompt,
             systemPrompt: batch.systemPrompt,
             aspectRatio: batch.aspectRatio,
@@ -505,8 +650,20 @@ final class BatchOrchestrator {
             outputDirectoryBookmark: batch.outputDirectoryBookmark,
             useBatchTier: batch.useBatchTier,
             projectId: batch.projectId,
-            modelName: batch.modelName
+            modelName: batch.modelName,
+            maskImagePath: batch.maskImagePath,
+            maskImageBookmark: batch.maskImageBookmark,
+            openAIOutputFormat: batch.openAIOutputFormat,
+            openAIBackground: batch.openAIBackground,
+            openAIInputFidelity: batch.openAIInputFidelity,
+            openAIOutputCompression: batch.openAIOutputCompression,
+            openAINCount: batch.openAINCount
         )
+
+        if batch.provider == .openAI && batch.useBatchTier {
+            await processOpenAIBatchQueue(batch: batch, settings: batchSettings)
+            return
+        }
 
         if controlState != .cancelling {
             let submissionDataList = buildSubmissionDataList(for: batch)
@@ -535,6 +692,47 @@ final class BatchOrchestrator {
                         await self.performPoll(jobId: id, jobName: name, settings: batchSettings, recovering: recovering)
                     }
                 }
+            }
+        }
+
+        normalizeBatchStatus(batch)
+        if batch.status == "completed" {
+            let count = batch.tasks.filter { $0.status == "completed" }.count
+            statusMessage = "Completed: \(count) output images"
+            await sendCompletionNotification()
+        } else if batch.status == "failed" {
+            statusMessage = "Completed with issues"
+            await sendCompletionNotification()
+        } else if batch.status == "cancelled" {
+            statusMessage = "Cancellation complete"
+        }
+    }
+
+    private func processOpenAIBatchQueue(batch: BatchJob, settings: BatchSettings) async {
+        if controlState != .cancelling {
+            let submissionDataList = buildSubmissionDataList(for: batch)
+            if !submissionDataList.isEmpty {
+                statusMessage = "Submitting \(submissionDataList.count) OpenAI batch requests..."
+                await submitOpenAIBatch(submissionDataList, in: batch, settings: settings)
+            }
+        }
+
+        if controlState == .pausedLocal {
+            applyPausedStateToBatch(batch)
+            return
+        }
+
+        let remoteBatchIDs = Set(
+            batch.tasks.compactMap { task -> String? in
+                guard shouldPollOpenAIBatch(task: task) else { return nil }
+                return task.remoteBatchId
+            }
+        )
+
+        if !remoteBatchIDs.isEmpty {
+            statusMessage = controlState == .cancelling ? "Reconciling OpenAI batch cancellation..." : "Polling OpenAI batch..."
+            for remoteBatchID in remoteBatchIDs {
+                await performOpenAIBatchPoll(remoteBatchID: remoteBatchID, batch: batch, settings: settings)
             }
         }
 
@@ -583,45 +781,267 @@ final class BatchOrchestrator {
         }
     }
 
-    private func buildSubmissionDataList(for batch: BatchJob) -> [JobSubmissionData] {
+    private func submitOpenAIBatch(_ submissionDataList: [JobSubmissionData], in batch: BatchJob, settings: BatchSettings) async {
+        let resolvedMaskBookmark = settings.maskImageBookmark.flatMap {
+            AppPaths.resolveBookmark($0, dependencies: bookmarkDependencies)
+        }
+        if let refreshedMaskBookmark = resolvedMaskBookmark?.refreshedBookmarkData {
+            batch.maskImageBookmark = refreshedMaskBookmark
+            for data in submissionDataList {
+                task(for: data.id)?.maskImageBookmark = refreshedMaskBookmark
+            }
+            saveActiveBatches()
+        }
+        let maskImageURL = resolvedMaskBookmark?.url ?? settings.maskImagePath.map { URL(fileURLWithPath: $0) }
+        let resolvedModelName = settings.modelName ?? AppPricing.defaultModelName(for: settings.provider)
+        defer {
+            resolvedMaskBookmark?.url.stopAccessingSecurityScopedResource()
+            submissionDataList.forEach { $0.stopAccessingSecurityScopedResources() }
+        }
+
+        do {
+            let requestItems = try submissionDataList.map { data -> OpenAIBatchSubmissionItem in
+                guard let job = task(for: data.id) else {
+                    throw NanoBananaError.batchError(message: "OpenAI batch task disappeared before submission.")
+                }
+
+                job.status = "processing"
+                job.phase = .submitting
+                job.startedAt = job.startedAt ?? Date()
+                job.error = nil
+
+                let request = makeImageEditRequest(
+                    data: data,
+                    settings: settings,
+                    maskImageURL: maskImageURL,
+                    resolvedModelName: resolvedModelName
+                )
+
+                return OpenAIBatchSubmissionItem(
+                    taskID: data.id,
+                    customID: "task-\(data.id.uuidString)",
+                    request: request
+                )
+            }
+
+            saveActiveBatches()
+            updateProgress()
+
+            let batchInfo = try await service.startOpenAIBatch(requests: requestItems)
+            for mapping in batchInfo.requests {
+                guard let job = task(for: mapping.taskID) else { continue }
+                job.remoteBatchId = batchInfo.batchID
+                job.remoteRequestId = mapping.customID
+                job.remoteBatchProvider = .openAI
+                job.submittedAt = Date()
+                job.lastPollState = "validating"
+                job.lastPollUpdatedAt = Date()
+                job.stalledAt = nil
+                job.status = "processing"
+                job.cancelRequestedAt = job.cancelRequestedAt ?? (job.phase == .cancelRequested ? Date() : nil)
+
+                if job.phase == .cancelRequested || controlState == .cancelling {
+                    job.phase = .cancelRequested
+                    job.error = "Cancel requested. Waiting for final status."
+                    job.cancelRequestedAt = job.cancelRequestedAt ?? Date()
+                } else if controlState == .pausedLocal {
+                    job.phase = .pausedLocal
+                    job.error = "Paused locally. Resume to reconcile remote status."
+                } else {
+                    job.phase = .submittedRemote
+                    job.error = nil
+                }
+            }
+
+            if controlState == .cancelling {
+                try? await service.cancelOpenAIBatch(batchID: batchInfo.batchID)
+            }
+
+            saveActiveBatches()
+            updateProgress()
+        } catch {
+            for data in submissionDataList {
+                await handleError(jobId: data.id, data: data, settings: settings, error: error)
+            }
+        }
+    }
+
+    private func makeImageEditRequest(
+        data: JobSubmissionData,
+        settings: BatchSettings,
+        maskImageURL: URL?,
+        resolvedModelName: String
+    ) -> ImageEditRequest {
+        if data.inputURLs.isEmpty {
+            return ImageEditRequest.textOnly(
+                provider: settings.provider,
+                modelName: resolvedModelName,
+                prompt: settings.prompt,
+                systemInstruction: settings.systemPrompt,
+                aspectRatio: settings.aspectRatio,
+                imageSize: settings.imageSize,
+                useBatchTier: settings.useBatchTier,
+                openAIOutputFormat: settings.openAIOutputFormat,
+                openAIBackground: settings.openAIBackground,
+                openAIInputFidelity: settings.openAIInputFidelity,
+                openAIOutputCompression: settings.openAIOutputCompression,
+                openAINCount: settings.openAINCount
+            )
+        }
+
+        return ImageEditRequest(
+            provider: settings.provider,
+            modelName: resolvedModelName,
+            inputImageURLs: data.inputURLs,
+            maskImageURL: maskImageURL,
+            prompt: settings.prompt,
+            systemInstruction: settings.systemPrompt,
+            aspectRatio: settings.aspectRatio,
+            imageSize: settings.imageSize,
+            useBatchTier: settings.useBatchTier,
+            openAIOutputFormat: settings.openAIOutputFormat,
+            openAIBackground: settings.openAIBackground,
+            openAIInputFidelity: settings.openAIInputFidelity,
+            openAIOutputCompression: settings.openAIOutputCompression,
+            openAINCount: settings.openAINCount
+        )
+    }
+
+    private func performOpenAIBatchPoll(remoteBatchID: String, batch: BatchJob, settings: BatchSettings) async {
+        let tasksForRemoteBatch = batch.tasks.filter {
+            $0.remoteBatchId == remoteBatchID && !$0.isTerminal
+        }
+        let expectedCustomIDs = tasksForRemoteBatch.compactMap(\.remoteRequestId)
+        guard !expectedCustomIDs.isEmpty else { return }
+
+        do {
+            let shouldContinue: @Sendable () async -> Bool = { [orchestrator = self] in
+                await MainActor.run {
+                    orchestrator.shouldContinueOpenAIBatchPolling(remoteBatchID: remoteBatchID)
+                }
+            }
+
+            let result = try await service.pollOpenAIBatch(
+                batchID: remoteBatchID,
+                expectedCustomIDs: expectedCustomIDs,
+                onPollUpdate: { @Sendable update in
+                    Task { @MainActor [weak self] in
+                        self?.updateOpenAIBatchPollStatus(remoteBatchID: remoteBatchID, update: update)
+                    }
+                },
+                softTimeout: softPollTimeout,
+                shouldContinue: shouldContinue
+            )
+
+            await applyOpenAIBatchResult(result, batch: batch, settings: settings)
+        } catch NanoBananaError.softTimeout(let state) {
+            for task in tasksForRemoteBatch {
+                await markJobAsStalled(jobId: task.id, state: state)
+            }
+        } catch NanoBananaError.pollingStopped(let state) {
+            for task in tasksForRemoteBatch {
+                markJobAsPaused(jobId: task.id, state: state)
+            }
+        } catch {
+            for task in tasksForRemoteBatch {
+                await handleError(
+                    jobId: task.id,
+                    data: JobSubmissionData(id: task.id, inputURLs: [], inputPaths: [], securityScopedInputURLs: []),
+                    settings: settings,
+                    error: error
+                )
+            }
+        }
+    }
+
+    func applyOpenAIBatchResult(_ result: OpenAIBatchResult, batch: BatchJob, settings: BatchSettings) async {
+        for success in result.successes {
+            guard let job = batch.tasks.first(where: { $0.remoteRequestId == success.customID }),
+                  !job.isTerminal else { continue }
+            await handleSuccess(
+                jobId: job.id,
+                data: JobSubmissionData(id: job.id, inputURLs: [], inputPaths: [], securityScopedInputURLs: []),
+                settings: settings,
+                responses: success.responses,
+                jobName: nil
+            )
+        }
+
+        for failure in result.failures {
+            guard let job = batch.tasks.first(where: { $0.remoteRequestId == failure.customID }),
+                  !job.isTerminal else { continue }
+
+            switch result.terminalStatus {
+            case "cancelled":
+                await handleCancelled(jobId: job.id, settings: settings, message: failure.message, jobName: nil)
+            case "expired":
+                await handleExpired(jobId: job.id, settings: settings, message: failure.message, jobName: nil)
+            default:
+                await handleError(
+                    jobId: job.id,
+                    data: JobSubmissionData(id: job.id, inputURLs: [], inputPaths: [], securityScopedInputURLs: []),
+                    settings: settings,
+                    error: NanoBananaError.batchError(message: failure.message)
+                )
+            }
+        }
+    }
+
+    private func updateOpenAIBatchPollStatus(remoteBatchID: String, update: OpenAIBatchStatusUpdate) {
+        for job in allJobs where job.remoteBatchId == remoteBatchID && !job.isTerminal {
+            job.status = "processing"
+            job.phase = job.phase == .cancelRequested ? .cancelRequested : .polling
+            job.pollCount += 1
+            job.lastPollState = update.status
+            job.lastPollUpdatedAt = update.updatedAt
+            job.stalledAt = nil
+            if job.phase != .cancelRequested {
+                job.error = nil
+            }
+        }
+    }
+
+    func buildSubmissionDataList(for batch: BatchJob) -> [JobSubmissionData] {
         var didRefreshInputBookmarks = false
 
         let submissionDataList: [JobSubmissionData] = batch.tasks.compactMap { job in
             guard shouldSubmit(task: job) else { return nil }
+
+            var inputURLs: [URL] = []
+            var securityScopedInputURLs: [URL] = []
+
             if let bookmarks = job.inputBookmarks, !bookmarks.isEmpty {
                 var updatedBookmarks = bookmarks
-                let resolvedBookmarks: [AppPaths.ResolvedBookmark] = bookmarks.enumerated().compactMap { item in
-                    guard let resolution = AppPaths.resolveBookmark(
-                        item.element,
+
+                for (index, path) in job.inputPaths.enumerated() {
+                    if bookmarks.indices.contains(index),
+                       let resolution = AppPaths.resolveBookmark(
+                        bookmarks[index],
                         dependencies: bookmarkDependencies
-                    ) else {
-                        return nil
+                       ) {
+                        inputURLs.append(resolution.url)
+                        securityScopedInputURLs.append(resolution.url)
+                        if let refreshedBookmark = resolution.refreshedBookmarkData {
+                            updatedBookmarks[index] = refreshedBookmark
+                        }
+                    } else {
+                        inputURLs.append(URL(fileURLWithPath: path))
                     }
-                    if let refreshedBookmark = resolution.refreshedBookmarkData {
-                        updatedBookmarks[item.offset] = refreshedBookmark
-                    }
-                    return resolution
                 }
 
                 if updatedBookmarks != bookmarks {
                     job.inputBookmarks = updatedBookmarks
                     didRefreshInputBookmarks = true
                 }
-
-                if !resolvedBookmarks.isEmpty {
-                    return JobSubmissionData(
-                        id: job.id,
-                        inputURLs: resolvedBookmarks.map(\.url),
-                        inputPaths: job.inputPaths,
-                        hasSecurityScope: true
-                    )
-                }
+            } else {
+                inputURLs = job.inputPaths.map { URL(fileURLWithPath: $0) }
             }
+
             return JobSubmissionData(
                 id: job.id,
-                inputURLs: job.inputPaths.map { URL(fileURLWithPath: $0) },
+                inputURLs: inputURLs,
                 inputPaths: job.inputPaths,
-                hasSecurityScope: false
+                securityScopedInputURLs: securityScopedInputURLs
             )
         }
 
@@ -657,32 +1077,58 @@ final class BatchOrchestrator {
         saveActiveBatches()
         updateProgress()
 
+        let resolvedMaskBookmark = settings.maskImageBookmark.flatMap {
+            AppPaths.resolveBookmark($0, dependencies: bookmarkDependencies)
+        }
+        if let refreshedMaskBookmark = resolvedMaskBookmark?.refreshedBookmarkData, let owningBatch = batch(containing: data.id) {
+            owningBatch.maskImageBookmark = refreshedMaskBookmark
+            job.maskImageBookmark = refreshedMaskBookmark
+            saveActiveBatches()
+        }
+        let maskImageURL = resolvedMaskBookmark?.url ?? settings.maskImagePath.map { URL(fileURLWithPath: $0) }
+        let resolvedModelName = settings.modelName ?? AppPricing.defaultModelName(for: settings.provider)
+        defer {
+            resolvedMaskBookmark?.url.stopAccessingSecurityScopedResource()
+        }
         let request: ImageEditRequest
         if data.inputURLs.isEmpty {
             request = ImageEditRequest.textOnly(
+                provider: settings.provider,
+                modelName: resolvedModelName,
                 prompt: settings.prompt,
                 systemInstruction: settings.systemPrompt,
                 aspectRatio: settings.aspectRatio,
                 imageSize: settings.imageSize,
-                useBatchTier: settings.useBatchTier
+                useBatchTier: settings.useBatchTier,
+                openAIOutputFormat: settings.openAIOutputFormat,
+                openAIBackground: settings.openAIBackground,
+                openAIInputFidelity: settings.openAIInputFidelity,
+                openAIOutputCompression: settings.openAIOutputCompression,
+                openAINCount: settings.openAINCount
             )
         } else {
             request = ImageEditRequest(
+                provider: settings.provider,
+                modelName: resolvedModelName,
                 inputImageURLs: data.inputURLs,
+                maskImageURL: maskImageURL,
                 prompt: settings.prompt,
                 systemInstruction: settings.systemPrompt,
                 aspectRatio: settings.aspectRatio,
                 imageSize: settings.imageSize,
-                useBatchTier: settings.useBatchTier
+                useBatchTier: settings.useBatchTier,
+                openAIOutputFormat: settings.openAIOutputFormat,
+                openAIBackground: settings.openAIBackground,
+                openAIInputFidelity: settings.openAIInputFidelity,
+                openAIOutputCompression: settings.openAIOutputCompression,
+                openAINCount: settings.openAINCount
             )
         }
 
         do {
             if settings.useBatchTier {
                 let jobInfo = try await service.startBatchJob(request: request)
-                if data.hasSecurityScope {
-                    data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
-                }
+                data.stopAccessingSecurityScopedResources()
 
                 guard let submittedJob = task(for: data.id) else { return }
                 submittedJob.externalJobName = jobInfo.jobName
@@ -693,23 +1139,32 @@ final class BatchOrchestrator {
                 submittedJob.status = "processing"
                 submittedJob.cancelRequestedAt = submittedJob.cancelRequestedAt ?? (submittedJob.phase == .cancelRequested ? Date() : nil)
 
-                    if let projectId = settings.projectId {
-                        let entry = HistoryEntry(
-                            projectId: projectId,
-                            sourceImagePaths: submittedJob.inputPaths,
-                            outputImagePath: "",
+                if let projectId = settings.projectId {
+                    let entry = HistoryEntry(
+                        projectId: projectId,
+                        sourceImagePaths: submittedJob.inputPaths,
+                        outputImagePath: "",
                         prompt: settings.prompt,
                         aspectRatio: settings.aspectRatio,
                         imageSize: settings.imageSize,
-                            usedBatchTier: settings.useBatchTier,
-                            cost: 0,
-                            status: "processing",
-                            externalJobName: jobInfo.jobName,
-                            sourceImageBookmarks: submittedJob.inputBookmarks,
-                            outputDirectoryBookmark: settings.outputDirectoryBookmark,
-                            modelName: settings.modelName,
-                            systemPrompt: settings.systemPrompt
-                        )
+                        usedBatchTier: settings.useBatchTier,
+                        cost: 0,
+                        status: "processing",
+                        externalJobName: jobInfo.jobName,
+                        sourceImageBookmarks: submittedJob.inputBookmarks,
+                        outputDirectoryBookmark: settings.outputDirectoryBookmark,
+                        modelName: resolvedModelName,
+                        provider: settings.provider,
+                        systemPrompt: settings.systemPrompt,
+                        maskImagePath: submittedJob.maskImagePath,
+                        outputDirectoryPath: settings.outputDirectory,
+                        maskImageBookmark: submittedJob.maskImageBookmark,
+                        openAIOutputFormat: settings.openAIOutputFormat,
+                        openAIBackground: settings.openAIBackground,
+                        openAIInputFidelity: settings.openAIInputFidelity,
+                        openAIOutputCompression: settings.openAIOutputCompression,
+                        openAINCount: settings.openAINCount
+                    )
                     onImageCompleted?(entry)
                 }
 
@@ -730,22 +1185,18 @@ final class BatchOrchestrator {
                 saveActiveBatches()
                 updateProgress()
             } else {
-                let response = try await service.editImage(request)
-                if data.hasSecurityScope {
-                    data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
-                }
+                let responses = try await service.editImages(request)
+                data.stopAccessingSecurityScopedResources()
                 await handleSuccess(
                     jobId: data.id,
                     data: data,
                     settings: settings,
-                    response: response,
+                    responses: responses,
                     jobName: nil
                 )
             }
         } catch {
-            if data.hasSecurityScope {
-                data.inputURLs.forEach { $0.stopAccessingSecurityScopedResource() }
-            }
+            data.stopAccessingSecurityScopedResources()
             await handleError(jobId: data.id, data: data, settings: settings, error: error)
         }
     }
@@ -753,9 +1204,9 @@ final class BatchOrchestrator {
     private func performPoll(jobId: UUID, jobName: String, settings: BatchSettings, recovering: Bool) async {
         do {
             let response: ImageEditResponse
-            let shouldContinue: @Sendable () async -> Bool = { [weak self] in
+            let shouldContinue: @Sendable () async -> Bool = { [orchestrator = self] in
                 await MainActor.run {
-                    self?.shouldContinuePolling(jobId: jobId) ?? false
+                    orchestrator.shouldContinuePolling(jobId: jobId)
                 }
             }
 
@@ -786,9 +1237,9 @@ final class BatchOrchestrator {
 
             await handleSuccess(
                 jobId: jobId,
-                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false),
+                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], securityScopedInputURLs: []),
                 settings: settings,
-                response: response,
+                responses: [response],
                 jobName: jobName
             )
         } catch NanoBananaError.jobCancelled {
@@ -802,7 +1253,7 @@ final class BatchOrchestrator {
         } catch {
             await handleError(
                 jobId: jobId,
-                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], hasSecurityScope: false),
+                data: JobSubmissionData(id: jobId, inputURLs: [], inputPaths: [], securityScopedInputURLs: []),
                 settings: settings,
                 error: error
             )
@@ -825,15 +1276,15 @@ final class BatchOrchestrator {
     private func markJobAsStalled(jobId: UUID, state: String) async {
         guard let batch = batch(containing: jobId), let job = task(for: jobId) else { return }
         if job.phase == .cancelRequested || job.cancelRequestedAt != nil || controlState == .cancelling {
-            job.phase = .cancelRequested
-            job.status = "processing"
             job.lastPollState = state
             job.lastPollUpdatedAt = Date()
-            job.stalledAt = Date()
-            job.error = "Cancel requested. Waiting for the final remote status."
-            batch.status = "processing"
-            controlState = .cancelling
-            statusMessage = cancellationStatusMessage
+            finalizeLocalCancellation(
+                job: job,
+                batch: batch,
+                message: cancellationFinalStatusTimedOutMessage
+            )
+            normalizeBatchStatus(batch)
+            recomputeControlStateAfterWork()
             saveActiveBatches()
             updateProgress()
             return
@@ -866,77 +1317,75 @@ final class BatchOrchestrator {
         updateProgress()
     }
 
-    private func handleSuccess(jobId: UUID, data: JobSubmissionData, settings: BatchSettings, response: ImageEditResponse, jobName: String?) async {
+    private func handleSuccess(jobId: UUID, data: JobSubmissionData, settings: BatchSettings, responses: [ImageEditResponse], jobName: String?) async {
         guard let job = task(for: jobId) else { return }
         let owningBatch = batch(containing: jobId)
+        let resolvedModelName = settings.modelName ?? AppPricing.defaultModelName(for: settings.provider)
 
         do {
-            let writeResult = try withAccessibleOutputDirectory(
-                path: settings.outputDirectory,
-                bookmark: settings.outputDirectoryBookmark
-            ) { directoryURL in
-                try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-                let outputURL = generateOutputURL(
-                    for: job,
-                    in: directoryURL,
-                    mimeType: response.mimeType
-                )
-                try response.imageData.write(to: outputURL)
-                return (outputURL: outputURL, directoryBookmark: AppPaths.bookmark(for: directoryURL))
-            }
-            let outputURL = writeResult.value.outputURL
-            let outputDirectoryBookmark = writeResult.refreshedBookmark ?? writeResult.value.directoryBookmark
-            if let outputDirectoryBookmark, let batchId = owningBatch?.id {
-                updateOutputBookmark(outputDirectoryBookmark, for: batchId)
-                onOutputDirectoryBookmarkRefreshed?(settings.projectId, settings.outputDirectory, outputDirectoryBookmark)
-            }
+            let persisted = try persistResponses(
+                responses,
+                for: job,
+                settings: settings,
+                resolvedModelName: resolvedModelName,
+                owningBatchId: owningBatch?.id
+            )
 
             let completedDespiteCancel = job.cancelRequestedAt != nil
+            let recoveryWarning = persisted.usedRecoveryDirectory
+                ? "Output folder could not be accessed. Saved to the recovery folder instead."
+                : nil
             job.status = "completed"
             job.phase = .completed
-            job.outputPath = outputURL.path
+            job.outputPath = persisted.outputs.first?.outputURL.path
             job.completedAt = Date()
-            job.error = nil
+            job.error = recoveryWarning
             job.stalledAt = nil
             job.cancelRequestedAt = nil
+            if let owningBatch {
+                normalizeBatchStatus(owningBatch)
+            }
 
-            let cost = settings.cost(inputCount: job.inputPaths.count)
             if let projectId = settings.projectId {
                 let sourceBookmarks = job.inputBookmarks ?? []
-                let outputBookmark = AppPaths.bookmark(for: outputURL)
-                let historyEntry = makeHistoryEntry(
-                    projectId: projectId,
-                    job: job,
-                    settings: settings,
-                    outputImagePath: outputURL.path,
-                    cost: cost,
-                    status: "completed",
-                    error: nil,
-                    externalJobName: jobName,
-                    sourceImageBookmarks: sourceBookmarks.isEmpty ? nil : sourceBookmarks,
-                    outputImageBookmark: outputBookmark,
-                    outputDirectoryBookmark: outputDirectoryBookmark ?? settings.outputDirectoryBookmark,
-                    tokenUsage: response.tokenUsage,
-                    modelName: settings.modelName
-                )
-                persistHistoryEntry(historyEntry, externalJobName: jobName)
-                onLedgerEntryCreated?(
-                    UsageLedgerEntry(
-                        kind: .jobCompletion,
+                let outputDirectoryBookmark = persisted.usedRecoveryDirectory
+                    ? nil
+                    : (persisted.outputDirectoryBookmark ?? settings.outputDirectoryBookmark)
+                for output in persisted.outputs {
+                    let historyEntry = makeHistoryEntry(
                         projectId: projectId,
-                        projectNameSnapshot: nil,
-                        costDelta: cost,
-                        imageDelta: 1,
-                        tokenDelta: response.tokenUsage?.totalTokenCount ?? 0,
-                        inputTokenDelta: response.tokenUsage?.promptTokenCount ?? 0,
-                        outputTokenDelta: response.tokenUsage?.candidatesTokenCount ?? 0,
-                        resolution: settings.imageSize,
-                        modelName: settings.modelName,
-                        relatedHistoryEntryId: historyEntry.id,
-                        note: nil
+                        job: job,
+                        settings: settings,
+                        outputImagePath: output.outputURL.path,
+                        cost: output.cost,
+                        status: "completed",
+                        error: recoveryWarning,
+                        externalJobName: jobName,
+                        sourceImageBookmarks: sourceBookmarks.isEmpty ? nil : sourceBookmarks,
+                        outputImageBookmark: output.outputBookmark,
+                        outputDirectoryBookmark: outputDirectoryBookmark,
+                        tokenUsage: output.tokenUsage,
+                        modelName: resolvedModelName
                     )
-                )
-                onCostIncurred?(cost, settings.imageSize, projectId, response.tokenUsage, settings.modelName)
+                    persistHistoryEntry(historyEntry, externalJobName: jobName)
+                    onLedgerEntryCreated?(
+                        UsageLedgerEntry(
+                            kind: .jobCompletion,
+                            projectId: projectId,
+                            projectNameSnapshot: nil,
+                            costDelta: output.cost,
+                            imageDelta: 1,
+                            tokenDelta: output.tokenUsage?.totalTokenCount ?? 0,
+                            inputTokenDelta: output.tokenUsage?.promptTokenCount ?? 0,
+                            outputTokenDelta: output.tokenUsage?.candidatesTokenCount ?? 0,
+                            resolution: settings.imageSize,
+                            modelName: resolvedModelName,
+                            relatedHistoryEntryId: historyEntry.id,
+                            note: recoveryWarning
+                        )
+                    )
+                }
+                onCostIncurred?(persisted.totalCost, settings.imageSize, projectId, persisted.totalTokenUsage, resolvedModelName)
             }
 
             if completedDespiteCancel, !hasCancellationInProgress {
@@ -958,6 +1407,9 @@ final class BatchOrchestrator {
         job.completedAt = Date()
         job.stalledAt = nil
         job.cancelRequestedAt = nil
+        if let batch = batch(containing: jobId) {
+            normalizeBatchStatus(batch)
+        }
 
         if let projectId = settings.projectId {
             let historyEntry = makeHistoryEntry(
@@ -1047,6 +1499,118 @@ final class BatchOrchestrator {
         updateProgress()
     }
 
+    func persistResponses(
+        _ responses: [ImageEditResponse],
+        for job: ImageTask,
+        settings: BatchSettings,
+        resolvedModelName: String,
+        owningBatchId: UUID?
+    ) throws -> PersistedResponseBatch {
+        guard !responses.isEmpty else {
+            throw NanoBananaError.noImageInResponse
+        }
+
+        let totalTokenUsage = responses.compactMap(\.tokenUsage).first
+        let totalCost = AppPricing.usageCost(
+            modelName: resolvedModelName,
+            provider: settings.provider,
+            tokenUsage: totalTokenUsage,
+            isBatchTier: settings.useBatchTier
+        ) ?? settings.cost(inputCount: job.inputPaths.count)
+        let costShares = splitTotalCost(totalCost, across: responses.count)
+
+        let writeResult: (value: (outputURLs: [URL], directoryBookmark: Data?), refreshedBookmark: Data?)
+        let usedRecoveryDirectory: Bool
+
+        do {
+            writeResult = try withAccessibleOutputDirectory(
+                path: settings.outputDirectory,
+                bookmark: settings.outputDirectoryBookmark
+            ) { directoryURL in
+                try writeResponses(
+                    responses,
+                    for: job,
+                    in: directoryURL
+                )
+            }
+            usedRecoveryDirectory = false
+        } catch {
+            LogManager.shared.log(
+                .error,
+                payload: "Primary output write failed for task \(job.id.uuidString): \(error.localizedDescription). Saving returned image data to recovery folder."
+            )
+            let recovered = try writeResponses(
+                responses,
+                for: job,
+                in: recoveredOutputsDirectoryURL
+            )
+            writeResult = (value: recovered, refreshedBookmark: nil)
+            usedRecoveryDirectory = true
+            LogManager.shared.log(
+                .response,
+                payload: "Recovered \(responses.count) output image(s) for task \(job.id.uuidString) in \(recoveredOutputsDirectoryURL.path)."
+            )
+        }
+
+        let outputDirectoryBookmark = usedRecoveryDirectory
+            ? nil
+            : (writeResult.refreshedBookmark ?? writeResult.value.directoryBookmark)
+        if !usedRecoveryDirectory, let outputDirectoryBookmark, let batchId = owningBatchId {
+            updateOutputBookmark(outputDirectoryBookmark, for: batchId)
+            onOutputDirectoryBookmarkRefreshed?(settings.projectId, settings.outputDirectory, outputDirectoryBookmark)
+        }
+
+        let outputs = writeResult.value.outputURLs.enumerated().map { index, outputURL in
+            PersistedResponseOutput(
+                outputURL: outputURL,
+                outputBookmark: AppPaths.bookmark(for: outputURL),
+                cost: costShares[index],
+                tokenUsage: index == 0 ? totalTokenUsage : nil
+            )
+        }
+
+        return PersistedResponseBatch(
+            outputs: outputs,
+            outputDirectoryBookmark: outputDirectoryBookmark,
+            totalCost: totalCost,
+            totalTokenUsage: totalTokenUsage,
+            usedRecoveryDirectory: usedRecoveryDirectory
+        )
+    }
+
+    private func writeResponses(
+        _ responses: [ImageEditResponse],
+        for job: ImageTask,
+        in directoryURL: URL
+    ) throws -> (outputURLs: [URL], directoryBookmark: Data?) {
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+
+        let outputURLs = try responses.enumerated().map { index, response in
+            let outputURL = generateOutputURL(
+                for: job,
+                in: directoryURL,
+                mimeType: response.mimeType,
+                outputIndex: responses.count > 1 ? index + 1 : nil,
+                outputCount: responses.count
+            )
+            try response.imageData.write(to: outputURL)
+            return outputURL
+        }
+
+        return (outputURLs: outputURLs, directoryBookmark: AppPaths.bookmark(for: directoryURL))
+    }
+
+    private func splitTotalCost(_ totalCost: Double, across outputCount: Int) -> [Double] {
+        guard outputCount > 0 else { return [] }
+        guard outputCount > 1 else { return [totalCost] }
+
+        let share = totalCost / Double(outputCount)
+        var shares = Array(repeating: share, count: outputCount)
+        shares[outputCount - 1] = totalCost - shares.dropLast().reduce(0, +)
+        return shares
+    }
+
+
     private func makeHistoryEntry(
         projectId: UUID,
         job: ImageTask,
@@ -1079,7 +1643,19 @@ final class BatchOrchestrator {
             outputDirectoryBookmark: outputDirectoryBookmark,
             tokenUsage: tokenUsage,
             modelName: modelName,
-            systemPrompt: settings.systemPrompt
+            provider: settings.provider,
+            systemPrompt: settings.systemPrompt,
+            maskImagePath: job.maskImagePath,
+            outputDirectoryPath: settings.outputDirectory,
+            maskImageBookmark: job.maskImageBookmark,
+            openAIOutputFormat: settings.openAIOutputFormat,
+            openAIBackground: settings.openAIBackground,
+            openAIInputFidelity: settings.openAIInputFidelity,
+            openAIOutputCompression: settings.openAIOutputCompression,
+            openAINCount: settings.openAINCount,
+            remoteBatchId: job.remoteBatchId,
+            remoteRequestId: job.remoteRequestId,
+            remoteBatchProvider: job.remoteBatchProvider
         )
     }
 
@@ -1091,10 +1667,14 @@ final class BatchOrchestrator {
         }
     }
 
-    private func finalizeLocalCancellation(job: ImageTask, batch: BatchJob?) {
+    private func finalizeLocalCancellation(
+        job: ImageTask,
+        batch: BatchJob?,
+        message: String = "Cancelled by user"
+    ) {
         job.status = "cancelled"
         job.phase = .cancelled
-        job.error = "Cancelled by user"
+        job.error = message
         job.completedAt = Date()
         job.cancelRequestedAt = nil
         job.stalledAt = nil
@@ -1110,12 +1690,24 @@ final class BatchOrchestrator {
                 usedBatchTier: batch?.useBatchTier ?? false,
                 cost: 0,
                 status: "cancelled",
-                error: "Cancelled by user",
+                error: message,
                 externalJobName: job.externalJobName,
                 sourceImageBookmarks: job.inputBookmarks,
                 outputDirectoryBookmark: batch?.outputDirectoryBookmark,
                 modelName: batch?.modelName,
-                systemPrompt: batch?.systemPrompt
+                provider: batch?.provider ?? job.provider,
+                systemPrompt: batch?.systemPrompt,
+                maskImagePath: job.maskImagePath,
+                outputDirectoryPath: batch?.outputDirectory,
+                maskImageBookmark: job.maskImageBookmark,
+                openAIOutputFormat: batch?.openAIOutputFormat ?? .png,
+                openAIBackground: batch?.openAIBackground ?? .auto,
+                openAIInputFidelity: batch?.openAIInputFidelity ?? .high,
+                openAIOutputCompression: batch?.openAIOutputCompression ?? 100,
+                openAINCount: batch?.openAINCount ?? 1,
+                remoteBatchId: job.remoteBatchId,
+                remoteRequestId: job.remoteRequestId,
+                remoteBatchProvider: job.remoteBatchProvider
             )
             persistHistoryEntry(entry, externalJobName: job.externalJobName)
         }
@@ -1123,7 +1715,7 @@ final class BatchOrchestrator {
 
     private func shouldSubmit(task: ImageTask) -> Bool {
         !task.isTerminal &&
-        task.externalJobName == nil &&
+        !task.hasRemoteJob &&
         task.phase != .submitting &&
         task.phase != .cancelRequested &&
         (task.status == "pending" || task.phase == .pausedLocal)
@@ -1131,6 +1723,17 @@ final class BatchOrchestrator {
 
     private func shouldPoll(task: ImageTask) -> Bool {
         guard task.externalJobName != nil, !task.isTerminal else { return false }
+        guard controlState != .pausedLocal else { return false }
+        switch task.phase {
+        case .submitting, .pending, .completed, .cancelled, .expired, .failed:
+            return false
+        default:
+            return true
+        }
+    }
+
+    private func shouldPollOpenAIBatch(task: ImageTask) -> Bool {
+        guard task.remoteBatchId != nil, !task.isTerminal else { return false }
         guard controlState != .pausedLocal else { return false }
         switch task.phase {
         case .submitting, .pending, .completed, .cancelled, .expired, .failed:
@@ -1150,6 +1753,20 @@ final class BatchOrchestrator {
         return controlState != .pausedLocal
     }
 
+    private func shouldContinueOpenAIBatchPolling(remoteBatchID: String) -> Bool {
+        guard controlState != .pausedLocal else { return false }
+        return allJobs.contains {
+            $0.remoteBatchId == remoteBatchID &&
+            !$0.isTerminal &&
+            ($0.phase == .polling ||
+             $0.phase == .submittedRemote ||
+             $0.phase == .reconnecting ||
+             $0.phase == .stalled ||
+             $0.phase == .pausedLocal ||
+             $0.phase == .cancelRequested)
+        }
+    }
+
     private func applyPausedStateToActiveTasks() {
         for batch in activeBatches {
             applyPausedStateToBatch(batch)
@@ -1161,7 +1778,7 @@ final class BatchOrchestrator {
             if job.phase == .cancelRequested {
                 continue
             }
-            if job.status == "pending" || job.externalJobName == nil {
+            if job.status == "pending" || !job.hasRemoteJob {
                 job.phase = .pausedLocal
                 job.error = "Paused locally. Resume to continue."
             } else {
@@ -1270,10 +1887,24 @@ final class BatchOrchestrator {
         activeBatches.lazy.flatMap(\.tasks).first(where: { $0.id == id })
     }
 
-    private func generateOutputURL(for task: ImageTask, in directoryURL: URL, mimeType: String) -> URL {
-        let ext = mimeType == "image/png" ? "png" : "jpg"
+    private func generateOutputURL(
+        for task: ImageTask,
+        in directoryURL: URL,
+        mimeType: String,
+        outputIndex: Int? = nil,
+        outputCount: Int = 1
+    ) -> URL {
+        let ext: String
+        switch mimeType {
+        case "image/png":
+            ext = "png"
+        case "image/webp":
+            ext = "webp"
+        default:
+            ext = "jpg"
+        }
 
-        let baseName: String
+        var baseName: String
         if task.inputPaths.isEmpty {
             let formatter = DateFormatter()
             formatter.dateFormat = "yyyyMMdd_HHmmss"
@@ -1292,6 +1923,10 @@ final class BatchOrchestrator {
                 variationSuffix = ""
             }
             baseName = "\(inputName)_edited\(variationSuffix)"
+        }
+
+        if let outputIndex, outputCount > 1 {
+            baseName += "_img\(outputIndex)of\(outputCount)"
         }
 
         var candidate = directoryURL.appendingPathComponent("\(baseName).\(ext)")
@@ -1327,6 +1962,16 @@ final class BatchOrchestrator {
 
     private var softPollTimeout: TimeInterval {
         30 * 60
+    }
+
+    private func hasTimedOutCancellationRequest(_ task: ImageTask, now: Date) -> Bool {
+        guard !task.isTerminal,
+              task.phase == .cancelRequested,
+              let cancelRequestedAt = task.cancelRequestedAt else {
+            return false
+        }
+
+        return now.timeIntervalSince(cancelRequestedAt) >= softPollTimeout
     }
 
     private func sendCompletionNotification() async {
@@ -1417,10 +2062,18 @@ final class BatchOrchestrator {
     private func normalizeLoadedQueueState(persistedControlState: QueueControlState) -> StartupRecoveryNormalizationResult {
         var didChangePersistedState = false
         var hadAmbiguousSubmittingTasks = false
+        let now = Date()
 
         for batch in activeBatches {
             for task in batch.tasks {
-                if task.phase == .submitting && task.externalJobName == nil {
+                if hasTimedOutCancellationRequest(task, now: now) {
+                    finalizeLocalCancellation(
+                        job: task,
+                        batch: batch,
+                        message: cancellationFinalStatusTimedOutMessage
+                    )
+                    didChangePersistedState = true
+                } else if task.phase == .submitting && !task.hasRemoteJob {
                     task.status = "failed"
                     task.phase = .failed
                     task.error = ambiguousSubmittingRecoveryMessage
@@ -1428,7 +2081,7 @@ final class BatchOrchestrator {
                     task.stalledAt = nil
                     hadAmbiguousSubmittingTasks = true
                     didChangePersistedState = true
-                } else if task.phase == .submitting && task.externalJobName != nil {
+                } else if task.phase == .submitting && task.hasRemoteJob {
                     task.phase = .submittedRemote
                     didChangePersistedState = true
                 }
@@ -1485,6 +2138,16 @@ final class BatchOrchestrator {
         var didRefresh = false
 
         for batch in activeBatches {
+            if let maskBookmark = batch.maskImageBookmark,
+               let resolution = AppPaths.resolveBookmarkToPath(maskBookmark, dependencies: bookmarkDependencies),
+               let refreshedBookmark = resolution.refreshedBookmarkData {
+                batch.maskImageBookmark = refreshedBookmark
+                for task in batch.tasks {
+                    task.maskImageBookmark = refreshedBookmark
+                }
+                didRefresh = true
+            }
+
             for task in batch.tasks {
                 guard let inputBookmarks = task.inputBookmarks else { continue }
                 var updatedBookmarks = inputBookmarks
@@ -1512,17 +2175,41 @@ final class BatchOrchestrator {
     }
 
     func resumePollingFromHistory(for entry: HistoryEntry) {
+        if entry.canResumeOpenAIBatchPolling {
+            resumeOpenAIPollingFromHistory(for: entry)
+            return
+        }
+        if entry.provider == .openAI || entry.remoteBatchProvider == .openAI {
+            LogManager.shared.log(.error, payload: "Resume polling ignored: OpenAI history entry is missing a remote batch id or request id.")
+            return
+        }
+        resumeGeminiPollingFromHistory(for: entry)
+    }
+
+    private func resumeGeminiPollingFromHistory(for entry: HistoryEntry) {
         guard let jobName = entry.externalJobName else { return }
 
-        if activeBatches.contains(where: { $0.tasks.contains(where: { $0.externalJobName == jobName }) }) {
+        if let existingBatch = activeBatches.first(where: { $0.tasks.contains(where: { $0.externalJobName == jobName }) }),
+           let existingTask = existingBatch.tasks.first(where: { $0.externalJobName == jobName }) {
+            if existingTask.isIssue {
+                rearmRemoteJobForPolling(existingTask, in: existingBatch, jobIdentifier: jobName, source: "history")
+            } else {
+                LogManager.shared.log(.request, payload: "Resume polling requested for existing active job \(jobName).")
+            }
             Task {
                 await self.startAll()
             }
             return
         }
 
-        let task = ImageTask(inputPaths: entry.sourceImagePaths, projectId: entry.projectId)
-        task.inputBookmarks = entry.sourceImageBookmarks
+        let task = ImageTask(
+            inputPaths: entry.sourceImagePaths,
+            projectId: entry.projectId,
+            provider: entry.provider,
+            inputBookmarks: entry.sourceImageBookmarks,
+            maskImagePath: entry.maskImagePath,
+            maskImageBookmark: entry.maskImageBookmark
+        )
         task.externalJobName = jobName
         task.status = "processing"
         task.phase = .pausedLocal
@@ -1531,37 +2218,125 @@ final class BatchOrchestrator {
         task.lastPollUpdatedAt = entry.timestamp
         task.error = "Resuming from history. Reconciling remote status."
 
-        let outputDir: String
-        if !entry.outputImagePath.isEmpty {
-            outputDir = (entry.outputImagePath as NSString).deletingLastPathComponent
-        } else {
-            let projectsDir = AppPaths.projectsDirectoryURL
-            outputDir = projectsDir
-                .appendingPathComponent(entry.projectId.uuidString)
-                .appendingPathComponent("Outputs")
-                .path(percentEncoded: false)
-        }
-
-        let batch = BatchJob(
-            prompt: entry.prompt,
-            systemPrompt: entry.systemPrompt,
-            aspectRatio: entry.aspectRatio,
-            imageSize: entry.imageSize,
-            outputDirectory: outputDir,
-            outputDirectoryBookmark: entry.outputDirectoryBookmark,
-            useBatchTier: entry.usedBatchTier,
-            projectId: entry.projectId,
-            modelName: entry.modelName
-        )
+        let batch = makeHistoryResumeBatch(for: entry, outputDirectory: outputDirectoryForHistoryResume(entry))
         batch.tasks = [task]
         batch.status = "pending"
 
         enqueue(batch)
         statusMessage = "Resuming job from history..."
+        LogManager.shared.log(.request, payload: "Resume polling enqueued recovered history job \(jobName).")
 
         Task {
             await self.startAll()
         }
+    }
+
+    private func resumeOpenAIPollingFromHistory(for entry: HistoryEntry) {
+        guard let remoteBatchId = entry.remoteBatchId,
+              let remoteRequestId = entry.remoteRequestId else { return }
+
+        if let existingBatch = activeBatches.first(where: {
+            $0.tasks.contains {
+                $0.remoteBatchId == remoteBatchId &&
+                $0.remoteRequestId == remoteRequestId
+            }
+        }),
+           let existingTask = existingBatch.tasks.first(where: {
+               $0.remoteBatchId == remoteBatchId &&
+               $0.remoteRequestId == remoteRequestId
+           }) {
+            if existingTask.isIssue {
+                rearmRemoteJobForPolling(existingTask, in: existingBatch, jobIdentifier: remoteBatchId, source: "history")
+            } else {
+                LogManager.shared.log(.request, payload: "Resume polling requested for existing active OpenAI batch \(remoteBatchId).")
+            }
+            Task {
+                await self.startAll()
+            }
+            return
+        }
+
+        let task = ImageTask(
+            inputPaths: entry.sourceImagePaths,
+            projectId: entry.projectId,
+            provider: .openAI,
+            inputBookmarks: entry.sourceImageBookmarks,
+            maskImagePath: entry.maskImagePath,
+            maskImageBookmark: entry.maskImageBookmark
+        )
+        task.remoteBatchId = remoteBatchId
+        task.remoteRequestId = remoteRequestId
+        task.remoteBatchProvider = entry.remoteBatchProvider ?? .openAI
+        task.status = "processing"
+        task.phase = .pausedLocal
+        task.submittedAt = entry.timestamp
+        task.lastPollState = "validating"
+        task.lastPollUpdatedAt = entry.timestamp
+        task.error = "Resuming from history. Reconciling remote status."
+
+        let batch = makeHistoryResumeBatch(for: entry, outputDirectory: outputDirectoryForHistoryResume(entry))
+        batch.isTextMode = entry.isTextToImage
+        batch.tasks = [task]
+        batch.status = "pending"
+
+        enqueue(batch)
+        statusMessage = "Resuming OpenAI batch from history..."
+        LogManager.shared.log(.request, payload: "Resume polling enqueued recovered OpenAI batch \(remoteBatchId).")
+
+        Task {
+            await self.startAll()
+        }
+    }
+
+    private func outputDirectoryForHistoryResume(_ entry: HistoryEntry) -> String {
+        if !entry.outputImagePath.isEmpty {
+            return (entry.outputImagePath as NSString).deletingLastPathComponent
+        }
+        if let outputDirectoryPath = entry.outputDirectoryPath, !outputDirectoryPath.isEmpty {
+            return outputDirectoryPath
+        }
+        return AppPaths.projectsDirectoryURL
+            .appendingPathComponent(entry.projectId.uuidString)
+            .appendingPathComponent("Outputs")
+            .path(percentEncoded: false)
+    }
+
+    private func makeHistoryResumeBatch(for entry: HistoryEntry, outputDirectory: String) -> BatchJob {
+        BatchJob(
+            prompt: entry.prompt,
+            systemPrompt: entry.systemPrompt,
+            aspectRatio: entry.aspectRatio,
+            imageSize: entry.imageSize,
+            outputDirectory: outputDirectory,
+            outputDirectoryBookmark: entry.outputDirectoryBookmark,
+            useBatchTier: entry.usedBatchTier,
+            projectId: entry.projectId,
+            modelName: entry.modelName,
+            provider: entry.provider,
+            maskImagePath: entry.maskImagePath,
+            maskImageBookmark: entry.maskImageBookmark,
+            openAIOutputFormat: entry.openAIOutputFormat,
+            openAIBackground: entry.openAIBackground,
+            openAIInputFidelity: entry.openAIInputFidelity,
+            openAIOutputCompression: entry.openAIOutputCompression,
+            openAINCount: entry.openAINCount
+        )
+    }
+
+    private func rearmRemoteJobForPolling(_ job: ImageTask, in batch: BatchJob, jobIdentifier: String, source: String) {
+        job.status = "processing"
+        job.phase = .pausedLocal
+        job.error = "Resuming remote job. Reconciling final status."
+        job.completedAt = nil
+        job.stalledAt = nil
+        job.cancelRequestedAt = nil
+        job.lastPollUpdatedAt = Date()
+        batch.status = "pending"
+        controlState = .interrupted
+        statusMessage = "Resuming remote job..."
+        saveActiveBatches()
+        updateProgress()
+        LogManager.shared.log(.request, payload: "Resume polling re-armed \(source) job \(jobIdentifier) for task \(job.id.uuidString).")
     }
 
     private func withAccessibleOutputDirectory<T>(

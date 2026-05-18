@@ -230,7 +230,27 @@ struct ProgressQueueView: View {
                         Section {
                             ForEach(orchestrator.failedJobs, id: \.id) { task in
                                 TaskRowView(task: task)
+                                    .contextMenu {
+                                        if task.hasRemoteJob {
+                                            Button("Resume Polling") {
+                                                orchestrator.resumeIssueTask(task)
+                                            }
+                                        }
+                                        Button("Dismiss", role: .destructive) {
+                                            if let index = orchestrator.failedJobs.firstIndex(where: { $0.id == task.id }) {
+                                                orchestrator.removeFailedTasks(at: IndexSet(integer: index))
+                                            }
+                                        }
+                                    }
                                     .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                        if task.hasRemoteJob {
+                                            Button {
+                                                orchestrator.resumeIssueTask(task)
+                                            } label: {
+                                                Text("Resume")
+                                            }
+                                            .tint(.orange)
+                                        }
                                         Button(role: .destructive) {
                                             if let index = orchestrator.failedJobs.firstIndex(where: { $0.id == task.id }) {
                                                 orchestrator.removeFailedTasks(at: IndexSet(integer: index))
@@ -326,7 +346,7 @@ struct ProgressQueueView: View {
 
         switch orchestrator.controlState {
         case .pausedLocal:
-            return "Paused locally. Gemini may still finish already-submitted work remotely."
+            return "Paused locally. Already-submitted remote work may still finish while local polling is paused."
         case .cancelling:
             return "Cancelling remotely where possible and reconciling final job states."
         case .interrupted:

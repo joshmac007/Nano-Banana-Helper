@@ -13,7 +13,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_NAME="Nano Banana Helper"
 SCHEME="Nano Banana Helper"
 TEAM="46BZ85ALNS"
-DERIVED_DATA_DIR="$HOME/Library/Developer/Xcode/DerivedData"
+DERIVED_DATA_DIR="$PROJECT_DIR/DerivedData"
 
 # Colors for output
 RED='\033[0;31m'
@@ -36,7 +36,12 @@ BUILD_OUTPUT=$(xcodebuild \
     -project "$PROJECT_NAME.xcodeproj" \
     -scheme "$SCHEME" \
     -configuration Release \
+    -derivedDataPath "$DERIVED_DATA_DIR" \
     DEVELOPMENT_TEAM="$TEAM" \
+    MACOSX_DEPLOYMENT_TARGET=26.2 \
+    CODE_SIGNING_ALLOWED=NO \
+    CODE_SIGNING_REQUIRED=NO \
+    CODE_SIGN_IDENTITY="" \
     2>&1)
 
 echo "$BUILD_OUTPUT" | tail -3

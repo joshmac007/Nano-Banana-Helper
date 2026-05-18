@@ -173,7 +173,7 @@ struct HistoryEntryCard: View {
             Button("Reuse Settings") {
                 onReuse?(entry)
             }
-            if entry.status == "failed" && entry.externalJobName != nil {
+            if entry.status == "failed" && entry.canResumeRemotePolling {
                 Button("Resume Polling") {
                     onResumePolling?(entry)
                 }

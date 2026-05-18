@@ -62,7 +62,7 @@ struct WorkbenchView: View {
                         projectManager: projectManager,
                         projects: projectManager.projects,
                         initialProjectId: projectManager.currentProject?.id,
-                        activeJobIDs: Set(orchestrator.processingJobs.compactMap { $0.externalJobName }),
+                        activeJobIDs: Set(orchestrator.processingJobs.compactMap { $0.remoteJobIdForDisplay }),
                         onDelete: { entry in
                             historyManager.deleteEntry(entry)
                         },
@@ -90,6 +90,10 @@ struct WorkbenchView: View {
 
     private func reuseEntry(_ entry: HistoryEntry) {
         stagingManager.restore(from: entry)
+        var config = AppConfig.load()
+        config.provider = entry.provider
+        config.setModelName(entry.modelName ?? AppPricing.defaultModelName(for: entry.provider), for: entry.provider)
+        config.save()
         selectedTab = .staging
     }
 }

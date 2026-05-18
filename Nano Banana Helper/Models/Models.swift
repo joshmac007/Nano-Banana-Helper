@@ -1,5 +1,63 @@
 import Foundation
 
+nonisolated enum ModelProvider: String, Codable, CaseIterable, Identifiable, Sendable {
+    case gemini
+    case openAI = "openai"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .gemini: return "Gemini"
+        case .openAI: return "OpenAI"
+        }
+    }
+
+    var apiKeyLabel: String {
+        switch self {
+        case .gemini: return "Gemini API Key"
+        case .openAI: return "OpenAI API Key"
+        }
+    }
+
+    var documentationURL: URL {
+        switch self {
+        case .gemini: return URL(string: "https://ai.google.dev/gemini-api/docs")!
+        case .openAI: return URL(string: "https://developers.openai.com/api/docs/guides/image-generation")!
+        }
+    }
+}
+
+
+// MARK: - OpenAI Advanced Parameter Types
+
+nonisolated enum OpenAIOutputFormat: String, CaseIterable, Identifiable, Codable, Sendable {
+    case png, jpeg, webp
+    var id: String { rawValue }
+    var displayName: String { rawValue.uppercased() }
+    var mimeType: String {
+        switch self {
+        case .png: return "image/png"
+        case .jpeg: return "image/jpeg"
+        case .webp: return "image/webp"
+        }
+    }
+    var supportsCompression: Bool { self == .jpeg || self == .webp }
+    var supportsBackground: Bool { self == .png || self == .webp }
+}
+
+nonisolated enum OpenAIBackground: String, CaseIterable, Identifiable, Codable, Sendable {
+    case auto, transparent, opaque
+    var id: String { rawValue }
+    var displayName: String { rawValue.capitalized }
+}
+
+nonisolated enum OpenAIInputFidelity: String, CaseIterable, Identifiable, Codable, Sendable {
+    case high, low
+    var id: String { rawValue }
+    var displayName: String { rawValue.capitalized }
+}
+
 // MARK: - Project
 
 /// A project groups related batch jobs together with shared cost tracking
@@ -114,9 +172,20 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     let status: String // "completed", "cancelled", "failed"
     let error: String?
     let externalJobName: String?
+    let remoteBatchId: String?
+    let remoteRequestId: String?
+    let remoteBatchProvider: ModelProvider?
     let tokenUsage: TokenUsage?
     let modelName: String?
+    let provider: ModelProvider
     let systemPrompt: String?
+    let maskImagePath: String?
+    let outputDirectoryPath: String?
+    let openAIOutputFormat: OpenAIOutputFormat
+    let openAIBackground: OpenAIBackground
+    let openAIInputFidelity: OpenAIInputFidelity
+    let openAIOutputCompression: Int
+    let openAINCount: Int
 
     // Backward compatibility for single source path
     var sourceImagePath: String { sourceImagePaths.first ?? "" }
@@ -125,6 +194,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     var sourceImageBookmarks: [Data]?
     var outputImageBookmark: Data?
     var outputDirectoryBookmark: Data?
+    var maskImageBookmark: Data?
     
     var sourceURLs: [URL] {
         // Plain path-based URLs for display and non-file-access contexts only.
@@ -140,6 +210,10 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         return URL(fileURLWithPath: outputImagePath)
     }
 
+    var maskURL: URL? {
+        maskImagePath.map { URL(fileURLWithPath: $0) }
+    }
+
     var hasSourceImages: Bool {
         sourceImagePaths.contains { !$0.isEmpty }
     }
@@ -151,13 +225,44 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     var generationDescription: String {
         isTextToImage ? "Text to Image" : "Image to Image"
     }
+
+    var remoteJobIdForDisplay: String? {
+        remoteBatchId ?? externalJobName
+    }
+
+    var isOpenAIRemoteBatchEntry: Bool {
+        provider == .openAI || remoteBatchProvider == .openAI
+    }
+
+    var canResumeOpenAIBatchPolling: Bool {
+        isOpenAIRemoteBatchEntry &&
+            remoteBatchId != nil &&
+            remoteRequestId != nil
+    }
+
+    var canResumeRemotePolling: Bool {
+        if isOpenAIRemoteBatchEntry {
+            return canResumeOpenAIBatchPolling
+        }
+        if externalJobName != nil {
+            return true
+        }
+        return false
+    }
+
+    var canRescueRemoteJobID: Bool {
+        externalJobName == nil &&
+            !isOpenAIRemoteBatchEntry
+    }
     
     enum CodingKeys: String, CodingKey {
         case id, projectId, timestamp, sourceImagePaths, outputImagePath
         case prompt, aspectRatio, imageSize, usedBatchTier, cost
-        case status, error, externalJobName
-        case sourceImageBookmarks, outputImageBookmark, outputDirectoryBookmark
-        case tokenUsage, modelName, systemPrompt
+        case status, error, externalJobName, remoteBatchId, remoteRequestId, remoteBatchProvider
+        case sourceImageBookmarks, outputImageBookmark, outputDirectoryBookmark, maskImageBookmark
+        case tokenUsage, modelName, provider, systemPrompt, maskImagePath
+        case outputDirectoryPath
+        case openAIOutputFormat, openAIBackground, openAIInputFidelity, openAIOutputCompression, openAINCount
     }
     
     init(
@@ -179,7 +284,19 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         outputDirectoryBookmark: Data? = nil,
         tokenUsage: TokenUsage? = nil,
         modelName: String? = nil,
-        systemPrompt: String? = nil
+        provider: ModelProvider = .gemini,
+        systemPrompt: String? = nil,
+        maskImagePath: String? = nil,
+        outputDirectoryPath: String? = nil,
+        maskImageBookmark: Data? = nil,
+        openAIOutputFormat: OpenAIOutputFormat = .png,
+        openAIBackground: OpenAIBackground = .auto,
+        openAIInputFidelity: OpenAIInputFidelity = .high,
+        openAIOutputCompression: Int = 100,
+        openAINCount: Int = 1,
+        remoteBatchId: String? = nil,
+        remoteRequestId: String? = nil,
+        remoteBatchProvider: ModelProvider? = nil
     ) {
         self.id = id
         self.projectId = projectId
@@ -194,12 +311,24 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         self.status = status
         self.error = error
         self.externalJobName = externalJobName
+        self.remoteBatchId = remoteBatchId
+        self.remoteRequestId = remoteRequestId
+        self.remoteBatchProvider = remoteBatchProvider
         self.sourceImageBookmarks = sourceImageBookmarks
         self.outputImageBookmark = outputImageBookmark
         self.outputDirectoryBookmark = outputDirectoryBookmark
         self.tokenUsage = tokenUsage
         self.modelName = modelName
+        self.provider = provider
         self.systemPrompt = systemPrompt
+        self.maskImagePath = maskImagePath
+        self.outputDirectoryPath = outputDirectoryPath
+        self.maskImageBookmark = maskImageBookmark
+        self.openAIOutputFormat = openAIOutputFormat
+        self.openAIBackground = openAIBackground
+        self.openAIInputFidelity = openAIInputFidelity
+        self.openAIOutputCompression = openAIOutputCompression
+        self.openAINCount = openAINCount
     }
     
     init(from decoder: Decoder) throws {
@@ -217,12 +346,24 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         status = try container.decode(String.self, forKey: .status)
         error = try container.decodeIfPresent(String.self, forKey: .error)
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
+        remoteBatchId = try container.decodeIfPresent(String.self, forKey: .remoteBatchId)
+        remoteRequestId = try container.decodeIfPresent(String.self, forKey: .remoteRequestId)
+        remoteBatchProvider = try container.decodeIfPresent(ModelProvider.self, forKey: .remoteBatchProvider)
         sourceImageBookmarks = try container.decodeIfPresent([Data].self, forKey: .sourceImageBookmarks)
         outputImageBookmark = try container.decodeIfPresent(Data.self, forKey: .outputImageBookmark)
         outputDirectoryBookmark = try container.decodeIfPresent(Data.self, forKey: .outputDirectoryBookmark)
         tokenUsage = try container.decodeIfPresent(TokenUsage.self, forKey: .tokenUsage)
         modelName = try container.decodeIfPresent(String.self, forKey: .modelName)
+        provider = try container.decodeIfPresent(ModelProvider.self, forKey: .provider) ?? .gemini
         systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt)
+        maskImagePath = try container.decodeIfPresent(String.self, forKey: .maskImagePath)
+        outputDirectoryPath = try container.decodeIfPresent(String.self, forKey: .outputDirectoryPath)
+        maskImageBookmark = try container.decodeIfPresent(Data.self, forKey: .maskImageBookmark)
+        openAIOutputFormat = try container.decodeIfPresent(OpenAIOutputFormat.self, forKey: .openAIOutputFormat) ?? .png
+        openAIBackground = try container.decodeIfPresent(OpenAIBackground.self, forKey: .openAIBackground) ?? .auto
+        openAIInputFidelity = try container.decodeIfPresent(OpenAIInputFidelity.self, forKey: .openAIInputFidelity) ?? .high
+        openAIOutputCompression = try container.decodeIfPresent(Int.self, forKey: .openAIOutputCompression) ?? 100
+        openAINCount = try container.decodeIfPresent(Int.self, forKey: .openAINCount) ?? 1
     }
     
     func encode(to encoder: Encoder) throws {
@@ -240,12 +381,24 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         try container.encode(status, forKey: .status)
         try container.encodeIfPresent(error, forKey: .error)
         try container.encodeIfPresent(externalJobName, forKey: .externalJobName)
+        try container.encodeIfPresent(remoteBatchId, forKey: .remoteBatchId)
+        try container.encodeIfPresent(remoteRequestId, forKey: .remoteRequestId)
+        try container.encodeIfPresent(remoteBatchProvider, forKey: .remoteBatchProvider)
         try container.encodeIfPresent(sourceImageBookmarks, forKey: .sourceImageBookmarks)
         try container.encodeIfPresent(outputImageBookmark, forKey: .outputImageBookmark)
         try container.encodeIfPresent(outputDirectoryBookmark, forKey: .outputDirectoryBookmark)
         try container.encodeIfPresent(tokenUsage, forKey: .tokenUsage)
         try container.encodeIfPresent(modelName, forKey: .modelName)
+        try container.encode(provider, forKey: .provider)
         try container.encodeIfPresent(systemPrompt, forKey: .systemPrompt)
+        try container.encodeIfPresent(maskImagePath, forKey: .maskImagePath)
+        try container.encodeIfPresent(outputDirectoryPath, forKey: .outputDirectoryPath)
+        try container.encodeIfPresent(maskImageBookmark, forKey: .maskImageBookmark)
+        try container.encode(openAIOutputFormat, forKey: .openAIOutputFormat)
+        try container.encode(openAIBackground, forKey: .openAIBackground)
+        try container.encode(openAIInputFidelity, forKey: .openAIInputFidelity)
+        try container.encode(openAIOutputCompression, forKey: .openAIOutputCompression)
+        try container.encode(openAINCount, forKey: .openAINCount)
     }
 
     func rescuing(externalJobName: String) -> HistoryEntry {
@@ -268,7 +421,19 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
             outputDirectoryBookmark: outputDirectoryBookmark,
             tokenUsage: tokenUsage,
             modelName: modelName,
-            systemPrompt: systemPrompt
+            provider: provider,
+            systemPrompt: systemPrompt,
+            maskImagePath: maskImagePath,
+            outputDirectoryPath: outputDirectoryPath,
+            maskImageBookmark: maskImageBookmark,
+            openAIOutputFormat: openAIOutputFormat,
+            openAIBackground: openAIBackground,
+            openAIInputFidelity: openAIInputFidelity,
+            openAIOutputCompression: openAIOutputCompression,
+            openAINCount: openAINCount,
+            remoteBatchId: remoteBatchId,
+            remoteRequestId: remoteRequestId,
+            remoteBatchProvider: remoteBatchProvider
         )
     }
 }
@@ -428,8 +593,9 @@ class BatchJob: Identifiable, Codable {
     let createdAt: Date
     var projectId: UUID?
     var modelName: String?
+    var provider: ModelProvider
     var prompt: String
-    var systemPrompt: String? // Added
+    var systemPrompt: String?
     var aspectRatio: String
     var imageSize: String
     var outputDirectory: String
@@ -438,9 +604,19 @@ class BatchJob: Identifiable, Codable {
     var status: String
     var tasks: [ImageTask]
     var isTextMode: Bool = false // For text-to-image generation
-
+    var maskImagePath: String?
+    var maskImageBookmark: Data?
+    // OpenAI advanced parameters
+    var openAIOutputFormat: OpenAIOutputFormat = .png
+    var openAIBackground: OpenAIBackground = .auto
+    var openAIInputFidelity: OpenAIInputFidelity = .high
+    var openAIOutputCompression: Int = 100
+    var openAINCount: Int = 1
     enum CodingKeys: String, CodingKey {
-        case id, createdAt, projectId, modelName, prompt, systemPrompt, aspectRatio, imageSize, outputDirectory, outputDirectoryBookmark, useBatchTier, status, tasks, isTextMode
+        case id, createdAt, projectId, modelName, provider, prompt, systemPrompt
+        case aspectRatio, imageSize, outputDirectory, outputDirectoryBookmark
+        case useBatchTier, status, tasks, isTextMode, maskImagePath, maskImageBookmark
+        case openAIOutputFormat, openAIBackground, openAIInputFidelity, openAIOutputCompression, openAINCount
     }
 
     required init(from decoder: Decoder) throws {
@@ -449,8 +625,9 @@ class BatchJob: Identifiable, Codable {
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         projectId = try container.decodeIfPresent(UUID.self, forKey: .projectId)
         modelName = try container.decodeIfPresent(String.self, forKey: .modelName)
+        provider = try container.decodeIfPresent(ModelProvider.self, forKey: .provider) ?? .gemini
         prompt = try container.decode(String.self, forKey: .prompt)
-        systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt) // Decode if present
+        systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt)
         aspectRatio = try container.decode(String.self, forKey: .aspectRatio)
         imageSize = try container.decode(String.self, forKey: .imageSize)
         outputDirectory = try container.decode(String.self, forKey: .outputDirectory)
@@ -459,14 +636,21 @@ class BatchJob: Identifiable, Codable {
         status = try container.decode(String.self, forKey: .status)
         tasks = try container.decode([ImageTask].self, forKey: .tasks)
         isTextMode = try container.decodeIfPresent(Bool.self, forKey: .isTextMode) ?? false
+        maskImagePath = try container.decodeIfPresent(String.self, forKey: .maskImagePath)
+        maskImageBookmark = try container.decodeIfPresent(Data.self, forKey: .maskImageBookmark)
+        openAIOutputFormat = try container.decodeIfPresent(OpenAIOutputFormat.self, forKey: .openAIOutputFormat) ?? .png
+        openAIBackground = try container.decodeIfPresent(OpenAIBackground.self, forKey: .openAIBackground) ?? .auto
+        openAIInputFidelity = try container.decodeIfPresent(OpenAIInputFidelity.self, forKey: .openAIInputFidelity) ?? .high
+        openAIOutputCompression = try container.decodeIfPresent(Int.self, forKey: .openAIOutputCompression) ?? 100
+        openAINCount = try container.decodeIfPresent(Int.self, forKey: .openAINCount) ?? 1
     }
-
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(projectId, forKey: .projectId)
         try container.encodeIfPresent(modelName, forKey: .modelName)
+        try container.encode(provider, forKey: .provider)
         try container.encode(prompt, forKey: .prompt)
         try container.encode(systemPrompt, forKey: .systemPrompt)
         try container.encode(aspectRatio, forKey: .aspectRatio)
@@ -477,8 +661,14 @@ class BatchJob: Identifiable, Codable {
         try container.encode(status, forKey: .status)
         try container.encode(tasks, forKey: .tasks)
         try container.encode(isTextMode, forKey: .isTextMode)
+        try container.encodeIfPresent(maskImagePath, forKey: .maskImagePath)
+        try container.encodeIfPresent(maskImageBookmark, forKey: .maskImageBookmark)
+        try container.encode(openAIOutputFormat, forKey: .openAIOutputFormat)
+        try container.encode(openAIBackground, forKey: .openAIBackground)
+        try container.encode(openAIInputFidelity, forKey: .openAIInputFidelity)
+        try container.encode(openAIOutputCompression, forKey: .openAIOutputCompression)
+        try container.encode(openAINCount, forKey: .openAINCount)
     }
-    
     init(
         prompt: String,
         systemPrompt: String? = nil,
@@ -488,12 +678,21 @@ class BatchJob: Identifiable, Codable {
         outputDirectoryBookmark: Data? = nil,
         useBatchTier: Bool = false,
         projectId: UUID? = nil,
-        modelName: String? = nil
+        modelName: String? = nil,
+        provider: ModelProvider = .gemini,
+        maskImagePath: String? = nil,
+        maskImageBookmark: Data? = nil,
+        openAIOutputFormat: OpenAIOutputFormat = .png,
+        openAIBackground: OpenAIBackground = .auto,
+        openAIInputFidelity: OpenAIInputFidelity = .high,
+        openAIOutputCompression: Int = 100,
+        openAINCount: Int = 1
     ) {
         self.id = UUID()
         self.createdAt = Date()
         self.projectId = projectId
         self.modelName = modelName
+        self.provider = provider
         self.prompt = prompt
         self.systemPrompt = systemPrompt
         self.aspectRatio = aspectRatio
@@ -503,8 +702,15 @@ class BatchJob: Identifiable, Codable {
         self.useBatchTier = useBatchTier
         self.status = "pending"
         self.tasks = []
+        self.maskImagePath = maskImagePath
+        self.maskImageBookmark = maskImageBookmark
+        self.openAIOutputFormat = openAIOutputFormat
+        self.openAIBackground = openAIBackground
+        self.openAIInputFidelity = openAIInputFidelity
+        self.openAIOutputCompression = openAIOutputCompression
+        self.openAINCount = openAINCount
     }
-    
+
     var pendingCount: Int { tasks.filter { $0.status == "pending" }.count }
     var completedCount: Int { tasks.filter { $0.status == "completed" }.count }
     var failedCount: Int { tasks.filter { ImageTask.issueStatuses.contains($0.status) }.count }
@@ -610,15 +816,22 @@ class ImageTask: Identifiable, Codable {
     var submittedAt: Date?
     var completedAt: Date?
     var externalJobName: String? // Store Gemini API job ID
+    var remoteBatchId: String?
+    var remoteRequestId: String?
+    var remoteBatchProvider: ModelProvider?
     var projectId: UUID? // Added for filtering results by project
+    var provider: ModelProvider
+    var maskImagePath: String?
+    var maskImageBookmark: Data?
     var cancelRequestedAt: Date?
     var variationIndex: Int?
     var variationTotal: Int?
-
     enum CodingKeys: String, CodingKey {
         case id, inputPaths, inputBookmarks, outputPath, status, phase, pollCount
         case lastPollState, lastPollUpdatedAt, stalledAt
-        case error, startedAt, submittedAt, completedAt, externalJobName, projectId, cancelRequestedAt
+        case error, startedAt, submittedAt, completedAt, externalJobName
+        case remoteBatchId, remoteRequestId, remoteBatchProvider, projectId
+        case provider, maskImagePath, maskImageBookmark, cancelRequestedAt
         case variationIndex, variationTotal
     }
 
@@ -639,7 +852,13 @@ class ImageTask: Identifiable, Codable {
         submittedAt = try container.decodeIfPresent(Date.self, forKey: .submittedAt)
         completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         externalJobName = try container.decodeIfPresent(String.self, forKey: .externalJobName)
+        remoteBatchId = try container.decodeIfPresent(String.self, forKey: .remoteBatchId)
+        remoteRequestId = try container.decodeIfPresent(String.self, forKey: .remoteRequestId)
+        remoteBatchProvider = try container.decodeIfPresent(ModelProvider.self, forKey: .remoteBatchProvider)
         projectId = try container.decodeIfPresent(UUID.self, forKey: .projectId)
+        provider = try container.decodeIfPresent(ModelProvider.self, forKey: .provider) ?? .gemini
+        maskImagePath = try container.decodeIfPresent(String.self, forKey: .maskImagePath)
+        maskImageBookmark = try container.decodeIfPresent(Data.self, forKey: .maskImageBookmark)
         cancelRequestedAt = try container.decodeIfPresent(Date.self, forKey: .cancelRequestedAt)
         variationIndex = try container.decodeIfPresent(Int.self, forKey: .variationIndex)
         variationTotal = try container.decodeIfPresent(Int.self, forKey: .variationTotal)
@@ -662,7 +881,13 @@ class ImageTask: Identifiable, Codable {
         try container.encode(submittedAt, forKey: .submittedAt)
         try container.encode(completedAt, forKey: .completedAt)
         try container.encode(externalJobName, forKey: .externalJobName)
+        try container.encodeIfPresent(remoteBatchId, forKey: .remoteBatchId)
+        try container.encodeIfPresent(remoteRequestId, forKey: .remoteRequestId)
+        try container.encodeIfPresent(remoteBatchProvider, forKey: .remoteBatchProvider)
         try container.encode(projectId, forKey: .projectId)
+        try container.encode(provider, forKey: .provider)
+        try container.encodeIfPresent(maskImagePath, forKey: .maskImagePath)
+        try container.encodeIfPresent(maskImageBookmark, forKey: .maskImageBookmark)
         try container.encodeIfPresent(cancelRequestedAt, forKey: .cancelRequestedAt)
         try container.encodeIfPresent(variationIndex, forKey: .variationIndex)
         try container.encodeIfPresent(variationTotal, forKey: .variationTotal)
@@ -671,7 +896,10 @@ class ImageTask: Identifiable, Codable {
     init(
         inputPaths: [String],
         projectId: UUID? = nil,
+        provider: ModelProvider = .gemini,
         inputBookmarks: [Data]? = nil,
+        maskImagePath: String? = nil,
+        maskImageBookmark: Data? = nil,
         variationIndex: Int? = nil,
         variationTotal: Int? = nil
     ) {
@@ -684,16 +912,26 @@ class ImageTask: Identifiable, Codable {
         self.lastPollState = nil
         self.lastPollUpdatedAt = nil
         self.stalledAt = nil
+        self.remoteBatchId = nil
+        self.remoteRequestId = nil
+        self.remoteBatchProvider = nil
         self.projectId = projectId
+        self.provider = provider
+        self.maskImagePath = maskImagePath
+        self.maskImageBookmark = maskImageBookmark
         self.cancelRequestedAt = nil
         self.variationIndex = variationIndex
         self.variationTotal = variationTotal
-    }
     
+    }
+
     init(
         inputPath: String,
         projectId: UUID? = nil,
+        provider: ModelProvider = .gemini,
         inputBookmark: Data? = nil,
+        maskImagePath: String? = nil,
+        maskImageBookmark: Data? = nil,
         variationIndex: Int? = nil,
         variationTotal: Int? = nil
     ) {
@@ -706,12 +944,19 @@ class ImageTask: Identifiable, Codable {
         self.lastPollState = nil
         self.lastPollUpdatedAt = nil
         self.stalledAt = nil
+        self.remoteBatchId = nil
+        self.remoteRequestId = nil
+        self.remoteBatchProvider = nil
         self.projectId = projectId
+        self.provider = provider
+        self.maskImagePath = maskImagePath
+        self.maskImageBookmark = maskImageBookmark
         self.cancelRequestedAt = nil
         self.variationIndex = variationIndex
         self.variationTotal = variationTotal
-    }
     
+    }
+
     // Backward compatibility for single input path
     var inputPath: String { inputPaths.first ?? "" }
     
@@ -759,7 +1004,11 @@ class ImageTask: Identifiable, Codable {
     }
 
     var hasRemoteJob: Bool {
-        externalJobName != nil
+        externalJobName != nil || remoteBatchId != nil
+    }
+
+    var remoteJobIdForDisplay: String? {
+        remoteBatchId ?? externalJobName
     }
 
     var variationLabel: String? {

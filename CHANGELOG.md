@@ -2,6 +2,82 @@
 
 All notable changes to Nano Banana Helper will be documented in this file.
 
+## [2.0] - 2026-05-17
+
+Version 2.0 is the multi-provider release. The app moves from a Gemini-focused batch workbench into a Gemini and OpenAI image operations tool with OpenAI `gpt-image-2`, provider-side Batch Tier support, stronger recovery, Swift 6 project settings, and broader regression coverage.
+
+Release boundary reviewed: `v1.4.2..0af3507`, covering 40 tracked files with 9,094 insertions and 766 deletions. One untracked local file, `docs/complexity-diagram.html`, was present during review and is not included in this release summary unless it is intentionally added.
+
+### Added
+- **OpenAI provider support**: Settings now supports Gemini and OpenAI as first-class providers, with provider selection, separate API keys, separate model selections, provider documentation links, and backward-compatible migration from the old single Gemini config.
+- **GPT Image 2 workflows**: Added OpenAI `gpt-image-2` support for text-to-image generation, image editing, multi-input edits, masks, and multi-output responses.
+- **OpenAI advanced controls**: The Inspector now exposes OpenAI output format (`PNG`, `JPEG`, `WebP`), background handling where supported, input fidelity, output compression, and images per request.
+- **OpenAI Batch Tier**: Batch Tier now routes OpenAI work through the OpenAI Batch API, including request JSONL generation, file upload handling, batch creation, status polling, cancellation, result-file download, and batch result parsing.
+- **Provider-aware remote identity**: Queue, history, and result records now persist provider, remote batch ID, remote request ID, remote batch provider, OpenAI advanced settings, mask metadata, and cancellation timestamps.
+- **OpenAI history resume**: OpenAI remote batches can be resumed from History and active queue issue states when both remote batch ID and remote request ID are available.
+- **Recovered Outputs folder**: Returned provider images are preserved in an app-managed `Recovered Outputs` directory if the selected output folder cannot be accessed at completion time.
+- **Output directory preservation for resumed history**: History entries now preserve the intended output directory path so resumed remote jobs do not unnecessarily fall back to app-support output paths.
+- **Result detail viewer**: Results now include a richer detail popup with full-resolution viewing, generation metadata, prompt and system-prompt text, provider/model details, output ratio, size, tier context, and output actions.
+- **Async staging thumbnails**: Staged image thumbnails now load asynchronously through a bookmark-aware ImageIO thumbnail path instead of reading full image data during SwiftUI rendering.
+- **Goal and release documentation**: Added release notes and audit-fix documentation under `docs/releases/`, `docs/goals/`, and `docs/superpowers/plans/`.
+
+### Changed
+- **Provider-aware pricing**: Pricing now handles Gemini per-image rates and OpenAI token-based usage. OpenAI preflight estimates are labeled approximate until provider-reported usage is returned.
+- **OpenAI usage accounting**: OpenAI costs now use returned text/image token usage when available, with aggregate-token fallback behavior when detailed token fields are absent.
+- **Model catalog**: The curated model list now includes Gemini image models and OpenAI `gpt-image-2`, provider-scoped defaults, masking capability labels, Batch Tier support flags, and legacy selected-model preservation.
+- **Batch Tier semantics**: The Batch Tier toggle now maps to the active provider: Gemini uses `batchGenerateContent`; OpenAI uses the OpenAI Batch API.
+- **Queue recovery model**: The queue now tracks richer control and task phases including local pause, remote submission, reconnecting, cancel requested, stalled, expired, and terminal cancellation states.
+- **Cancellation UX**: Cancelled, cancelling, stalled, expired, and locally paused jobs now report clearer status messages while remote state is being reconciled.
+- **OpenAI aspect sizing**: OpenAI edit requests with `Auto` aspect now infer size from the source image aspect while preserving the selected output size tier.
+- **Mask behavior**: Shared OpenAI masks are preserved for one source or merged multi-input work, but dropped for multiple independent per-file tasks where one shared mask could poison the batch.
+- **Bottom dock spend summary**: The queue dock now reports selected-project spend when session spend is empty instead of falling back to an unrelated global total.
+- **Cost estimator explanation**: Projected-cost explanatory copy has been moved into contextual help instead of occupying the visible pricing row.
+- **Swift project configuration**: App and test targets are now promoted to Swift 6.0 project settings.
+- **Build script**: DMG build cleanup was tightened to reduce stale build artifact issues.
+
+### Fixed
+- **Gemini batch auth after provider switch**: Gemini batch polling and cancellation continue to use the Gemini API key path even after multi-provider settings were introduced.
+- **OpenAI Batch result replay**: OpenAI batch result parsing now scopes result lines to expected custom IDs and skips unexpected rows so replay does not duplicate terminal local jobs.
+- **OpenAI duplicate completion accounting**: Replayed or repeated OpenAI results do not create duplicate completion side effects for already-terminal tasks.
+- **OpenAI partial success handling**: Batch result parsing now preserves success and failure rows separately so partial results can be applied without flattening the whole batch into a generic failure.
+- **OpenAI resume identity rules**: OpenAI history rows now require both remote batch ID and remote request ID before advertising Resume or Rescue actions.
+- **Timed-out cancellation recovery**: Launch recovery finalizes stale cancellation rows locally instead of leaving them indefinitely in cancelling state.
+- **Interrupted queue recovery**: Launch recovery now separates terminal-only queues, resumable remote polling states, and ambiguous submitting tasks so the app avoids unsafe duplicate submission.
+- **Output write failures**: If the primary output directory fails after an API response is already returned, completed image bytes are written to recovery storage and the history/ledger entry records that fallback.
+- **Last-project deletion**: Project deletion now refuses to remove the final project and repairs `currentProject` when possible. Settings also disables the final-project delete action.
+- **Security-scoped access**: Input, mask, source, and output bookmarks are refreshed and preserved in more queue and history paths.
+- **OpenAI mask validation**: Mask handling now validates file size, dimensions, format, and alpha-channel requirements before OpenAI edit submission.
+- **OpenAI aspect ratio guardrails**: Extreme aspect ratios that OpenAI does not support are rejected with guidance instead of being sent to the provider.
+
+### Technical
+- Added or expanded focused regression coverage for provider config migration, provider/model pricing, OpenAI token usage pricing, provider metadata persistence, OpenAI response parsing, multi-output persistence, recovery output writes, OpenAI Batch request construction, Batch result parsing, replay protection, remote resume, cancellation normalization, last-project deletion, output directory preservation, mask propagation, and Swift 6 readiness.
+- The unit test file now contains 137 Swift Testing `@Test` entries.
+- Promoted `SWIFT_VERSION` to `6.0` across the Xcode project and kept `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` for app targets.
+- Added `CONTEXT.md` for project language around providers, local queue semantics, remote batch identity, OpenAI Batch Tier, and recovery behavior.
+- Regenerated the release DMG during the v2 work.
+
+## [1.4.2] - 2026-04-12
+
+### Added
+- **Persistent Usage Ledger**: Usage tracking now backed by a persistent ledger system that records every batch operation and cost transaction, with support for manual adjustments and reconciliation.
+- **Usage Snapshot Builder**: Create point-in-time snapshots of usage data with advanced filtering by date, project, model, and resolution for detailed reporting and analysis.
+- **Resizable Queue Drawer**: Queue visualization can now be dynamically resized by dragging, with automatic layout adjustment and improved section headers for better workflow control.
+
+### Changed
+- **Request Diagnostics**: All API requests (batch and standard) now emit structured diagnostic logs with timing, status, retry attempts, and detailed error information for improved debuggability.
+- **Logging Architecture**: Replaced ad-hoc logging with unified structured logging integrated into existing LogManager for cleaner, more parseable session output.
+- **Session Tracking**: Ledger-based session cost tracking replaces previous ad-hoc recording for more accurate usage aggregation and transparency.
+
+### Fixed
+- Improved consistency of usage tracking across batch submissions, polling, and image downloads.
+- Enhanced queue state recovery with better persistence semantics during high-throughput operations.
+- Stabilized concurrent ledger writes during simultaneous batch operations.
+
+### Technical
+- Added comprehensive unit tests for ledger filtering, reporting, and snapshot generation.
+- Implemented atomic append operations for thread-safe ledger access.
+- Backward-compatible migration of existing cost data to ledger format on first launch.
+
 ## [1.4.0] - 2026-04-04
 
 ### Added

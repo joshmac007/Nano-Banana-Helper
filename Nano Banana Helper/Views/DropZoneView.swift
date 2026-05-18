@@ -89,7 +89,17 @@ struct DropZoneView: View {
         }
         
         // Add to manager
-        stagingManager.addFiles(gatheredUrls)
+        stagingManager.addFiles(gatheredUrls, bookmarks: makeBookmarks(for: gatheredUrls))
+    }
+
+    private func makeBookmarks(for urls: [URL]) -> [URL: Data] {
+        var bookmarks: [URL: Data] = [:]
+        for url in urls {
+            if let bookmark = AppPaths.bookmark(for: url) {
+                bookmarks[url] = bookmark
+            }
+        }
+        return bookmarks
     }
     
     private func scanDirectory(_ directory: URL) -> [URL] {

@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import Combine
+import UniformTypeIdentifiers
 
 struct InspectorView: View {
     @Bindable var stagingManager: BatchStagingManager
@@ -7,6 +9,7 @@ struct InspectorView: View {
     var historyManager: HistoryManager
     @Environment(PromptLibrary.self) private var promptLibrary
     @Environment(BatchOrchestrator.self) private var orchestrator
+    @State private var showingMaskPicker = false
 
     let sizes = ImageSize.allCases.map { $0.rawValue }
 
@@ -46,7 +49,7 @@ struct InspectorView: View {
                     .controlSize(.large)
                     .padding(.horizontal)
                     .padding(.top)
-                    .disabled(!stagingManager.isReadyForGeneration)
+                    .disabled(!canStartGeneration)
 
                     HStack {
                         Text("Variations")
@@ -74,7 +77,7 @@ struct InspectorView: View {
                     }
                     .padding(.horizontal)
 
-                    if stagingManager.generationMode == .image && stagingManager.containsPNGInputs {
+                    if stagingManager.generationMode == .image && stagingManager.containsPNGInputs && stagingManager.provider == .gemini {
                         HStack(alignment: .top, spacing: 8) {
                             Image(systemName: "info.circle")
                                 .foregroundStyle(.secondary)
@@ -129,15 +132,58 @@ struct InspectorView: View {
                     }
                     .padding(.horizontal)
 
+                    if stagingManager.generationMode == .image && stagingManager.provider == .openAI {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(alignment: .top) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Mask")
+                                        .font(.system(size: 11, weight: .bold))
+                                        .foregroundStyle(.primary)
+                                        .textCase(.uppercase)
+                                    Text(stagingManager.hasMask ? (stagingManager.isMultiInput || stagingManager.count == 1 ? "Mask will be submitted with this batch." : "Mask is kept, but not submitted for separate multi-file tasks.") : "Optional. Same size, format, and alpha channel required.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                HStack(spacing: 8) {
+                                    Button(stagingManager.hasMask ? "Replace…" : "Select…") {
+                                        showingMaskPicker = true
+                                    }
+                                    .buttonStyle(.bordered)
+
+                                    if stagingManager.hasMask {
+                                        Button("Clear", role: .destructive) {
+                                            stagingManager.clearMask()
+                                        }
+                                        .buttonStyle(.bordered)
+                                    }
+                                }
+                            }
+
+                            if let maskFile = stagingManager.maskFile {
+                                Text(maskFile.lastPathComponent)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+
+                            if !openAIAspectRatioSupported {
+                                Text("OpenAI currently supports aspect ratios up to 3:1. Select Auto or a less extreme preset.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                        .padding(.horizontal)
+                    }
+
                     VStack(alignment: .leading, spacing: 16) {
-                        // Batch Tier Toggle
                         HStack(alignment: .top) {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Batch Tier")
-                                    .font(.system(size: 11, weight: .bold)) // Standardized header
+                                    .font(.system(size: 11, weight: .bold))
                                     .foregroundStyle(.primary)
                                     .textCase(.uppercase)
-                                Text("50% Cost savings.")
+                                Text(stagingManager.provider == .openAI ? "Async batch processing. Up to 24 hours." : "50% cost savings.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -147,15 +193,14 @@ struct InspectorView: View {
                                 .labelsHidden()
                         }
 
-                        // Multi-Input Toggle (Image mode only)
                         if stagingManager.generationMode == .image {
                             HStack(alignment: .top) {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Multi-Input Mode")
-                                        .font(.system(size: 11, weight: .bold)) // Standardized header
+                                        .font(.system(size: 11, weight: .bold))
                                         .foregroundStyle(.primary)
                                         .textCase(.uppercase)
-                                    Text("Merge all to 1 output.")
+                                    Text(stagingManager.provider == .openAI && stagingManager.hasMask ? "Mask applies to the first input image only." : "Merge all to 1 output.")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -171,33 +216,210 @@ struct InspectorView: View {
                     CostEstimatorView(
                         stagedImageCount: stagingManager.count,
                         variationCount: currentVariationCount,
-                        outputCount: stagingManager.effectiveTaskCount,
+                        outputCount: stagingManager.expectedOutputCount,
                         imageSize: stagingManager.imageSize,
                         isBatchTier: stagingManager.isBatchTier,
                         isMultiInput: stagingManager.isMultiInput,
                         generationMode: stagingManager.generationMode,
-                        modelName: AppConfig.load().modelName
+                        modelName: stagingManager.modelName
                     )
                     .padding(.horizontal)
+
+                    // OpenAI Advanced Controls
+                    if stagingManager.provider == .openAI {
+                        DisclosureGroup(
+                            content: {
+                                VStack(spacing: 20) {
+                                    // Output Format
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Output Format")
+                                                .font(.system(size: 11, weight: .bold))
+                                                .foregroundStyle(.primary)
+                                                .textCase(.uppercase)
+                                        }
+                                        Spacer()
+                                        Picker("", selection: $stagingManager.openAIOutputFormat) {
+                                            ForEach(OpenAIOutputFormat.allCases) { fmt in
+                                                Text(fmt.displayName).tag(fmt)
+                                            }
+                                        }
+                                        .pickerStyle(.segmented)
+                                        .frame(width: 150)
+                                        .labelsHidden()
+                                    }
+
+                                    // Background — only meaningful for transparency-capable formats
+                                    if stagingManager.openAIOutputFormat.supportsBackground {
+                                        HStack {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text("Background")
+                                                    .font(.system(size: 11, weight: .bold))
+                                                    .foregroundStyle(.primary)
+                                                    .textCase(.uppercase)
+                                                Text("Transparent requires PNG or WebP format.")
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                            Spacer()
+                                            Picker("", selection: $stagingManager.openAIBackground) {
+                                                ForEach(OpenAIBackground.allCases) { bg in
+                                                    Text(bg.displayName).tag(bg)
+                                                }
+                                            }
+                                            .pickerStyle(.segmented)
+                                            .frame(width: 150)
+                                            .labelsHidden()
+                                        }
+                                    }
+
+                                    // Input Fidelity — only relevant when editing images
+                                    if stagingManager.generationMode == .image {
+                                        HStack {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text("Input Fidelity")
+                                                    .font(.system(size: 11, weight: .bold))
+                                                    .foregroundStyle(.primary)
+                                                    .textCase(.uppercase)
+                                                Text("How closely to follow source images.")
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                            Spacer()
+                                            Picker("", selection: $stagingManager.openAIInputFidelity) {
+                                                ForEach(OpenAIInputFidelity.allCases) { fidelity in
+                                                    Text(fidelity.displayName).tag(fidelity)
+                                                }
+                                            }
+                                            .pickerStyle(.segmented)
+                                            .frame(width: 100)
+                                            .labelsHidden()
+                                        }
+                                    }
+
+                                    // Output Compression — only for JPEG or WebP
+                                    if stagingManager.openAIOutputFormat.supportsCompression {
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            HStack {
+                                                Text("Compression")
+                                                    .font(.system(size: 11, weight: .bold))
+                                                    .foregroundStyle(.primary)
+                                                    .textCase(.uppercase)
+                                                Spacer()
+                                                Text("\(stagingManager.openAIOutputCompression)%")
+                                                    .font(.system(.body, design: .rounded))
+                                                    .foregroundStyle(.secondary)
+                                                    .frame(minWidth: 36, alignment: .trailing)
+                                            }
+                                            Slider(
+                                                value: Binding(
+                                                    get: { Double(stagingManager.openAIOutputCompression) },
+                                                    set: { stagingManager.openAIOutputCompression = Int($0) }
+                                                ),
+                                                in: 0...100,
+                                                step: 1
+                                            )
+                                        }
+                                    }
+
+                                    // Images per Request (n)
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Images per Request")
+                                                .font(.system(size: 11, weight: .bold))
+                                                .foregroundStyle(.primary)
+                                                .textCase(.uppercase)
+                                            Text("Up to 4 images per API call.")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                        HStack(spacing: 12) {
+                                            Button(action: { stagingManager.openAINCount = max(1, stagingManager.openAINCount - 1) }) {
+                                                Image(systemName: "minus.circle")
+                                            }
+                                            .disabled(stagingManager.openAINCount <= 1)
+
+                                            Text("\(stagingManager.openAINCount)")
+                                                .font(.system(.body, design: .rounded))
+                                                .frame(minWidth: 24)
+
+                                            Button(action: { stagingManager.openAINCount = min(4, stagingManager.openAINCount + 1) }) {
+                                                Image(systemName: "plus.circle")
+                                            }
+                                            .disabled(stagingManager.openAINCount >= 4)
+                                        }
+                                    }
+                                }
+                                .padding(.top, 12)
+                            },
+                            label: {
+                                Text("Advanced")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundStyle(.secondary)
+                                    .textCase(.uppercase)
+                            }
+                        )
+                        .padding(.horizontal)
+                    }
                 }
             }
         }
         .frame(minWidth: 280, idealWidth: 300, maxWidth: 350)
         .background(VisualEffectView(material: .sidebar, blendingMode: .withinWindow))
+        .onAppear {
+            stagingManager.refreshProviderSelection()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .appConfigDidChange)) { _ in
+            stagingManager.refreshProviderSelection()
+        }
+        .fileImporter(
+            isPresented: $showingMaskPicker,
+            allowedContentTypes: [.image],
+            allowsMultipleSelection: false
+        ) { result in
+            guard case .success(let urls) = result, let url = urls.first else { return }
+            let didStart = url.startAccessingSecurityScopedResource()
+            let bookmark = AppPaths.bookmark(for: url)
+            if didStart {
+                url.stopAccessingSecurityScopedResource()
+            }
+            stagingManager.setMaskFile(url, bookmark: bookmark)
+        }
+
     }
 
     private var buttonTitle: String {
+        let count = max(1, stagingManager.expectedOutputCount)
         switch stagingManager.generationMode {
         case .image:
-            return "Start Batch"
+            if stagingManager.isBatchTier {
+                return "Start Batch"
+            }
+            return count == 1 ? "Generate Image" : "Generate \(count) Images"
         case .text:
-            let count = stagingManager.textImageCount
+            if stagingManager.isBatchTier {
+                return "Start Batch"
+            }
             return count == 1 ? "Generate Image" : "Generate \(count) Images"
         }
     }
 
+    private var canStartGeneration: Bool {
+        stagingManager.isReadyForGeneration &&
+        (stagingManager.provider != .openAI || openAIAspectRatioSupported)
+    }
+
+    private var openAIAspectRatioSupported: Bool {
+        let aspect = AspectRatio.from(string: stagingManager.aspectRatio)
+        guard aspect.id != "Auto" else { return true }
+        let ratio = Double(aspect.width / aspect.height)
+        return ratio <= 3.0 && ratio >= (1.0 / 3.0)
+    }
+
     private func startBatch() {
         guard let project = projectManager.currentProject else { return }
+        guard ensureOutputDirectoryAccess(for: project) else { return }
 
         switch stagingManager.generationMode {
         case .image:
@@ -207,7 +429,52 @@ struct InspectorView: View {
         }
     }
 
+    private func ensureOutputDirectoryAccess(for project: Project) -> Bool {
+        let fallbackPath = project.outputDirectory == AppPaths.defaultOutputDirectory.path
+            ? project.outputDirectory
+            : ""
+        var capturedError: Error?
+
+        let result = AppPaths.withAccessibleURL(
+            bookmark: project.outputDirectoryBookmark,
+            fallbackPath: fallbackPath
+        ) { directoryURL in
+            do {
+                try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+                let probeURL = directoryURL.appendingPathComponent(".nano-banana-write-test-\(UUID().uuidString)")
+                try Data().write(to: probeURL)
+                try? FileManager.default.removeItem(at: probeURL)
+                return true
+            } catch {
+                capturedError = error
+                return nil
+            }
+        }
+
+        switch result {
+        case let .success(_, refreshedBookmark):
+            if let refreshedBookmark {
+                project.outputDirectoryBookmark = refreshedBookmark
+                projectManager.saveProjects()
+            }
+            return true
+        case .fallbackUsed:
+            return true
+        case .accessDenied:
+            if let capturedError {
+                print("Output directory access denied before generation: \(capturedError.localizedDescription)")
+            }
+            BookmarkReauthorization.reauthorizeOutputFolder(
+                for: project,
+                projectManager: projectManager,
+                historyManager: historyManager
+            )
+            return false
+        }
+    }
+
     private func startImageBatch(project: Project) {
+        let shouldStoreBatchMask = stagingManager.isMultiInput || stagingManager.count == 1
         let batch = BatchJob(
             prompt: stagingManager.prompt,
             systemPrompt: stagingManager.systemPrompt,
@@ -217,7 +484,15 @@ struct InspectorView: View {
             outputDirectoryBookmark: project.outputDirectoryBookmark,
             useBatchTier: stagingManager.isBatchTier,
             projectId: project.id,
-            modelName: AppConfig.load().modelName ?? AppPricing.defaultModelName
+            modelName: stagingManager.modelName,
+            provider: stagingManager.provider,
+            maskImagePath: shouldStoreBatchMask ? stagingManager.maskFile?.path : nil,
+            maskImageBookmark: shouldStoreBatchMask ? stagingManager.maskBookmark : nil,
+            openAIOutputFormat: stagingManager.openAIOutputFormat,
+            openAIBackground: stagingManager.openAIBackground,
+            openAIInputFidelity: stagingManager.openAIInputFidelity,
+            openAIOutputCompression: stagingManager.openAIOutputCompression,
+            openAINCount: stagingManager.openAINCount
         )
 
         // Handle Multi-Input vs Standard Batch
@@ -233,6 +508,8 @@ struct InspectorView: View {
 
     private func startTextBatch(project: Project) {
         orchestrator.enqueueTextGeneration(
+            provider: stagingManager.provider,
+            modelName: stagingManager.modelName,
             prompt: stagingManager.prompt,
             systemPrompt: stagingManager.systemPrompt,
             aspectRatio: stagingManager.aspectRatio,
@@ -241,7 +518,12 @@ struct InspectorView: View {
             outputDirectoryBookmark: project.outputDirectoryBookmark,
             useBatchTier: stagingManager.isBatchTier,
             imageCount: stagingManager.textImageCount,
-            projectId: project.id
+            projectId: project.id,
+            openAIOutputFormat: stagingManager.openAIOutputFormat,
+            openAIBackground: stagingManager.openAIBackground,
+            openAIInputFidelity: stagingManager.openAIInputFidelity,
+            openAIOutputCompression: stagingManager.openAIOutputCompression,
+            openAINCount: stagingManager.openAINCount
         )
 
         // Clear prompt after generation
